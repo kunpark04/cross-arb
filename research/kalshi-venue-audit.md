@@ -22,6 +22,8 @@
 **[FLAG — likely drift]:** The `api.elections.kalshi.com` subdomain appears to be a legacy or elections-specific URL; prefer `external-api.kalshi.com` for general use. Confirm with current docs before hardcoding.
 
 > **[RESOLVED 2026-06-08 — empirical WS probe, `scripts/probe_kalshi_ws.py`]** The live WebSocket is **`wss://api.elections.kalshi.com/trade-api/ws/v2`** (unauth handshake → `401 token_authentication_failure` = live + auth-gated). The legacy **`trading-api.kalshi.com` is dead** (returns *"API has been moved to api.elections.kalshi.com"*). **`external-api-ws.kalshi.com/`** (root path) returns **404** — the table row above was drift. The Kalshi WS **requires auth even for orderbook data** (RSA-PSS, §1.2), unlike the public REST market-data endpoints. **Authenticated `orderbook_delta` VERIFIED 2026-06-08** with the read-only API key: RSA-PSS handshake → `101`, then `subscribed` + `orderbook_snapshot` frames received.
+>
+> **WS message format (verified live, supersedes the cents framing elsewhere):** `orderbook_snapshot.msg` = `{market_ticker, market_id, yes_dollars_fp?, no_dollars_fp?}`, each side an array `[[price_dollars, qty_fp], …]` (a side is **absent** when empty). `orderbook_delta.msg` = `{market_ticker, side ("yes"/"no"), price_dollars, delta_fp (signed)}` — prices in **dollars** (e.g. `"0.4430"`), quantities fixed-point (`"20.00"`). The book is resting **bids per side**, so **YES ask = 1 − best NO bid**. `seq` is **one monotonic counter per connection** (single `sid`; covers snapshots + acks + deltas) — a gap ⇒ resubscribe all. Merge implementation: `bot/kalshi_book.py`.
 
 ### 1.2 Authentication — API Key + RSA-PSS Signing
 

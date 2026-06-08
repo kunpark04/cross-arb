@@ -15,12 +15,13 @@ polymarket.us WS protocol — VERIFIED 2026-06-08 via scripts/probe_pmus_ws_auth
   • subscribe {"subscribe":{"requestId":..,"subscriptionType":"SUBSCRIPTION_TYPE_MARKET_DATA","marketSlugs":[..]}}
   • frame     {"marketData":{"marketSlug":..,"bids":[{"px":{"value":".."},"qty":".."}],"offers":[..],"state":".."}}
   • limit     ≤100 slugs per subscription  →  shard the ~200-market universe across ≥2 subs
-Kalshi WS (orderbook_delta) is the second stream — endpoint wired below; its auth is the next TODO
-(not validated in this session). See research/polymarketus-api-auth.md §3c.
+Kalshi WS (orderbook_delta) is the second stream — RSA-PSS auth + snapshot/delta merge VALIDATED
+(bot/kalshi_book.py); both streams feed the same MarketTracker. See research/kalshi-venue-audit.md.
 """
 import os, sys, json, time
 sys.path.insert(0, os.path.dirname(__file__))
 from ledger import signal  # reuse the cross-venue best-edge calculation (single source of truth)
+from kalshi_book import KalshiBook, SeqTracker, kalshi_ws_headers  # Kalshi snapshot/delta merge
 
 # ============================================================================================
 # TRANSITION CORE  (pure, fully unit-tested offline — this is the load-bearing logic)
@@ -158,6 +159,7 @@ async def run_live(market_map, logger, shard_size=100):
     """
     import asyncio, websockets
     trackers = {slug: MarketTracker(slug) for slug in market_map}
+    tick2slug = {t: s for s, t in market_map.items()}     # Kalshi ticker -> pmus slug (reverse map)
 
     def on_book(venue, slug, bids, offers):
         trk = trackers.get(slug)
@@ -181,12 +183,29 @@ async def run_live(market_map, logger, shard_size=100):
                     on_book("P", md.get("marketSlug"), md.get("bids", []), md.get("offers", []))
 
     async def kalshi_stream():
-        # Auth VERIFIED with the read-only key (scripts/probe_kalshi_ws.py): RSA-PSS over
-        # "{ts}GET/trade-api/ws/v2" + 3 KALSHI-ACCESS-* headers -> 101 -> subscribe orderbook_delta.
-        # TODO: apply the snapshot+delta merge (Kalshi sends an orderbook_snapshot then seq-ordered
-        # orderbook_delta frames; book is bids-only per YES/NO, so YES ask = 1 - best NO bid), then
-        # feed on_book("K", slug-mapped-ticker, yes_bids, derived_yes_offers).
-        raise NotImplementedError("Kalshi orderbook_delta: snapshot/delta merge pending (auth verified; see scripts/probe_kalshi_ws.py)")
+        # RSA-PSS handshake + orderbook_delta, merged via KalshiBook (bot/kalshi_book.py; validated
+        # offline + live). seq is ONE per-connection counter -> a gap means resubscribe everything.
+        tickers = list(tick2slug)
+        async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
+            async def subscribe():
+                await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                    "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}}))
+            await subscribe()
+            books, st = {}, SeqTracker()
+            async for raw in ws:
+                o = json.loads(raw)
+                if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> resync all
+                    books.clear(); st.reset(); await subscribe(); continue
+                typ, msg = o.get("type"), o.get("msg", {}); tk = msg.get("market_ticker")
+                if typ == "orderbook_snapshot":
+                    books[tk] = KalshiBook(tk); books[tk].apply_snapshot(msg)
+                elif typ == "orderbook_delta" and tk in books:
+                    books[tk].apply_delta(msg)
+                else:
+                    continue
+                slug = tick2slug.get(tk)
+                if slug:
+                    on_book("K", slug, books[tk].yes_bid_ladder(), books[tk].yes_offer_ladder())
 
     async def rest_heartbeat():     # slow full-universe resync + coverage check (decision 0003)
         while True:

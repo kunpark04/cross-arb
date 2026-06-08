@@ -65,6 +65,10 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       (`scripts/probe_kalshi_ws.py`, `scripts/kalshi_readonly.pem`; legacy `trading-api` dead). **Both
       venues' WS now proven.** Remaining: Kalshi snapshot/delta merge into `monitor.py` + co-listed
       `{slug:ticker}` map (`scan_all.py`) + FLIP debounce → live dual-stream run (deploy gated, 0006).
+      **→ UPDATE 2026-06-08 (Kalshi merge built):** `bot/kalshi_book.py` (`KalshiBook` + `SeqTracker`)
+      reconstructs the Kalshi book from snapshot+deltas — VALIDATED offline + live (28 real deltas, 0 seq
+      gaps) — and is wired into `monitor.py`'s `kalshi_stream`. **Both streams now implemented.** Remaining:
+      co-listed `{slug:ticker}` map (`scan_all.py`) + FLIP debounce + REST heartbeat → live dual-stream run.
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit

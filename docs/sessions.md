@@ -6,6 +6,18 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Kalshi snapshot/delta merge built (KalshiBook) + wired into the monitor
+
+Built `bot/kalshi_book.py`: `KalshiBook` reconstructs a live Kalshi book from an `orderbook_snapshot`
+plus `orderbook_delta` stream (prices/qty as `*_dollars`/`*_fp` strings; YES ask = 1 − best NO bid),
+with a connection-level `SeqTracker` (gap → resubscribe). Confirmed empirically that Kalshi's `seq` is
+**one counter per connection** (not per-market) by observing live frames across 8 markets on one `sid`.
+Offline self-test passes; the live test merged 8 snapshots + **28 real deltas with no seq gaps**. Wired
+it into `bot/monitor.py`'s `kalshi_stream` (replacing the stub) — both venue streams now feed the same
+`MarketTracker`. Promoted the verified WS message format into `research/kalshi-venue-audit.md`. Remaining
+before a live dual-stream run: the co-listed `{slug:ticker}` map (`scan_all.py`), FLIP debounce, REST
+heartbeat.
+
 ## 2026-06-08 — Kalshi WS fully validated (read-only key added)
 
 Copied the **read-only** Kalshi API key into the project (`scripts/kalshi_readonly.pem`, gitignored;

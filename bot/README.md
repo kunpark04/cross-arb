@@ -53,8 +53,10 @@ python bot/monitor.py --live   # GATED — needs co-listed map + Kalshi WS auth 
 - **polymarket.us stream** is wired with the protocol verified 2026-06-08
   (`scripts/probe_pmus_ws_auth.py`): `wss://api.polymarket.us/v1/ws/markets`, Ed25519 handshake signing
   `{ts}GET/v1/ws/markets`, slug-keyed `SUBSCRIPTION_TYPE_MARKET_DATA`, frames = REST-book shape.
-- **Remaining for live:** Kalshi `orderbook_delta` auth + delta-merge; the co-listed `{slug: ticker}`
-  map from `scripts/scan_all.py`; per-frame FLIP debounce; REST heartbeat resync.
+- **Kalshi stream** (`kalshi_book.py`) — RSA-PSS handshake + snapshot/delta merge (`KalshiBook`),
+  VALIDATED offline + live (28 real deltas, no seq gaps). `python bot/kalshi_book.py [--live]`.
+- **Remaining for live:** the co-listed `{slug: ticker}` map from `scripts/scan_all.py`; per-frame
+  FLIP debounce; REST heartbeat resync.
 - **Deploy is gated** → DigitalOcean droplet, consult the owner first
   ([decisions/0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 
