@@ -75,6 +75,12 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       (weather 1:1) + heartbeat re-discovery ([decision 0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).
       Remaining: SPORTS 2-outcome tracker (game ↔ 2 Kalshi tickers) + dynamic re-subscribe on churn +
       FLIP debounce → short live read-only dual-stream run.
+      **→ UPDATE 2026-06-08 (sports 2-outcome tracker + FIRST LIVE RUN):** `GameTracker` (pm game YES=A +
+      two Kalshi team tickers; cheapest-venue-per-side `game_edge`) built in `monitor.py`, self-test
+      passing, wired into run_live's unified dispatch. **LIVE-VERIFIED** (`--live 75`): tracked 60 weather
+      + 124 sports (184 pmus slugs / 292 Kalshi tickers) and logged real MLB OPEN edges (nyy-cle dir PK
+      net 0.0375; phi-tor dir KP net 0.0681). Remaining: dynamic re-subscribe on churn + per-frame FLIP
+      debounce. (Item #10 is now functionally COMPLETE for a read-only logger.)
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit

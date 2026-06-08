@@ -45,8 +45,8 @@ book delta, and logs edge **state-transitions** (open / close / flip / widen / n
 input to the layer-vs-rotate rule above. **READ-ONLY**; places no orders.
 
 ```bash
-python bot/monitor.py          # OFFLINE self-test of the transition core (no network)
-python bot/monitor.py --live   # GATED — needs co-listed map + Kalshi WS auth + owner sign-off
+python bot/monitor.py          # OFFLINE self-test (weather + sports trackers; no network)
+python bot/monitor.py --live N # bounded ~N-second READ-ONLY dual-stream run (no orders; deploy gated)
 ```
 
 - **Transition core** (`classify` / `MarketTracker`) is pure + self-verifying, like `ledger.py`.
@@ -56,11 +56,13 @@ python bot/monitor.py --live   # GATED — needs co-listed map + Kalshi WS auth 
 - **Kalshi stream** (`kalshi_book.py`) — RSA-PSS handshake + snapshot/delta merge (`KalshiBook`),
   VALIDATED offline + live (28 real deltas, no seq gaps). `python bot/kalshi_book.py [--live]`.
 - **Co-listed map** (`colisted_map.py`) — `build_colisted_map()` does FULL discovery (pmus catalog +
-  Kalshi series, dynamic date/event grouping) → `{slug:ticker}` pairs, plus a COVERAGE AUDIT that flags
-  any pmus city/league we don't map. `python bot/colisted_map.py`. Weather is 1:1 (monitor-ready);
-  sports = a game ↔ two Kalshi tickers (2-outcome tracker TODO). Refreshed on the heartbeat ([0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).
-- **Remaining for live:** the SPORTS 2-outcome tracker; dynamic (un)subscribe on discovery churn;
-  per-frame FLIP debounce.
+  Kalshi series, dynamic date/event grouping) → pairs, plus a COVERAGE AUDIT that flags any pmus
+  city/league we don't map. `python bot/colisted_map.py`. Refreshed on the heartbeat ([0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).
+- **Two tracker types:** WEATHER → `MarketTracker` (1:1 binary); SPORTS → `GameTracker` (2-outcome: a pm
+  game market + two Kalshi team tickers, cheapest-venue-per-side). `run_live` dispatches each book delta
+  to the right one. **Live-verified** 2026-06-08 (`--live 75`: 60 weather + 124 sports tracked; logged
+  real MLB edges nyy-cle PK +3.75¢, phi-tor KP +6.81¢).
+- **Remaining for live:** dynamic (un)subscribe on discovery churn; per-frame FLIP debounce.
 - **Deploy is gated** → DigitalOcean droplet, consult the owner first
   ([decisions/0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 

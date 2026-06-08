@@ -20,7 +20,7 @@ Kalshi WS (orderbook_delta) is the second stream — RSA-PSS auth + snapshot/del
 """
 import os, sys, json, time
 sys.path.insert(0, os.path.dirname(__file__))
-from ledger import signal  # reuse the cross-venue best-edge calculation (single source of truth)
+from ledger import signal, pfee, kfee  # cross-venue edge + fee models (single source of truth)
 from kalshi_book import KalshiBook, SeqTracker, kalshi_ws_headers  # Kalshi snapshot/delta merge
 
 # ============================================================================================
@@ -88,6 +88,46 @@ class MarketTracker:
         return self.evaluate()
 
 
+def game_edge(pm_bid, pm_ask, kA_ask, kB_ask):
+    """2-outcome cross-venue edge for a GAME (polymarket market YES = team A). Cheapest venue per side:
+    back A = min(pm_ask, Kalshi-A ask); back B = min(1 - pm_bid, Kalshi-B ask). Returns {arb,dir,net} or
+    None. dir = (venue backing A)+(venue backing B), e.g. 'PK' = back A on polymarket, B on Kalshi."""
+    if None in (pm_bid, pm_ask, kA_ask, kB_ask):
+        return None
+    pm_backB = round(1 - pm_bid, 4)
+    aA, vA = (pm_ask, "P") if pm_ask <= kA_ask else (kA_ask, "K")
+    aB, vB = (pm_backB, "P") if pm_backB <= kB_ask else (kB_ask, "K")
+    feeA = pfee(aA) if vA == "P" else kfee(aA)
+    feeB = pfee(aB) if vB == "P" else kfee(aB)
+    net = round((1 - (aA + aB)) - feeA - feeB, 4)
+    return {"arb": net > 0, "dir": vA + vB, "net": net}
+
+
+class GameTracker:
+    """2-outcome cross-venue tracker for ONE game: the polymarket game market (YES = team A) + the TWO
+    Kalshi single-team markets (ticker_a = 'A wins', ticker_b = 'B wins'). Emits the same transitions as
+    MarketTracker; a FLIP here = the cheapest-execution config (which side is bought on which venue) flips."""
+    def __init__(self, slug, ticker_a, ticker_b):
+        self.slug, self.ta, self.tb = slug, ticker_a, ticker_b
+        self.pm = (None, None)          # polymarket (best YES bid, best YES ask)
+        self.ka = self.kb = None        # Kalshi best YES ask on ticker_a / ticker_b
+        self.state = None
+
+    def set_pm(self, bid, ask):
+        self.pm = (bid, ask)
+
+    def set_kalshi(self, side, yes_ask):   # side in {"A","B"}
+        if side == "A": self.ka = yes_ask
+        else: self.kb = yes_ask
+
+    def evaluate(self):
+        new = game_edge(self.pm[0], self.pm[1], self.ka, self.kb)
+        label = classify(self.state, new)
+        if new is not None:
+            self.state = new
+        return label, new
+
+
 class TransitionLogger:
     """Append-only JSONL sink. One line per logged edge transition."""
     def __init__(self, path):
@@ -125,11 +165,28 @@ def _selftest():
         assert label == expect, f"expected {expect}, got {label} (state {trk.state})"
         print(f"  P{po[0]['px']['value']}/{pb[0]['px']['value']}  K{ko[0]['px']['value']}/{kb[0]['px']['value']}  -> {label}")
     assert [g for g in got if g] == ["OPEN", "WIDEN", "FLIP", "CLOSE"]
-    print("OK - OPEN / WIDEN / FLIP / CLOSE all detected; no spurious transitions.")
+    print("OK - weather 1:1: OPEN / WIDEN / FLIP / CLOSE all detected; no spurious transitions.")
+
+    # --- GameTracker: 2-outcome sports (polymarket game YES=A; two Kalshi team books) ---
+    g = GameTracker("nyy-bos", "K-NYY", "K-BOS")
+    gseq = [   # (pm_bid, pm_ask, kA_ask, kB_ask, expected)
+        (0.53, 0.55, 0.56, 0.48, None),    # backA min(.55,.56)=.55P + backB min(.47,.48)=.47P > $1 -> no arb
+        (0.48, 0.50, 0.55, 0.45, "OPEN"),  # A@P .50 + B@K .45 = .95 -> arb (dir PK)
+        (0.48, 0.48, 0.55, 0.44, "WIDEN"), # both legs cheaper
+        (0.56, 0.58, 0.46, 0.50, "FLIP"),  # A@K .46 + B@P .44 -> dir KP
+        (0.53, 0.55, 0.56, 0.48, "CLOSE"), # back to no arb
+    ]
+    ggot = []
+    for pb, pa, ka, kb, expect in gseq:
+        g.set_pm(pb, pa); g.set_kalshi("A", ka); g.set_kalshi("B", kb)
+        label, _ = g.evaluate(); ggot.append(label)
+        assert label == expect, f"game expected {expect}, got {label} (state {g.state})"
+    assert [x for x in ggot if x] == ["OPEN", "WIDEN", "FLIP", "CLOSE"]
+    print("OK - sports 2-outcome: OPEN / WIDEN / FLIP / CLOSE via cheapest-venue-per-side (3 books)")
 
 
 # ============================================================================================
-# LIVE LAYER  (protocol verified for polymarket.us; Kalshi auth = next TODO; deploy = gated)
+# LIVE LAYER  (both venue streams validated; weather=MarketTracker, sports=GameTracker; deploy gated)
 # ============================================================================================
 PMUS_WS = "wss://api.polymarket.us/v1/ws/markets"
 PMUS_WS_PATH = "/v1/ws/markets"
@@ -150,38 +207,47 @@ def _pmus_auth_headers():
     return {"X-PM-Access-Key": env["PMUS_ACCESS_KEY"], "X-PM-Timestamp": ts, "X-PM-Signature": sig}
 
 async def run_live(logger, refresh_sec=300):
-    """Open both streams, route deltas through MarketTrackers, log transitions. Builds its own co-listed
-    map via FULL discovery (bot/colisted_map.py) and re-audits coverage on the heartbeat. GATED (0006).
-
-    Wiring status:
-      • polymarket.us markets WS + Kalshi orderbook_delta WS — both VALIDATED.
-      • Co-listed map: the WEATHER subset (1:1 slug<->ticker) is wired here; SPORTS needs the 2-outcome
-        tracker (a pm game market <-> two Kalshi team tickers) — next extension.
-    """
+    """Open both venue WS streams, route each book delta to the right tracker, log transitions. Self-
+    discovers the co-listed universe (bot/colisted_map.py): WEATHER via the 1:1 MarketTracker, SPORTS via
+    the 2-outcome GameTracker (pm game market + two Kalshi team tickers). Re-audits coverage + churn on the
+    heartbeat. Read-only (no orders); droplet DEPLOY is gated (decision 0006)."""
     import asyncio, websockets
-    from colisted_map import build_colisted_map, weather_monitor_map
+    from colisted_map import build_colisted_map
     shard_size = 100
     colisted, rep = build_colisted_map()
     for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
         if rep[kind]:
             print(f"[coverage] WARNING unmapped {kind}: {rep[kind]} (MISSED until added to colisted_map.py)")
-    market_map = weather_monitor_map(colisted)            # weather 1:1; sports = 2-outcome tracker TODO
-    print(f"[discovery] {len(market_map)} co-listed weather markets live; "
-          f"{rep['counts']['sports_pairs']} sports pairs pending the 2-outcome tracker")
-    trackers = {slug: MarketTracker(slug) for slug in market_map}
-    tick2slug = {t: s for s, t in market_map.items()}     # Kalshi ticker -> pmus slug (reverse map)
 
-    def on_book(venue, slug, bids, offers):
-        trk = trackers.get(slug)
-        if not trk:
-            return
-        label, state = trk.update(venue, bids, offers)
+    def emit(label, state, key):
         if label:
-            rec = logger.write(slug, label, state, int(time.time()))
-            print(f"[{rec['t']}] {slug} {label} dir={rec['dir']} net={rec['net_edge']}")
+            rec = logger.write(key, label, state, int(time.time()))
+            print(f"[{rec['t']}] {key} {label} dir={rec['dir']} net={rec['net_edge']}")
+
+    # dispatch: pmus slug -> fn(bids, offers) ;  Kalshi ticker -> fn(KalshiBook)
+    pm_targets, k_targets = {}, {}
+    for e in colisted["weather"]:                         # WEATHER = 1:1 binary MarketTracker
+        trk = MarketTracker(e["slug"])
+        def pm_fn(b, o, trk=trk, key=e["slug"]):
+            trk.set_book("P", b, o); emit(*trk.evaluate(), key)
+        def k_fn(book, trk=trk, key=e["slug"]):
+            trk.set_book("K", book.yes_bid_ladder(), book.yes_offer_ladder()); emit(*trk.evaluate(), key)
+        pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi"]] = k_fn
+    for e in colisted["sports"]:                          # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
+        g = GameTracker(e["slug"], e["kalshi_a"], e["kalshi_b"])
+        def pm_fn(b, o, g=g, key=e["slug"]):
+            g.set_pm(best_px(b), best_px(o)); emit(*g.evaluate(), key)
+        def ka_fn(book, g=g, key=e["slug"]):
+            g.set_kalshi("A", book.best()[1]); emit(*g.evaluate(), key)
+        def kb_fn(book, g=g, key=e["slug"]):
+            g.set_kalshi("B", book.best()[1]); emit(*g.evaluate(), key)
+        pm_targets[e["slug"]] = pm_fn
+        k_targets[e["kalshi_a"]] = ka_fn; k_targets[e["kalshi_b"]] = kb_fn
+    print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports "
+          f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
 
     async def pmus_stream():
-        slugs = list(market_map)
+        slugs = list(pm_targets)
         async with websockets.connect(PMUS_WS, additional_headers=_pmus_auth_headers()) as ws:
             for i in range(0, len(slugs), shard_size):          # ≤100 slugs per subscription
                 await ws.send(json.dumps({"subscribe": {
@@ -189,13 +255,14 @@ async def run_live(logger, refresh_sec=300):
                     "marketSlugs": slugs[i:i + shard_size]}}))
             async for msg in ws:
                 md = (json.loads(msg) or {}).get("marketData")
-                if md:
-                    on_book("P", md.get("marketSlug"), md.get("bids", []), md.get("offers", []))
+                fn = pm_targets.get((md or {}).get("marketSlug"))
+                if fn:
+                    fn(md.get("bids", []), md.get("offers", []))
 
     async def kalshi_stream():
         # RSA-PSS handshake + orderbook_delta, merged via KalshiBook (bot/kalshi_book.py; validated
         # offline + live). seq is ONE per-connection counter -> a gap means resubscribe everything.
-        tickers = list(tick2slug)
+        tickers = list(k_targets)
         async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
             async def subscribe():
                 await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
@@ -213,16 +280,16 @@ async def run_live(logger, refresh_sec=300):
                     books[tk].apply_delta(msg)
                 else:
                     continue
-                slug = tick2slug.get(tk)
-                if slug:
-                    on_book("K", slug, books[tk].yes_bid_ladder(), books[tk].yes_offer_ladder())
+                fn = k_targets.get(tk)
+                if fn:
+                    fn(books[tk])
 
     async def rest_heartbeat():     # periodic FULL re-discovery: coverage audit + churn (decision 0003)
         while True:
             await asyncio.sleep(refresh_sec)
             fresh, r2 = await asyncio.to_thread(build_colisted_map)
-            new_map = weather_monitor_map(fresh)
-            added, gone = set(new_map) - set(market_map), set(market_map) - set(new_map)
+            fresh_slugs = {e["slug"] for e in fresh["weather"] + fresh["sports"]}
+            added, gone = fresh_slugs - set(pm_targets), set(pm_targets) - fresh_slugs
             for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
                 if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
             if added or gone:
@@ -234,6 +301,13 @@ async def run_live(logger, refresh_sec=300):
 
 if __name__ == "__main__":
     if "--live" in sys.argv:
-        raise SystemExit("--live is GATED: wire the co-listed market_map + Kalshi WS auth, and "
-                         "consult the owner before deploying (decision 0006). Run with no args for the self-test.")
-    _selftest()
+        import asyncio
+        secs = next((int(a) for a in sys.argv[1:] if a.isdigit()), 60)
+        out = os.path.join(os.path.dirname(__file__), "..", "scripts", "_data", "transitions.jsonl")
+        print(f"LIVE read-only dual-stream ~{secs}s -> {out}  (no orders; droplet DEPLOY still gated, 0006)")
+        try:
+            asyncio.run(asyncio.wait_for(run_live(TransitionLogger(out)), timeout=secs))
+        except (asyncio.TimeoutError, KeyboardInterrupt):
+            print(f"stopped after ~{secs}s")
+    else:
+        _selftest()

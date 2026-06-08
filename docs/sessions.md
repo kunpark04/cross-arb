@@ -6,6 +6,19 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Sports 2-outcome tracker (GameTracker) + first live dual-stream run
+
+Built `GameTracker` in `bot/monitor.py`: the 2-outcome cross-venue tracker for the sports topology (the
+polymarket game market YES=team A + the TWO Kalshi single-team tickers), computing the cheapest-venue-
+per-side edge (`game_edge`) and emitting the same OPEN/CLOSE/FLIP/WIDEN/NARROW transitions as the weather
+`MarketTracker`. Self-test passes. Rewired `run_live` into a unified dispatch (pmus slug → fn, Kalshi
+ticker → fn) routing weather to `MarketTracker` and sports to `GameTracker`; `--live N` now does a bounded
+read-only run. **First live dual-stream run** (`--live 75`): connected both streams, tracked 60 weather +
+124 sports (184 pmus slugs / 292 Kalshi tickers), and logged real live MLB cross-venue edges
+(`aec-mlb-nyy-cle` OPEN dir PK net 0.0375; `aec-mlb-phi-tor` OPEN dir KP net 0.0681) — also confirming a
+sports slug's pmus WS frame delivers a usable book. Remaining: dynamic (un)subscribe on discovery churn;
+per-frame FLIP debounce.
+
 ## 2026-06-08 — Co-listed map: full-discovery builder + coverage audit
 
 Built `bot/colisted_map.py`: `build_colisted_map()` rebuilds the {pmus slug ↔ Kalshi ticker} map from a
