@@ -6,6 +6,19 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Monitor refinements: dynamic re-subscribe + FLIP debounce (build complete)
+
+Closed the two remaining monitor pieces. (1) **Dynamic re-subscribe:** `run_live` holds the live WS
+connections and, on each heartbeat, re-runs full discovery and subscribes any NEW weather days / games on
+both streams (`register()`), so a day-long run keeps coverage without a restart (settled markets idle
+out). (2) **FLIP debounce:** extracted `FlipDebouncer` (own self-test) — a CLOSE is held ~1s; an
+opposite-direction OPEN within the window becomes one FLIP, a same-direction reopen is a suppressed
+flicker, otherwise the CLOSE is flushed. **Live-verified** (`--live 120 30`): both streams + dispatch +
+debouncer + heartbeat ran clean — captured a full LAX weather edge lifecycle (OPEN→WIDEN→NARROW→CLOSE)
+plus live MLB edges, heartbeat re-discovery executing each cycle. The persistence-layer monitor (todo #10)
+is **build-complete** as a read-only logger; an extended data-collection run is the gated DigitalOcean
+deployment (decision 0006).
+
 ## 2026-06-08 — Sports 2-outcome tracker (GameTracker) + first live dual-stream run
 
 Built `GameTracker` in `bot/monitor.py`: the 2-outcome cross-venue tracker for the sports topology (the

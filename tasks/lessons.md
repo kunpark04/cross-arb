@@ -57,7 +57,7 @@ new direction as a fresh open. The self-test caught it.
 **Rule:** treat a "tick" as a **complete dual-venue snapshot** and classify the current complete state
 against the last complete state (`MarketTracker.evaluate()`). In the live per-frame path, a true FLIP
 legitimately surfaces as CLOSE→OPEN across two frames — coalescing those into one FLIP is an explicit
-**debounce** concern, not something to fake by resetting state mid-update.
+**debounce** concern, not something to fake by resetting state mid-update. **(Implemented 2026-06-08 as `FlipDebouncer` in `bot/monitor.py`, with its own self-test.)**
 
 ## L6 — polymarket.us `?active=true` returns STALE markets; use `?closed=false`
 

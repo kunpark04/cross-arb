@@ -62,7 +62,11 @@ python bot/monitor.py --live N # bounded ~N-second READ-ONLY dual-stream run (no
   game market + two Kalshi team tickers, cheapest-venue-per-side). `run_live` dispatches each book delta
   to the right one. **Live-verified** 2026-06-08 (`--live 75`: 60 weather + 124 sports tracked; logged
   real MLB edges nyy-cle PK +3.75¢, phi-tor KP +6.81¢).
-- **Remaining for live:** dynamic (un)subscribe on discovery churn; per-frame FLIP debounce.
+- **Dynamic re-subscribe + FLIP debounce** — the heartbeat re-discovers and subscribes new weather days /
+  games (`register`); `FlipDebouncer` coalesces a CLOSE + opposite-direction OPEN within ~1s into one FLIP
+  (same-dir reopen = suppressed flicker). Both live-verified 2026-06-08 (captured a full LAX weather edge
+  OPEN→WIDEN→NARROW→CLOSE + live MLB edges).
+- **Extended run = DigitalOcean droplet deploy** — gated on owner sign-off ([0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 - **Deploy is gated** → DigitalOcean droplet, consult the owner first
   ([decisions/0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 

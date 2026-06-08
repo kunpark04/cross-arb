@@ -128,6 +128,40 @@ class GameTracker:
         return label, new
 
 
+class FlipDebouncer:
+    """Live per-frame flicker guard. A genuine direction reversal arrives as CLOSE then OPEN across two
+    frames (the legs move one at a time), and a half-updated book can momentarily drop the arb. This
+    holds a CLOSE for `window` seconds: if an OPPOSITE-direction OPEN follows it becomes one FLIP; a
+    SAME-direction reopen is a flicker and is suppressed; otherwise the CLOSE is flushed once the window
+    elapses. feed()/flush() return the list of (label, state, key) tuples to actually log."""
+    def __init__(self, window=1.0):
+        self.window = window
+        self.last_arb_dir = {}                 # key -> dir while arb'd
+        self.pending = {}                      # key -> (t, closed_from_dir, close_state)
+    def feed(self, label, state, key, now):
+        if not label:
+            return []
+        if label == "CLOSE":
+            self.pending[key] = (now, self.last_arb_dir.get(key), state)
+            return []                          # hold; a flip may complete on the next frame
+        if label == "OPEN":
+            pc = self.pending.pop(key, None)
+            if pc and now - pc[0] <= self.window:
+                if pc[1] and pc[1] != state["dir"]:
+                    label = "FLIP"             # close + opposite-direction open = a flip
+                else:
+                    self.last_arb_dir[key] = state["dir"]
+                    return []                  # same-direction reopen = flicker, suppress
+        self.last_arb_dir[key] = state["dir"]
+        return [(label, state, key)]
+    def flush(self, now):
+        out = []
+        for key in [k for k, (t, _, _) in self.pending.items() if now - t > self.window]:
+            t, _, st = self.pending.pop(key); self.last_arb_dir.pop(key, None)
+            out.append(("CLOSE", st, key))
+        return out
+
+
 class TransitionLogger:
     """Append-only JSONL sink. One line per logged edge transition."""
     def __init__(self, path):
@@ -184,6 +218,19 @@ def _selftest():
     assert [x for x in ggot if x] == ["OPEN", "WIDEN", "FLIP", "CLOSE"]
     print("OK - sports 2-outcome: OPEN / WIDEN / FLIP / CLOSE via cheapest-venue-per-side (3 books)")
 
+    # --- FlipDebouncer: CLOSE + opposite-OPEN within window = FLIP; same-dir = flicker (suppressed) ---
+    A = {"arb": True, "dir": "PK", "net": 0.03}; Ac = {"arb": False, "dir": "PK", "net": -0.01}
+    B = {"arb": True, "dir": "KP", "net": 0.04}
+    d = FlipDebouncer(1.0)
+    assert d.feed("OPEN", A, "m", 100.0) == [("OPEN", A, "m")]
+    assert d.feed("CLOSE", Ac, "m", 100.2) == []                  # held
+    assert d.feed("OPEN", B, "m", 100.3) == [("FLIP", B, "m")]    # opposite within window -> FLIP
+    d2 = FlipDebouncer(1.0); d2.feed("OPEN", A, "m", 0.0); d2.feed("CLOSE", Ac, "m", 0.1)
+    assert d2.feed("OPEN", A, "m", 0.2) == []                     # same dir within window -> flicker
+    d3 = FlipDebouncer(1.0); d3.feed("OPEN", A, "m", 0.0); d3.feed("CLOSE", Ac, "m", 0.1)
+    assert d3.flush(0.5) == [] and d3.flush(2.0) == [("CLOSE", Ac, "m")]   # real close flushes post-window
+    print("OK - FlipDebouncer: FLIP coalesce, flicker suppress, CLOSE flush")
+
 
 # ============================================================================================
 # LIVE LAYER  (both venue streams validated; weather=MarketTracker, sports=GameTracker; deploy gated)
@@ -206,7 +253,7 @@ def _pmus_auth_headers():
     sig = base64.b64encode(priv.sign(f"{ts}GET{PMUS_WS_PATH}".encode())).decode()
     return {"X-PM-Access-Key": env["PMUS_ACCESS_KEY"], "X-PM-Timestamp": ts, "X-PM-Signature": sig}
 
-async def run_live(logger, refresh_sec=300):
+async def run_live(logger, refresh_sec=300, debounce=1.0):
     """Open both venue WS streams, route each book delta to the right tracker, log transitions. Self-
     discovers the co-listed universe (bot/colisted_map.py): WEATHER via the 1:1 MarketTracker, SPORTS via
     the 2-outcome GameTracker (pm game market + two Kalshi team tickers). Re-audits coverage + churn on the
@@ -214,41 +261,47 @@ async def run_live(logger, refresh_sec=300):
     import asyncio, websockets
     from colisted_map import build_colisted_map
     shard_size = 100
+    pm_targets, k_targets, conns = {}, {}, {}     # slug->fn(bids,offers) ; ticker->fn(book) ; "pm"/"k"->ws
+    deb = FlipDebouncer(debounce)
+
+    def _write(label, state, key):
+        rec = logger.write(key, label, state, int(time.time()))
+        print(f"[{rec['t']}] {key} {label} dir={rec['dir']} net={rec['net_edge']}")
+    def emit(label, state, key):
+        for lab, st, k in deb.feed(label, state, key, time.time()):
+            _write(lab, st, k)
+
+    def register(colisted):                       # add trackers for NEW markets; return (new slugs, new tickers)
+        new_pm, new_k = [], []
+        for e in colisted["weather"]:             # WEATHER = 1:1 binary MarketTracker
+            if e["slug"] in pm_targets: continue
+            trk = MarketTracker(e["slug"])
+            def pm_fn(b, o, trk=trk, key=e["slug"]): trk.set_book("P", b, o); emit(*trk.evaluate(), key)
+            def k_fn(book, trk=trk, key=e["slug"]): trk.set_book("K", book.yes_bid_ladder(), book.yes_offer_ladder()); emit(*trk.evaluate(), key)
+            pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi"]] = k_fn
+            new_pm.append(e["slug"]); new_k.append(e["kalshi"])
+        for e in colisted["sports"]:              # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
+            if e["slug"] in pm_targets: continue
+            g = GameTracker(e["slug"], e["kalshi_a"], e["kalshi_b"])
+            def pm_fn(b, o, g=g, key=e["slug"]): g.set_pm(best_px(b), best_px(o)); emit(*g.evaluate(), key)
+            def ka_fn(book, g=g, key=e["slug"]): g.set_kalshi("A", book.best()[1]); emit(*g.evaluate(), key)
+            def kb_fn(book, g=g, key=e["slug"]): g.set_kalshi("B", book.best()[1]); emit(*g.evaluate(), key)
+            pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi_a"]] = ka_fn; k_targets[e["kalshi_b"]] = kb_fn
+            new_pm.append(e["slug"]); new_k += [e["kalshi_a"], e["kalshi_b"]]
+        return new_pm, new_k
+
     colisted, rep = build_colisted_map()
     for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
         if rep[kind]:
             print(f"[coverage] WARNING unmapped {kind}: {rep[kind]} (MISSED until added to colisted_map.py)")
-
-    def emit(label, state, key):
-        if label:
-            rec = logger.write(key, label, state, int(time.time()))
-            print(f"[{rec['t']}] {key} {label} dir={rec['dir']} net={rec['net_edge']}")
-
-    # dispatch: pmus slug -> fn(bids, offers) ;  Kalshi ticker -> fn(KalshiBook)
-    pm_targets, k_targets = {}, {}
-    for e in colisted["weather"]:                         # WEATHER = 1:1 binary MarketTracker
-        trk = MarketTracker(e["slug"])
-        def pm_fn(b, o, trk=trk, key=e["slug"]):
-            trk.set_book("P", b, o); emit(*trk.evaluate(), key)
-        def k_fn(book, trk=trk, key=e["slug"]):
-            trk.set_book("K", book.yes_bid_ladder(), book.yes_offer_ladder()); emit(*trk.evaluate(), key)
-        pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi"]] = k_fn
-    for e in colisted["sports"]:                          # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
-        g = GameTracker(e["slug"], e["kalshi_a"], e["kalshi_b"])
-        def pm_fn(b, o, g=g, key=e["slug"]):
-            g.set_pm(best_px(b), best_px(o)); emit(*g.evaluate(), key)
-        def ka_fn(book, g=g, key=e["slug"]):
-            g.set_kalshi("A", book.best()[1]); emit(*g.evaluate(), key)
-        def kb_fn(book, g=g, key=e["slug"]):
-            g.set_kalshi("B", book.best()[1]); emit(*g.evaluate(), key)
-        pm_targets[e["slug"]] = pm_fn
-        k_targets[e["kalshi_a"]] = ka_fn; k_targets[e["kalshi_b"]] = kb_fn
+    register(colisted)
     print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports "
           f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
 
     async def pmus_stream():
-        slugs = list(pm_targets)
         async with websockets.connect(PMUS_WS, additional_headers=_pmus_auth_headers()) as ws:
+            conns["pm"] = ws
+            slugs = list(pm_targets)
             for i in range(0, len(slugs), shard_size):          # ≤100 slugs per subscription
                 await ws.send(json.dumps({"subscribe": {
                     "requestId": f"md-{i}", "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
@@ -262,17 +315,17 @@ async def run_live(logger, refresh_sec=300):
     async def kalshi_stream():
         # RSA-PSS handshake + orderbook_delta, merged via KalshiBook (bot/kalshi_book.py; validated
         # offline + live). seq is ONE per-connection counter -> a gap means resubscribe everything.
-        tickers = list(k_targets)
         async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
-            async def subscribe():
+            conns["k"] = ws
+            async def subscribe(tickers):
                 await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
                     "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}}))
-            await subscribe()
+            await subscribe(list(k_targets))
             books, st = {}, SeqTracker()
             async for raw in ws:
                 o = json.loads(raw)
                 if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> resync all
-                    books.clear(); st.reset(); await subscribe(); continue
+                    books.clear(); st.reset(); await subscribe(list(k_targets)); continue
                 typ, msg = o.get("type"), o.get("msg", {}); tk = msg.get("market_ticker")
                 if typ == "orderbook_snapshot":
                     books[tk] = KalshiBook(tk); books[tk].apply_snapshot(msg)
@@ -284,29 +337,44 @@ async def run_live(logger, refresh_sec=300):
                 if fn:
                     fn(books[tk])
 
-    async def rest_heartbeat():     # periodic FULL re-discovery: coverage audit + churn (decision 0003)
+    async def rest_heartbeat():     # periodic FULL re-discovery: subscribe NEW markets + coverage audit
         while True:
             await asyncio.sleep(refresh_sec)
             fresh, r2 = await asyncio.to_thread(build_colisted_map)
-            fresh_slugs = {e["slug"] for e in fresh["weather"] + fresh["sports"]}
-            added, gone = fresh_slugs - set(pm_targets), set(pm_targets) - fresh_slugs
             for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
                 if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
-            if added or gone:
-                print(f"[discovery] churn: +{len(added)} new / -{len(gone)} settled markets")
-            # TODO: (un)subscribe added/gone on both live WS connections + spin up/down their trackers.
+            new_pm, new_k = register(fresh)             # trackers for new weather days / games
+            if new_pm and conns.get("pm"):
+                for i in range(0, len(new_pm), shard_size):
+                    await conns["pm"].send(json.dumps({"subscribe": {
+                        "requestId": f"md-add-{int(time.time())}-{i}",
+                        "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+                        "marketSlugs": new_pm[i:i + shard_size]}}))
+            if new_k and conns.get("k"):
+                await conns["k"].send(json.dumps({"id": 2, "cmd": "subscribe",
+                    "params": {"channels": ["orderbook_delta"], "market_tickers": new_k}}))
+            if new_pm:
+                print(f"[discovery] +{len(new_pm)} new markets subscribed (settled ones idle out)")
 
-    await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat())
+    async def flusher():            # emit debounced CLOSEs whose flip-window elapsed
+        while True:
+            await asyncio.sleep(0.5)
+            for lab, st, k in deb.flush(time.time()):
+                _write(lab, st, k)
+
+    await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat(), flusher())
 
 
 if __name__ == "__main__":
     if "--live" in sys.argv:
         import asyncio
-        secs = next((int(a) for a in sys.argv[1:] if a.isdigit()), 60)
+        nums = [int(a) for a in sys.argv[1:] if a.isdigit()]
+        secs = nums[0] if nums else 60
+        refresh = nums[1] if len(nums) > 1 else 300        # optional 2nd arg: re-discovery interval (sec)
         out = os.path.join(os.path.dirname(__file__), "..", "scripts", "_data", "transitions.jsonl")
-        print(f"LIVE read-only dual-stream ~{secs}s -> {out}  (no orders; droplet DEPLOY still gated, 0006)")
+        print(f"LIVE read-only dual-stream ~{secs}s (refresh {refresh}s) -> {out}  (no orders; deploy gated, 0006)")
         try:
-            asyncio.run(asyncio.wait_for(run_live(TransitionLogger(out)), timeout=secs))
+            asyncio.run(asyncio.wait_for(run_live(TransitionLogger(out), refresh_sec=refresh), timeout=secs))
         except (asyncio.TimeoutError, KeyboardInterrupt):
             print(f"stopped after ~{secs}s")
     else:

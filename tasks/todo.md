@@ -36,7 +36,7 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       12 sports leagues), uniform metrics, nothing pruned -> `_data/scan_all.json`. Snapshot: MLB
       ~$15 (3 edges); weather $0 *this instant* (intermittent — ~$20 mid-day, settles by EOD); all
       sharp sports efficient but retained.
-- [ ] **10. Time-series / persistence layer** — capture how edges appear / persist / flip / fade per
+- [x] **10. Time-series / persistence layer** — capture how edges appear / persist / flip / fade per
       market over the day (the input to the bot's layer/rotate logic). **Design decided 2026-06-08:
       NOT blind fixed-cadence snapshot polling** — fixed cadence aliases the transient edges + flips the
       arb actually hunts, burns REST limits across the ~200 co-listed markets, and is stale by one
@@ -80,7 +80,13 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       passing, wired into run_live's unified dispatch. **LIVE-VERIFIED** (`--live 75`): tracked 60 weather
       + 124 sports (184 pmus slugs / 292 Kalshi tickers) and logged real MLB OPEN edges (nyy-cle dir PK
       net 0.0375; phi-tor dir KP net 0.0681). Remaining: dynamic re-subscribe on churn + per-frame FLIP
-      debounce. (Item #10 is now functionally COMPLETE for a read-only logger.)
+      debounce.
+      **→ UPDATE 2026-06-08 (refinements A done):** dynamic re-subscribe (heartbeat adds new weather
+      days / games via `register()` + live subscribe) + FLIP debounce (`FlipDebouncer`: CLOSE + opposite
+      OPEN within ~1s = one FLIP; flicker suppressed) built, self-tested, and **LIVE-VERIFIED**
+      (`--live 120 30`: captured a full LAX weather edge OPEN→WIDEN→NARROW→CLOSE + live MLB edges; heartbeat
+      re-discovery ran clean). **Monitor (item #10) BUILD COMPLETE** as a read-only logger; an extended
+      data-collection run = DigitalOcean deploy (gated, [0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit
