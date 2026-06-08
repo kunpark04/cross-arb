@@ -55,8 +55,12 @@ python bot/monitor.py --live   # GATED — needs co-listed map + Kalshi WS auth 
   `{ts}GET/v1/ws/markets`, slug-keyed `SUBSCRIPTION_TYPE_MARKET_DATA`, frames = REST-book shape.
 - **Kalshi stream** (`kalshi_book.py`) — RSA-PSS handshake + snapshot/delta merge (`KalshiBook`),
   VALIDATED offline + live (28 real deltas, no seq gaps). `python bot/kalshi_book.py [--live]`.
-- **Remaining for live:** the co-listed `{slug: ticker}` map from `scripts/scan_all.py`; per-frame
-  FLIP debounce; REST heartbeat resync.
+- **Co-listed map** (`colisted_map.py`) — `build_colisted_map()` does FULL discovery (pmus catalog +
+  Kalshi series, dynamic date/event grouping) → `{slug:ticker}` pairs, plus a COVERAGE AUDIT that flags
+  any pmus city/league we don't map. `python bot/colisted_map.py`. Weather is 1:1 (monitor-ready);
+  sports = a game ↔ two Kalshi tickers (2-outcome tracker TODO). Refreshed on the heartbeat ([0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).
+- **Remaining for live:** the SPORTS 2-outcome tracker; dynamic (un)subscribe on discovery churn;
+  per-frame FLIP debounce.
 - **Deploy is gated** → DigitalOcean droplet, consult the owner first
   ([decisions/0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 

@@ -68,3 +68,15 @@ subscribe failed.
 **Rule:** to list **currently-open** markets use `?closed=false&archived=false`; for today's weather,
 `?categories[]=climate&closed=false`. Don't trust `active=true` as "tradeable now."
 (Recorded in `research/polymarketus-api-auth.md` §3c.)
+
+## L7 — A hardcoded "what to discover" list silently misses new categories — audit it
+
+**Pattern:** co-listed discovery keys on hardcoded maps — `WX` (5 weather cities) and `LEAGUES` (12
+sports leagues). These catch new *dates/games* dynamically, but a brand-new **category** (a 6th city, a
+new league) matches nothing and vanishes silently. The first discovery run surfaced an unmapped league
+`twc` (influencer soccer) that a naive map would have dropped without a trace.
+
+**Rule:** any hardcoded enumeration of "what to look for" needs a **coverage audit** that compares the
+*live* universe against the config and **loudly reports** anything unmapped. `build_colisted_map()`
+returns that report and the monitor logs it every heartbeat. Detection ≠ auto-inclusion — a human still
+decides whether a flagged category is worth mapping ([decision 0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).

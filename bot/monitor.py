@@ -149,15 +149,25 @@ def _pmus_auth_headers():
     sig = base64.b64encode(priv.sign(f"{ts}GET{PMUS_WS_PATH}".encode())).decode()
     return {"X-PM-Access-Key": env["PMUS_ACCESS_KEY"], "X-PM-Timestamp": ts, "X-PM-Signature": sig}
 
-async def run_live(market_map, logger, shard_size=100):
-    """Open both streams, route deltas through MarketTrackers, log transitions. GATED — needs the
-    co-listed market_map {pmus_slug: kalshi_ticker} from the matcher (scripts/scan_all.py output).
+async def run_live(logger, refresh_sec=300):
+    """Open both streams, route deltas through MarketTrackers, log transitions. Builds its own co-listed
+    map via FULL discovery (bot/colisted_map.py) and re-audits coverage on the heartbeat. GATED (0006).
 
     Wiring status:
-      • polymarket.us markets WS — protocol VERIFIED; sharded subscribe + frame parse below.
-      • Kalshi orderbook_delta WS — endpoint known; AUTH + delta-merge are the next implementation TODO.
+      • polymarket.us markets WS + Kalshi orderbook_delta WS — both VALIDATED.
+      • Co-listed map: the WEATHER subset (1:1 slug<->ticker) is wired here; SPORTS needs the 2-outcome
+        tracker (a pm game market <-> two Kalshi team tickers) — next extension.
     """
     import asyncio, websockets
+    from colisted_map import build_colisted_map, weather_monitor_map
+    shard_size = 100
+    colisted, rep = build_colisted_map()
+    for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
+        if rep[kind]:
+            print(f"[coverage] WARNING unmapped {kind}: {rep[kind]} (MISSED until added to colisted_map.py)")
+    market_map = weather_monitor_map(colisted)            # weather 1:1; sports = 2-outcome tracker TODO
+    print(f"[discovery] {len(market_map)} co-listed weather markets live; "
+          f"{rep['counts']['sports_pairs']} sports pairs pending the 2-outcome tracker")
     trackers = {slug: MarketTracker(slug) for slug in market_map}
     tick2slug = {t: s for s, t in market_map.items()}     # Kalshi ticker -> pmus slug (reverse map)
 
@@ -207,10 +217,17 @@ async def run_live(market_map, logger, shard_size=100):
                 if slug:
                     on_book("K", slug, books[tk].yes_bid_ladder(), books[tk].yes_offer_ladder())
 
-    async def rest_heartbeat():     # slow full-universe resync + coverage check (decision 0003)
+    async def rest_heartbeat():     # periodic FULL re-discovery: coverage audit + churn (decision 0003)
         while True:
-            await asyncio.sleep(120)
-            # TODO: REST-sweep every market, reconcile against tracker state, warn on drift/gaps.
+            await asyncio.sleep(refresh_sec)
+            fresh, r2 = await asyncio.to_thread(build_colisted_map)
+            new_map = weather_monitor_map(fresh)
+            added, gone = set(new_map) - set(market_map), set(market_map) - set(new_map)
+            for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
+                if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
+            if added or gone:
+                print(f"[discovery] churn: +{len(added)} new / -{len(gone)} settled markets")
+            # TODO: (un)subscribe added/gone on both live WS connections + spin up/down their trackers.
 
     await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat())
 

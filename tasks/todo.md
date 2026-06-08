@@ -69,6 +69,12 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       reconstructs the Kalshi book from snapshot+deltas — VALIDATED offline + live (28 real deltas, 0 seq
       gaps) — and is wired into `monitor.py`'s `kalshi_stream`. **Both streams now implemented.** Remaining:
       co-listed `{slug:ticker}` map (`scan_all.py`) + FLIP debounce + REST heartbeat → live dual-stream run.
+      **→ UPDATE 2026-06-08 (co-listed map):** `bot/colisted_map.py` `build_colisted_map()` does FULL
+      discovery (60 weather + 123 sports pairs now) + a COVERAGE AUDIT (caught unmapped league `twc`
+      soccer — 1 niche mkt, no Kalshi co-listing, left unmapped). Wired into `monitor.py` run_live
+      (weather 1:1) + heartbeat re-discovery ([decision 0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).
+      Remaining: SPORTS 2-outcome tracker (game ↔ 2 Kalshi tickers) + dynamic re-subscribe on churn +
+      FLIP debounce → short live read-only dual-stream run.
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit

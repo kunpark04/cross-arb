@@ -6,6 +6,18 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Co-listed map: full-discovery builder + coverage audit
+
+Built `bot/colisted_map.py`: `build_colisted_map()` rebuilds the {pmus slug ↔ Kalshi ticker} map from a
+FULL catalog pull each call (dynamic date/event grouping → new weather days + sports games auto-covered),
+reusing `scan_all.py`'s identity matching (no false positives, L1). It also returns a COVERAGE AUDIT that
+flags any pmus climate city / sports league not in `WX`/`LEAGUES`. Live run: 60 weather + 123 sports
+pairs; the audit immediately caught an unmapped league `twc` (influencer soccer, 1 market, no Kalshi
+co-listing — left unmapped by choice). Wired into `bot/monitor.py`: `run_live` now self-discovers the
+weather map and the heartbeat re-runs discovery (coverage + churn logging). Design = decision 0008;
+gap-class lesson L7. Remaining for a live run: the SPORTS 2-outcome tracker, dynamic re-subscribe on
+churn, FLIP debounce.
+
 ## 2026-06-08 — Kalshi snapshot/delta merge built (KalshiBook) + wired into the monitor
 
 Built `bot/kalshi_book.py`: `KalshiBook` reconstructs a live Kalshi book from an `orderbook_snapshot`
