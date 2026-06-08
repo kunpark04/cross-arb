@@ -1,0 +1,11 @@
+# secrets & credentials
+scripts/.env
+*.pem
+*.key
+
+# raw API pulls / scratch data
+scripts/_data/
+
+# python
+__pycache__/
+*.pyc

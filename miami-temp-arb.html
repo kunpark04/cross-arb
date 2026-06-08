@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cross-Platform Arb — Miami Daily High (Kalshi vs Polymarket)</title>
+<style>
+  :root{
+    --bg:#0b0e11; --panel:#12161b; --panel2:#171c23; --line:#232a33;
+    --txt:#e6edf3; --muted:#9aa7b4; --dim:#6b7785;
+    --green:#3fb950; --green-bg:#0f2417; --red:#f85149; --red-bg:#2a1416;
+    --kalshi:#00d09c; --poly:#6f7bff; --warn:#f0b429; --warn-bg:#2a2210;
+    --good:#1f6feb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:980px;margin:0 auto;padding:40px 24px 80px}
+  header{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:30px}
+  .eyebrow{color:var(--dim);font-size:12px;letter-spacing:.14em;text-transform:uppercase;margin:0 0 8px}
+  h1{font-size:30px;line-height:1.2;margin:0 0 10px;font-weight:680}
+  h2{font-size:20px;margin:42px 0 14px;font-weight:640;display:flex;align-items:center;gap:10px}
+  h2 .n{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;
+    background:var(--panel2);border:1px solid var(--line);color:var(--muted);font-size:13px;font-weight:700}
+  h3{font-size:15px;margin:24px 0 8px;color:var(--muted);font-weight:640;letter-spacing:.02em}
+  p{margin:10px 0;color:#cdd6df}
+  .sub{color:var(--muted);font-size:14px;margin-top:2px}
+  .lead{font-size:16px;color:#dbe3ea}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#c9d3dc}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.02em}
+  .pill.kalshi{background:rgba(0,208,156,.12);color:var(--kalshi);border:1px solid rgba(0,208,156,.3)}
+  .pill.poly{background:rgba(111,123,255,.12);color:var(--poly);border:1px solid rgba(111,123,255,.3)}
+  .verdict{display:flex;gap:16px;align-items:flex-start;background:linear-gradient(180deg,#11201a,#0f1714);
+    border:1px solid #1c3a2b;border-radius:12px;padding:18px 20px;margin:6px 0 4px}
+  .verdict .big{font-size:30px;line-height:1;color:var(--green);font-weight:800;white-space:nowrap}
+  .verdict .big small{display:block;font-size:12px;color:var(--muted);font-weight:600;margin-top:6px;letter-spacing:.04em}
+  figure.shot{margin:22px 0 2px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#000}
+  figure.shot a{display:block;line-height:0}
+  figure.shot img{display:block;width:100%;height:auto}
+  figure.shot figcaption{padding:11px 16px;color:var(--muted);font-size:13px;background:var(--panel);
+    border-top:1px solid var(--line);line-height:1.5}
+  figure.shot figcaption b{color:var(--txt)}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  th,td{padding:10px 12px;text-align:right;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  thead th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+    border-bottom:1px solid var(--line)}
+  tbody tr:hover{background:#0f1418}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .hi{background:rgba(63,185,80,.07)}
+  .hi td{border-bottom:1px solid #1c3a2b}
+  .g{color:var(--green);font-weight:700}.r{color:var(--red)}.d{color:var(--dim)}
+  .tag{font-size:11px;color:var(--dim)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:14px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .card h4{margin:0 0 4px;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+  .card .px{font-size:13px}
+  .legbox{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .leg{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed var(--line)}
+  .leg:last-of-type{border-bottom:0}
+  .leg .lab{color:#cdd6df}.leg .lab b{color:var(--txt)}
+  .leg .amt{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+  .total{display:flex;justify-content:space-between;margin-top:10px;padding-top:12px;border-top:1px solid var(--line);
+    font-weight:700}
+  .payoff th,.payoff td{text-align:center}
+  .payoff th:first-child,.payoff td:first-child{text-align:left}
+  .win{color:var(--green);font-weight:700}.lose{color:var(--dim)}
+  .callout{border-radius:10px;padding:14px 18px;margin:14px 0;border:1px solid}
+  .callout.warn{background:var(--warn-bg);border-color:#4a3a12}
+  .callout.danger{background:var(--red-bg);border-color:#5a2420}
+  .callout .t{font-weight:700;margin-bottom:4px}
+  .callout.warn .t{color:var(--warn)}.callout.danger .t{color:var(--red)}
+  ul{margin:10px 0;padding-left:20px}li{margin:6px 0;color:#cdd6df}
+  .risknum{color:var(--warn);font-weight:700;margin-right:4px}
+  footer{margin-top:54px;padding-top:18px;border-top:1px solid var(--line);color:var(--dim);font-size:12.5px}
+  .swap{display:flex;gap:0;margin:16px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .swap>div{flex:1;padding:14px 16px}
+  .swap .k{background:rgba(0,208,156,.05)}.swap .p{background:rgba(111,123,255,.05);border-left:1px solid var(--line)}
+  .swap .hdr{font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+  .swap .row{display:flex;justify-content:space-between;padding:3px 0;font-size:14px}
+  .swap .row.peak{font-weight:700}
+  .swap .bar{height:6px;border-radius:3px;margin-top:3px}
+  @media(max-width:680px){.grid2,.swap{grid-template-columns:1fr;flex-direction:column}.wrap{padding:24px 16px 60px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Prediction-Market Arbitrage · Worked Example</p>
+  <h1>Cross-Platform Arb: Miami Daily-High Temperature</h1>
+  <p class="sub"><span class="pill kalshi">Kalshi</span> &nbsp;“Highest temperature in Miami today?” &nbsp;·&nbsp;
+     <span class="pill poly">Polymarket</span> &nbsp;“Highest temperature in Miami on June&nbsp;8?”</p>
+  <p class="sub d">Snapshot prices from the side-by-side screenshot. Two order books on the <em>same</em> underlying
+     event, 2&deg;F-wide buckets, settling on the daily high.</p>
+</header>
+
+<div class="verdict">
+  <div class="big">+24&cent;<small>PER $1 · ~32%</small></div>
+  <div>
+    <p style="margin:0 0 4px"><strong>Yes — on paper there are several cross-platform arbs, and the 90-91&deg;F pair is the fat one.</strong></p>
+    <p style="margin:0;color:#cdd6df">The two books have <strong>swapped their most-likely bucket</strong>: Kalshi’s mode is
+    90-91&deg;F (64%), Polymarket’s is 88-89&deg;F (50%). That single disagreement lets you buy the cheap side of the
+    same outcome on each venue and lock a guaranteed payout — <em>if</em> both legs settle off the identical reading.</p>
+  </div>
+</div>
+
+<figure class="shot">
+  <a href="miami-screenshot.png" target="_blank" rel="noopener">
+    <img src="miami-screenshot.png" alt="Side-by-side screenshot. Left: Kalshi 'Highest temperature in Miami today?' with buckets 85 or below through 94 or above and Yes/No cent prices. Right: Polymarket 'Highest temperature in Miami on June 8?' with buckets 84-85 through 92-93 and Buy Yes / Buy No cent prices.">
+  </a>
+  <figcaption><b>The source snapshot.</b> Left: <span class="pill kalshi">Kalshi</span> &nbsp;·&nbsp;
+    Right: <span class="pill poly">Polymarket</span>. Every price below is read from this image — note the
+    swapped peaks (Kalshi 90-91&deg; @ 64% vs Polymarket 88-89&deg; @ 50%). Click to enlarge.</figcaption>
+</figure>
+
+<!-- ============================================================= -->
+<h2><span class="n">1</span> The disagreement that creates it</h2>
+<p>Both venues price a mutually-exclusive, collectively-exhaustive set of 2&deg;F buckets. Their implied
+distributions are coherent <em>internally</em> (each set of Yes-asks sums to ~107&cent;, i.e. normal vig) but
+they disagree sharply with <em>each other</em> on which bucket is most likely:</p>
+
+<div class="swap">
+  <div class="k">
+    <div class="hdr" style="color:var(--kalshi)">Kalshi — implied chance</div>
+    <div class="row">86-87&deg;<span>2%</span></div>
+    <div class="row">88-89&deg;<span>31%</span></div>
+    <div class="bar" style="background:var(--kalshi);width:31%;opacity:.5"></div>
+    <div class="row peak">90-91&deg;<span>64%</span></div>
+    <div class="bar" style="background:var(--kalshi);width:64%"></div>
+    <div class="row">92-93&deg;<span>9%</span></div>
+  </div>
+  <div class="p">
+    <div class="hdr" style="color:var(--poly)">Polymarket — implied chance</div>
+    <div class="row">86-87&deg;<span>12%</span></div>
+    <div class="row peak">88-89&deg;<span>50%</span></div>
+    <div class="bar" style="background:var(--poly);width:50%"></div>
+    <div class="row">90-91&deg;<span>39%</span></div>
+    <div class="bar" style="background:var(--poly);width:39%;opacity:.6"></div>
+    <div class="row">92-93&deg;<span>2%</span></div>
+  </div>
+</div>
+<p class="sub d">Kalshi says 90-91 is the favorite; Polymarket says 88-89. They essentially traded places — which is
+exactly what makes the 88-89 and 90-91 hedges profitable in <em>opposite</em> directions.</p>
+
+<!-- ============================================================= -->
+<h2><span class="n">2</span> The mechanism</h2>
+<p>For any one bucket, “Yes” (it happens) and “No” (it doesn’t) are complementary. Buy <strong>Yes on the
+venue where Yes is cheaper</strong> and <strong>No on the venue where No is cheaper</strong>. Exactly one leg
+pays&nbsp;$1, so if the two prices add to <strong>under 100&cent;</strong>, the difference is locked profit:</p>
+
+<table>
+  <thead>
+    <tr><th>Bucket</th><th>Kalshi&nbsp;Yes&nbsp;/&nbsp;No</th><th>Poly&nbsp;Yes&nbsp;/&nbsp;No</th>
+        <th>Cheapest hedge</th><th>Cost</th><th>Gross</th><th>Net*</th></tr>
+  </thead>
+  <tbody>
+    <tr class="hi">
+      <td><b>90-91&deg;</b></td><td class="mono">65 / 36</td><td class="mono">40 / 63</td>
+      <td>Yes&nbsp;<span class="pill poly">P</span>&nbsp;40 + No&nbsp;<span class="pill kalshi">K</span>&nbsp;36</td>
+      <td class="mono">76&cent;</td><td class="g mono">+24&cent;</td><td class="g mono">~+22&cent;</td>
+    </tr>
+    <tr class="hi">
+      <td><b>88-89&deg;</b></td><td class="mono">31 / 73</td><td class="mono">52 / 52</td>
+      <td>Yes&nbsp;<span class="pill kalshi">K</span>&nbsp;31 + No&nbsp;<span class="pill poly">P</span>&nbsp;52</td>
+      <td class="mono">83&cent;</td><td class="g mono">+17&cent;</td><td class="g mono">~+15&cent;</td>
+    </tr>
+    <tr>
+      <td>86-87&deg;</td><td class="mono">3 / 98</td><td class="mono">13 / 89</td>
+      <td>Yes&nbsp;<span class="pill kalshi">K</span>&nbsp;3 + No&nbsp;<span class="pill poly">P</span>&nbsp;89</td>
+      <td class="mono">92&cent;</td><td class="g mono">+8&cent;</td><td class="mono">~+7&cent;</td>
+    </tr>
+    <tr>
+      <td class="d">92-93&deg;</td><td class="mono d">5 / 96</td><td class="mono d">2.5 / 97.8</td>
+      <td class="d">Yes&nbsp;P&nbsp;2.5 + No&nbsp;K&nbsp;96</td>
+      <td class="mono d">98.5&cent;</td><td class="d mono">+1.5&cent;</td><td class="d mono">~0 (fee eats it)</td>
+    </tr>
+  </tbody>
+</table>
+<p class="tag">*Net = gross minus the Kalshi trading fee <code>ceil(0.07 &times; N &times; P &times; (1&minus;P))</code>
+&asymp; 1-2&cent; on the priced leg; Polymarket currently charges no trading fee. Prices in cents per $1 contract.</p>
+<p class="sub d">It’s purely a <em>cross-venue</em> opportunity — neither book is beatable on its own (each set of
+Yes-asks already sums to &gt;100&cent;).</p>
+
+<!-- ============================================================= -->
+<h2><span class="n">3</span> Specific example — the 90-91&deg;F pair</h2>
+<p>The biggest edge. Kalshi prices 90-91 at <strong>64%</strong> but Polymarket at only <strong>39%</strong>,
+so 90-91 “Yes” is cheap on Polymarket and 90-91 “No” is cheap on Kalshi. Buy both:</p>
+
+<div class="legbox">
+  <div class="leg">
+    <div class="lab"><span class="pill poly">Polymarket</span> &nbsp; Buy <b>YES 90-91&deg;F</b>
+      <div class="tag">pays $1.00 if the high <b>is</b> 90&deg; or 91&deg;</div></div>
+    <div class="amt">&minus;$0.40</div>
+  </div>
+  <div class="leg">
+    <div class="lab"><span class="pill kalshi">Kalshi</span> &nbsp; Buy <b>NO 90-91&deg;</b>
+      <div class="tag">pays $1.00 if the high is <b>not</b> 90-91&deg;</div></div>
+    <div class="amt">&minus;$0.36</div>
+  </div>
+  <div class="total"><span>Total cost (per $1 of coverage)</span><span class="mono">$0.76</span></div>
+</div>
+
+<p>Exactly one of those two conditions is always true, so <strong>one leg always pays $1.00</strong>:</p>
+
+<table class="payoff">
+  <thead><tr><th>Outcome (daily high)</th><th>Polymarket YES</th><th>Kalshi NO</th><th>Payout</th><th>Profit</th></tr></thead>
+  <tbody>
+    <tr><td>High is <b>90&deg; or 91&deg;</b></td><td class="win">$1.00</td><td class="lose">$0</td>
+        <td class="mono">$1.00</td><td class="g mono">+$0.24</td></tr>
+    <tr><td>High is <b>anything else</b> (88, 89, 92, …)</td><td class="lose">$0</td><td class="win">$1.00</td>
+        <td class="mono">$1.00</td><td class="g mono">+$0.24</td></tr>
+  </tbody>
+</table>
+<p class="lead">Cost $0.76 → guaranteed $1.00 back → <strong class="g">+$0.24 locked (≈32% on capital)</strong>,
+or ~$0.22 after the Kalshi fee — <em>provided both legs settle off the identical temperature reading.</em></p>
+
+<div class="grid2">
+  <div class="card"><h4>Mirror trade — 88-89&deg;F</h4>
+    <p class="px">Here Kalshi is the cheap-Yes side. Buy <span class="g">YES 88-89 on Kalshi @ 31&cent;</span> +
+    <span class="g">NO 88-89 on Polymarket @ 52&cent;</span> = <b>83&cent;</b> → guaranteed $1 →
+    <b class="g">+17&cent;</b> (~+15&cent; net).</p></div>
+  <div class="card"><h4>Why both directions work</h4>
+    <p class="px">90-91 is overpriced on Kalshi / underpriced on Poly; 88-89 is the reverse. So you buy the
+    underpriced “Yes” on whichever venue is low and the cheap “No” on the other — the swapped modes feed both
+    hedges at once.</p></div>
+</div>
+
+<!-- ============================================================= -->
+<h2><span class="n">4</span> Why this is <em>not</em> free money</h2>
+
+<div class="callout danger">
+  <div class="t">⚠ Risk #1 — Settlement-source mismatch (the killer)</div>
+  <p style="margin:6px 0 0">It’s a true arbitrage <strong>only if both venues resolve off the same reading.</strong>
+  Kalshi settles Miami on the official NWS daily high (station <code>KMIA</code>); Polymarket may use a different
+  source/station/API. Buckets are only <strong>2&deg;F wide</strong>, so a 1&deg;F source difference near a boundary
+  flips the outcome — and then <strong>both legs can lose.</strong></p>
+  <p style="margin:8px 0 0">Example on the 90-91 pair: Kalshi reads <b>90</b> (→ in 90-91, your Kalshi-NO loses) while
+  Polymarket reads <b>89</b> (→ your Poly-YES 90-91 loses). Result: <b class="r">&minus;$0.76</b>, not +$0.24.
+  Kalshi’s own banner — <em>“Not all weather data is the same”</em> — is flagging exactly this.</p>
+</div>
+
+<div class="callout warn">
+  <div class="t">Other frictions to clear first</div>
+  <ul style="margin:6px 0 0">
+    <li><span class="risknum">2.</span><b>Same day?</b> Kalshi says “today,” Polymarket says “June 8.” Confirm they’re
+      the same calendar day in Miami’s timezone (ET) — otherwise they’re different events.</li>
+    <li><span class="risknum">3.</span><b>Liquidity.</b> Polymarket “Vol” on the two fat buckets is only ~$1.6-1.8k,
+      and that’s <em>cumulative</em> volume, not book depth. The quoted price likely fills only small size before the
+      edge collapses.</li>
+    <li><span class="risknum">4.</span><b>Funding &amp; fees.</b> You need both accounts funded (USD on Kalshi, USDC on
+      Polygon for Polymarket) — the screenshot shows Polymarket at $0.00. Kalshi fee ≈ 1-2&cent;/leg (already netted);
+      Polymarket adds gas/withdrawal friction.</li>
+    <li><span class="risknum">5.</span><b>Bucket boundaries.</b> The middle buckets line up (86-87, 88-89, 90-91, 92-93);
+      confirm identical integer-&deg;F edges and the daily-<em>high</em> definition. The tails differ
+      (Kalshi “85 or below / 94 or above” vs Polymarket “84-85 …”) — no clean arb there anyway.</li>
+  </ul>
+</div>
+
+<!-- ============================================================= -->
+<h2><span class="n">5</span> Bottom line</h2>
+<p>The <strong>88-89</strong> and <strong>90-91</strong> pairs are genuinely fat spreads (~15-22&cent; net per $1,
+≈20-32%) because the two venues disagree on the modal bucket. Act on them <strong>only after</strong> confirming
+both markets settle on the <em>same Miami daily-high reading for the same day</em>. If the resolution sources differ,
+it isn’t arbitrage at all — it’s a directional bet on whose weather feed is right, with double-loss tail risk.
+86-87 is thin; 92-93 disappears after fees.</p>
+
+<footer>
+  Prices are a point-in-time snapshot from the referenced Kalshi/Polymarket screenshot and will drift. This is an
+  analytical worked example, not financial advice or a solicitation. Verify each venue’s settlement station, daily-high
+  definition, resolution timezone, and live order-book depth before trading.
+</footer>
+
+</div>
+</body>
+</html>
