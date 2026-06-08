@@ -181,7 +181,10 @@ async def run_live(market_map, logger, shard_size=100):
                     on_book("P", md.get("marketSlug"), md.get("bids", []), md.get("offers", []))
 
     async def kalshi_stream():
-        raise NotImplementedError("Kalshi orderbook_delta WS: auth + snapshot/delta merge = next TODO")
+        # Endpoint CONFIRMED live + auth-gated (scripts/probe_kalshi_ws.py). Auth = RSA-PSS over
+        # "{ts}GET/trade-api/ws/v2" + 3 KALSHI-ACCESS-* headers. Needs a Kalshi API key in
+        # scripts/.env; then subscribe orderbook_delta and apply the snapshot+delta merge.
+        raise NotImplementedError("Kalshi orderbook_delta: add Kalshi creds + snapshot/delta merge (see scripts/probe_kalshi_ws.py)")
 
     async def rest_heartbeat():     # slow full-universe resync + coverage check (decision 0003)
         while True:

@@ -60,6 +60,10 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       **Remaining for live:** co-listed `{slug:ticker}` map (`scan_all.py`) + Kalshi `orderbook_delta`
       auth/merge + FLIP debounce + REST heartbeat; deploy GATED → DigitalOcean droplet, consult owner
       ([decision 0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
+      **→ UPDATE 2026-06-08 (Kalshi half):** Kalshi WS endpoint CONFIRMED live + auth-gated
+      (`wss://api.elections.kalshi.com/trade-api/ws/v2`; legacy `trading-api` dead; `scripts/probe_kalshi_ws.py`).
+      Authed `orderbook_delta` validation is **BLOCKED on creating a Kalshi API key** (RSA-PSS; `.env` has
+      only PMUS creds). Probe is ready — add `KALSHI_ACCESS_KEY` + `KALSHI_PRIVATE_KEY_PATH` and re-run.
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit

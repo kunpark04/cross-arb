@@ -21,6 +21,8 @@
 **[VERIFIED]** from `openapi.yaml` servers block and WebSocket docs.  
 **[FLAG — likely drift]:** The `api.elections.kalshi.com` subdomain appears to be a legacy or elections-specific URL; prefer `external-api.kalshi.com` for general use. Confirm with current docs before hardcoding.
 
+> **[RESOLVED 2026-06-08 — empirical WS probe, `scripts/probe_kalshi_ws.py`]** The live WebSocket is **`wss://api.elections.kalshi.com/trade-api/ws/v2`** (unauth handshake → `401 token_authentication_failure` = live + auth-gated). The legacy **`trading-api.kalshi.com` is dead** (returns *"API has been moved to api.elections.kalshi.com"*). **`external-api-ws.kalshi.com/`** (root path) returns **404** — the table row above was drift. The Kalshi WS **requires auth even for orderbook data** (RSA-PSS, §1.2), unlike the public REST market-data endpoints.
+
 ### 1.2 Authentication — API Key + RSA-PSS Signing
 
 All requests use **stateless per-request signing** (no session tokens). [VERIFIED]

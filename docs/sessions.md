@@ -6,6 +6,17 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Kalshi WS: endpoint validated; authed stream blocked on creds
+
+Validated the Kalshi side of the dual-stream as far as possible without creds (`scripts/probe_kalshi_ws.py`):
+the WS endpoint is **`wss://api.elections.kalshi.com/trade-api/ws/v2`** (unauth → `401
+token_authentication_failure` = live + auth-gated). Corrected the venue audit's endpoint drift — legacy
+`trading-api.kalshi.com` is dead; `external-api-ws.kalshi.com/` root 404s. Kalshi WS needs auth even for
+orderbook data (RSA-PSS over `{ts}GET/trade-api/ws/v2`). **Blocker:** `scripts/.env` has only PMUS creds,
+so the authenticated `orderbook_delta` validation can't run — needs a Kalshi API key
+(kalshi.com/account/profile). The probe is written to finish in one command once the key is added. The
+`bot/monitor.py` Kalshi stream stays a stub (endpoint + auth scheme documented) until then.
+
 ## 2026-06-08 — Step 2: WS auth verified + dual-stream monitor scaffold
 
 Verified the polymarket.us WS end-to-end (`scripts/probe_pmus_ws_auth.py`): the upgrade signs the same
