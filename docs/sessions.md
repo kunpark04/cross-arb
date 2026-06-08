@@ -6,6 +6,14 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Version control: git init + private GitHub remote
+
+Put the project under git (it had none) and pushed it. Early in the session: `git init -b main`, verified
+the gitignore excludes `scripts/.env` / `*.pem` / `scripts/_data/` (only `.env.example` tracked), initial
+commit. End of session: created **private** `github.com/kunpark04/cross-arb` via `gh` and pushed `main`
+(9 commits, `7342c35`..`3241bf2`) — secrets never left the machine. Visibility is private by the owner's
+choice (flip with `gh repo edit --visibility public`). Work was committed in focused units as it landed.
+
 ## 2026-06-08 — Monitor refinements: dynamic re-subscribe + FLIP debounce (build complete)
 
 Closed the two remaining monitor pieces. (1) **Dynamic re-subscribe:** `run_live` holds the live WS

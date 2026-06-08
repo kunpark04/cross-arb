@@ -13,7 +13,9 @@ hold to settlement, collect the gap net of fees.
 
 **Phase: READ-ONLY.** No capital is deployed and no orders are placed. All market data on both venues
 is public (no auth needed for books). We are measuring whether a real, persistent, scalable edge
-exists before wiring up trading keys. See `tasks/todo.md` for the live work item.
+exists before wiring up trading keys. The read-only **persistence monitor** (`bot/monitor.py`, todo #10)
+is **built + live-verified**; an extended data-collection run is the gated DigitalOcean deploy
+([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)).
 
 ## Core findings (as of 2026-06-08)
 
@@ -41,7 +43,7 @@ doc without linking it here leaves the index incomplete.
 | [decisions/template.md](decisions/template.md) | Skeleton for a new decision entry |
 | [research/README.md](research/README.md) | Index of the 9 research briefs (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
-| [bot/README.md](bot/README.md) | The accounting core (`ledger.py`) and bot roadmap |
+| [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
 
 ## Repo layout
 
@@ -56,7 +58,7 @@ cross-arb/
 ├─ tasks/              ← todo.md (plan) + lessons.md (corrections)
 ├─ research/           ← 9 settlement / legality / venue / edge briefs
 ├─ scripts/            ← Python probes + scanners (read-only); _data/ outputs are gitignored
-└─ bot/                ← ledger.py: cross-venue PnL accounting core
+└─ bot/                ← ledger.py (PnL core) + monitor.py (dual-stream logger) + kalshi_book.py + colisted_map.py
 ```
 
 ## Working agreement (project-specific)
@@ -78,6 +80,8 @@ cross-arb/
   See [decisions/0003](decisions/0003-event-driven-persistence.md).
 - **Secrets:** never commit `scripts/.env`, `*.pem`, `*.key`, or `scripts/_data/` (all gitignored).
   Market data is public; only order placement needs keys.
+- **Version control:** private GitHub repo `kunpark04/cross-arb` (`origin/main`). Commit in focused units
+  when the user asks; verify nothing sensitive is staged before any push (gitignore covers `.env`/`*.pem`/`_data/`).
 - **Scripts are throwaway-grade probes**, named for what they answer. Raw pulls land in
   `scripts/_data/` (gitignored). Conclusions get promoted into a `research/` brief.
 
