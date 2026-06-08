@@ -50,6 +50,12 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       for discovery. Cadence by category: weather slow (~60–120s is fine), MLB/sports fast (event-driven
       or ≤15–30s). **Next:** confirm whether polymarket.us exposes a retail WS, then build the hybrid
       monitor (transition log + heartbeat snapshot). (Design rationale: [decision 0003](../decisions/0003-event-driven-persistence.md).)
+      **→ UPDATE 2026-06-08 (step 1 done):** polymarket.us retail WS **CONFIRMED** —
+      `wss://api.polymarket.us/v1/ws/markets`, slug-keyed, channels MARKET_DATA/LITE/TRADE, ≤100/sub,
+      Ed25519 auth on handshake, frames identical to REST book (`scripts/probe_pmus_ws.py`; docs verified).
+      Monitor is now **dual-stream**, not hybrid ([decision 0005](../decisions/0005-dual-stream-persistence-monitor.md)).
+      **Next:** authenticated WS handshake to confirm the signed-string for the upgrade → then build the
+      dual-stream transition logger + REST heartbeat.
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit

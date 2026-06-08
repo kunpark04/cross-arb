@@ -21,5 +21,6 @@ be expensive or confusing to silently reverse. Capture *why*, not just *what* �
 |---|---|---|
 | [0001](0001-us-legal-only-venue-pair.md) | US-legal venues only (Kalshi × polymarket.us); identical settlement required | Accepted |
 | [0002](0002-comprehensive-coverage-no-pruning.md) | Comprehensive coverage — scanner prunes nothing; the bot decides what to trade | Accepted |
-| [0003](0003-event-driven-persistence.md) | Edge persistence via event-driven detection, not fixed-cadence polling | Accepted |
+| [0003](0003-event-driven-persistence.md) | Edge persistence via event-driven detection, not fixed-cadence polling | Accepted (mechanism → 0005) |
 | [0004](0004-ledger-layer-by-default.md) | Ledger decision rule: layer by default, rotate only on a real flip | Accepted |
+| [0005](0005-dual-stream-persistence-monitor.md) | Persistence monitor = dual-stream WebSocket (Kalshi + polymarket.us WS confirmed) | Accepted |

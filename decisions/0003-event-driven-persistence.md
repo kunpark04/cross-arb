@@ -1,7 +1,8 @@
 # 0003 — Edge persistence via event-driven detection, not fixed-cadence polling
 
 - **Date:** 2026-06-08
-- **Status:** Accepted
+- **Status:** Accepted — the event-driven *principle* stands; the venue mechanism is resolved by
+  [0005](0005-dual-stream-persistence-monitor.md) (polymarket.us WS confirmed → dual-stream, hybrid fallback dropped)
 - **Deciders:** Project owner + Claude
 
 ## Context
@@ -37,4 +38,5 @@ slow (~60–120s fine), MLB/sports fast (event-driven or ≤15–30s).
 - Supersedes the early `scripts/persistence_scan.py` (fixed 17-min snapshot loop) as the design.
 - **Next concrete step:** confirm whether polymarket.us exposes a retail WS, then build the hybrid
   monitor (transition log + heartbeat snapshot).
-- **Revisit if:** polymarket.us ships a retail WS (drop the fast-poll fallback for a clean dual-stream).
+- **Resolved (2026-06-08):** polymarket.us *does* expose a retail WS → fast-poll fallback dropped for a
+  clean dual-stream ([0005](0005-dual-stream-persistence-monitor.md)).

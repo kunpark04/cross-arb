@@ -48,6 +48,7 @@ read access, never to trade in this phase.
 **Unified + persistence**
 - `scan_all.py` — unified scanner over the entire co-listed universe, uniform metrics ⭐
 - `persistence_scan.py` — repeated weather + sports snapshots over time (early persistence probe)
+- `probe_pmus_ws.py` — confirm the polymarket.us retail WebSocket exists (step-1 probe; live, auth-gated 401) ✅
 
 ⭐ = the current canonical script for that job.
 
@@ -64,4 +65,6 @@ read access, never to trade in this phase.
 | `persistence_summary.txt` | Aggregated persistence summary |
 
 > The next work item (`../tasks/todo.md` #10) replaces `persistence_scan.py`'s fixed-cadence approach
-> with an **event-driven** monitor — see [decisions/0003](../decisions/0003-event-driven-persistence.md).
+> with an **event-driven, dual-stream WebSocket** monitor (Kalshi + polymarket.us). polymarket.us's
+> retail WS is confirmed (`probe_pmus_ws.py`) — see [decisions/0003](../decisions/0003-event-driven-persistence.md)
+> + [0005](../decisions/0005-dual-stream-persistence-monitor.md).

@@ -169,6 +169,44 @@ in the schema; confirm against a live binary market. ❓
 
 ---
 
+### 3c. Real-time WebSocket (retail) — ✅ VERIFIED 2026-06-08
+
+**Endpoints** (`docs.polymarket.us/api-reference/websocket`):
+- Public market data: **`wss://api.polymarket.us/v1/ws/markets`** ✅
+- Private (orders / positions / balance): `wss://api.polymarket.us/v1/ws/private` ✅
+
+**Auth — REQUIRED** (note: *unlike* the public REST `/{slug}/book`, the WS needs a key). Same Ed25519
+scheme as REST — `X-PM-Access-Key` / `X-PM-Timestamp` / `X-PM-Signature` on the connection
+**handshake**. ✅ Empirically the endpoint is live and auth-gated: an unauthenticated upgrade returns
+`401 unauthorized: valid API key authentication required` (`scripts/probe_pmus_ws.py`). ✅
+❓ The exact signed message for the WS upgrade is unconfirmed — REST signs `"{ts}{method}{path}"`;
+verify against a live authenticated connect (expect `101 Switching Protocols` + a snapshot frame with
+`eof:true`).
+
+**Subscribe** (keys on **`slug`**, same as the REST book): ✅
+```json
+{"subscribe": {"requestId": "md-sub-1",
+  "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+  "marketSlugs": ["<slug-1>", "<slug-2>"]}}
+```
+Unsubscribe: `{"unsubscribe": {"requestId": "md-sub-1"}}`. Subscribe replies with a snapshot
+terminated by an `eof: true` marker, then streams live deltas.
+
+**Channels** (`subscriptionType`): ✅
+- `SUBSCRIPTION_TYPE_MARKET_DATA` — full order book + stats (**the one the monitor uses**)
+- `SUBSCRIPTION_TYPE_MARKET_DATA_LITE` — lightweight price only
+- `SUBSCRIPTION_TYPE_TRADE` — real-time trade prints (separate channel from book)
+
+**Update frame shape** = **identical to the REST book**: `marketSlug`, `bids[]{px,qty}`,
+`offers[]{px,qty}`, `state`, `stats`, `transactTime`. → the existing book parser + edge calc reuse
+unchanged. ✅
+
+**Limits:** ≤ **100 markets per subscription** ✅ (our ~200 co-listed universe → shard across ≥2 subs);
+respond to server heartbeats / keep-alive; the 20 req/s key cap applies to connection setup, not
+streamed frames. Architecture decision: [decisions/0005](../decisions/0005-dual-stream-persistence-monitor.md).
+
+Sources: `docs.polymarket.us/api-reference/websocket/{overview,markets,private}.md`.
+
 ## 4. Rate limits & scopes
 
 - **Global: 20 req/s per API key** (authenticated) and **20 req/s per IP** (public). ✅

@@ -6,6 +6,18 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Step 1: confirm polymarket.us WebSocket (architecture fork resolved)
+
+Probed whether polymarket.us exposes a retail WebSocket — the one unknown blocking the persistence
+monitor (`tasks/todo.md` #10). **Confirmed it does:** `wss://api.polymarket.us/v1/ws/markets`,
+slug-keyed, channels MARKET_DATA / MARKET_DATA_LITE / TRADE, ≤100 markets/subscription, Ed25519 auth
+on the handshake; update frames identical to the REST book. Verified empirically
+(`scripts/probe_pmus_ws.py` → live, auth-gated `401`) and against `docs.polymarket.us`. Protocol
+promoted into `research/polymarketus-api-auth.md` §3c. **Fork resolved:** the monitor is a clean
+**dual-stream** ([decision 0005](../decisions/0005-dual-stream-persistence-monitor.md)), not the
+hybrid fallback; 0003's fast-poll path is dropped. **Next:** authenticated handshake to confirm the
+WS signed-string, then build the transition logger.
+
 ## 2026-06-08 — Managerial-doc scaffolding
 
 Stood up the full managerial-doc set (the project had research + scripts + a ledger but no working
