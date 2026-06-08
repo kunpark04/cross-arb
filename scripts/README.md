@@ -65,8 +65,8 @@ read access, never to trade in this phase.
 | `scan_all.json` | Unified scanner output (all weather + sports markets + edges) |
 | `persistence_log.jsonl` | Per-snapshot persistence-probe rows |
 | `persistence_summary.txt` | Aggregated persistence summary |
+| `transitions.jsonl` | **Live monitor output** — edge state-transitions (OPEN/CLOSE/FLIP/WIDEN/NARROW) from `bot/monitor.py` |
 
-> The next work item (`../tasks/todo.md` #10) replaces `persistence_scan.py`'s fixed-cadence approach
-> with an **event-driven, dual-stream WebSocket** monitor (Kalshi + polymarket.us). polymarket.us's
-> retail WS is confirmed (`probe_pmus_ws.py`) — see [decisions/0003](../decisions/0003-event-driven-persistence.md)
-> + [0005](../decisions/0005-dual-stream-persistence-monitor.md).
+> `persistence_scan.py` (fixed-cadence) is **superseded** by the build-complete **event-driven
+> dual-stream monitor** `bot/monitor.py` (writes `transitions.jsonl`) — see [decisions/0003](../decisions/0003-event-driven-persistence.md)
+> + [0005](../decisions/0005-dual-stream-persistence-monitor.md) and `bot/README.md`.
