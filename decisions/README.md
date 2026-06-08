@@ -25,3 +25,4 @@ be expensive or confusing to silently reverse. Capture *why*, not just *what* â€
 | [0004](0004-ledger-layer-by-default.md) | Ledger decision rule: layer by default, rotate only on a real flip | Accepted |
 | [0005](0005-dual-stream-persistence-monitor.md) | Persistence monitor = dual-stream WebSocket (Kalshi + polymarket.us WS confirmed) | Accepted |
 | [0006](0006-deploy-on-digitalocean-consult-first.md) | Live loggers + bot deploy to a DigitalOcean droplet; consult owner before any deploy | Accepted |
+| [0007](0007-readonly-kalshi-key-least-privilege.md) | Use the read-only Kalshi key for the monitor; keep trade-capable keys out of the repo | Accepted |

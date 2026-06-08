@@ -50,7 +50,7 @@ read access, never to trade in this phase.
 - `persistence_scan.py` — repeated weather + sports snapshots over time (early persistence probe)
 - `probe_pmus_ws.py` — confirm the polymarket.us retail WebSocket exists (step-1 probe; live, auth-gated 401) ✅
 - `probe_pmus_ws_auth.py` — authenticated WS handshake + live snapshot; verifies signed-string + subscribe envelope ✅
-- `probe_kalshi_ws.py` — validate the Kalshi `orderbook_delta` WS (endpoint confirmed live + auth-gated; authed run needs Kalshi creds) ⏳
+- `probe_kalshi_ws.py` — validate the Kalshi `orderbook_delta` WS (RSA-PSS handshake + snapshot VERIFIED with read-only key) ✅
 
 ⭐ = the current canonical script for that job.
 

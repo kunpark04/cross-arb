@@ -6,6 +6,16 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Kalshi WS fully validated (read-only key added)
+
+Copied the **read-only** Kalshi API key into the project (`scripts/kalshi_readonly.pem`, gitignored;
+`.env` updated with the key id) — demo + read-write keys intentionally left out (least privilege,
+[decision 0007](../decisions/0007-readonly-kalshi-key-least-privilege.md)). Re-ran
+`scripts/probe_kalshi_ws.py`: RSA-PSS signed handshake → `101`, `subscribed` + `orderbook_snapshot`
+received → **Kalshi `orderbook_delta` VERIFIED**. Both venues' WebSockets are now proven end-to-end
+(polymarket.us Ed25519 + Kalshi RSA-PSS). Remaining before a live dual-stream run: the Kalshi
+snapshot/delta merge in `bot/monitor.py`, the co-listed `{slug:ticker}` map, and FLIP debounce.
+
 ## 2026-06-08 — Kalshi WS: endpoint validated; authed stream blocked on creds
 
 Validated the Kalshi side of the dual-stream as far as possible without creds (`scripts/probe_kalshi_ws.py`):

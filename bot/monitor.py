@@ -181,10 +181,12 @@ async def run_live(market_map, logger, shard_size=100):
                     on_book("P", md.get("marketSlug"), md.get("bids", []), md.get("offers", []))
 
     async def kalshi_stream():
-        # Endpoint CONFIRMED live + auth-gated (scripts/probe_kalshi_ws.py). Auth = RSA-PSS over
-        # "{ts}GET/trade-api/ws/v2" + 3 KALSHI-ACCESS-* headers. Needs a Kalshi API key in
-        # scripts/.env; then subscribe orderbook_delta and apply the snapshot+delta merge.
-        raise NotImplementedError("Kalshi orderbook_delta: add Kalshi creds + snapshot/delta merge (see scripts/probe_kalshi_ws.py)")
+        # Auth VERIFIED with the read-only key (scripts/probe_kalshi_ws.py): RSA-PSS over
+        # "{ts}GET/trade-api/ws/v2" + 3 KALSHI-ACCESS-* headers -> 101 -> subscribe orderbook_delta.
+        # TODO: apply the snapshot+delta merge (Kalshi sends an orderbook_snapshot then seq-ordered
+        # orderbook_delta frames; book is bids-only per YES/NO, so YES ask = 1 - best NO bid), then
+        # feed on_book("K", slug-mapped-ticker, yes_bids, derived_yes_offers).
+        raise NotImplementedError("Kalshi orderbook_delta: snapshot/delta merge pending (auth verified; see scripts/probe_kalshi_ws.py)")
 
     async def rest_heartbeat():     # slow full-universe resync + coverage check (decision 0003)
         while True:
