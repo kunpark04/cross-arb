@@ -38,6 +38,26 @@ Rationale recorded in [decisions/0004](../decisions/0004-ledger-layer-by-default
 - **Kalshi** taker: `ceil(0.07 · N · P·(1−P))` per contract (maker = 0.25×).
 - **polymarket.us** taker: `0.05 · P·(1−P)` per contract (maker = 0).
 
+## `monitor.py` — dual-stream edge monitor (persistence layer; decisions 0003 / 0005)
+
+The persistence logger: streams both venues' order books, recomputes the cross-venue edge on every
+book delta, and logs edge **state-transitions** (open / close / flip / widen / narrow) to JSONL — the
+input to the layer-vs-rotate rule above. **READ-ONLY**; places no orders.
+
+```bash
+python bot/monitor.py          # OFFLINE self-test of the transition core (no network)
+python bot/monitor.py --live   # GATED — needs co-listed map + Kalshi WS auth + owner sign-off
+```
+
+- **Transition core** (`classify` / `MarketTracker`) is pure + self-verifying, like `ledger.py`.
+- **polymarket.us stream** is wired with the protocol verified 2026-06-08
+  (`scripts/probe_pmus_ws_auth.py`): `wss://api.polymarket.us/v1/ws/markets`, Ed25519 handshake signing
+  `{ts}GET/v1/ws/markets`, slug-keyed `SUBSCRIPTION_TYPE_MARKET_DATA`, frames = REST-book shape.
+- **Remaining for live:** Kalshi `orderbook_delta` auth + delta-merge; the co-listed `{slug: ticker}`
+  map from `scripts/scan_all.py`; per-frame FLIP debounce; REST heartbeat resync.
+- **Deploy is gated** → DigitalOcean droplet, consult the owner first
+  ([decisions/0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
+
 ## Roadmap (not built — read-only phase)
 
 `tasks/todo.md` item: wire `ledger.py` to live `scan_all.py` signals — trade selection, capital

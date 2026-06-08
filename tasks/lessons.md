@@ -46,3 +46,25 @@ It's public — keyed on **slug**.
 
 **Rule:** use the market **slug** for `gateway.polymarket.us/v1/markets/{slug}/book`. Reads need no
 auth; only order *placement* needs the Ed25519 key. (Documented in `research/live-edge-findings.md`.)
+
+## L5 — Classify the cross-venue edge on the COMPLETE dual-venue state, not per single frame
+
+**Pattern:** the monitor's transition core (`bot/monitor.py`) first classified on every incoming book
+frame. But book deltas arrive one venue at a time, so a genuine direction reversal (FLIP) showed up as
+a transient `OPEN` — the half-updated intermediate book made the prior arb vanish, then reappear in the
+new direction as a fresh open. The self-test caught it.
+
+**Rule:** treat a "tick" as a **complete dual-venue snapshot** and classify the current complete state
+against the last complete state (`MarketTracker.evaluate()`). In the live per-frame path, a true FLIP
+legitimately surfaces as CLOSE→OPEN across two frames — coalescing those into one FLIP is an explicit
+**debounce** concern, not something to fake by resetting state mid-update.
+
+## L6 — polymarket.us `?active=true` returns STALE markets; use `?closed=false`
+
+**Pattern:** `gateway.polymarket.us/v1/markets?active=true` returned 7-month-old NFL games
+(`...-2025-11-02`, `state=null`) — so a "pick a live market" probe found only empty books and a
+subscribe failed.
+
+**Rule:** to list **currently-open** markets use `?closed=false&archived=false`; for today's weather,
+`?categories[]=climate&closed=false`. Don't trust `active=true` as "tradeable now."
+(Recorded in `research/polymarketus-api-auth.md` §3c.)

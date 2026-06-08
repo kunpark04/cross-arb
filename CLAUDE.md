@@ -63,6 +63,9 @@ cross-arb/
 
 - **Read-only until told otherwise.** Do not write order-placement code or commit anything that
   could place a trade. Auth keys exist only to *verify* read access; `scripts/.env` is gitignored.
+- **Deployment is gated.** Live loggers (`bot/monitor.py`) + bot run on a DigitalOcean droplet —
+  **consult the owner before any deploy** ([decisions/0006](decisions/0006-deploy-on-digitalocean-consult-first.md)).
+  Dev stays local + read-only; `bot/monitor.py --live` is gated. Never push secrets to a remote host.
 - **Two load-bearing invariants** for any "arb" claim:
   1. **Settlement identity** — both venues must grade off the *same* named deterministic number, else
      a "locked" pair can lose *both* legs. See [decisions/0001](decisions/0001-us-legal-only-venue-pair.md).

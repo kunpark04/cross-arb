@@ -6,6 +6,21 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-08 — Step 2: WS auth verified + dual-stream monitor scaffold
+
+Verified the polymarket.us WS end-to-end (`scripts/probe_pmus_ws_auth.py`): the upgrade signs the same
+REST string `{ts}GET/v1/ws/markets` → `101`; camelCase `SUBSCRIPTION_TYPE_MARKET_DATA` subscribe; live
+snapshot on `tc-temp-nychigh-2026-06-08-lt72f` with frames identical to the REST book. (Also learned
+`?active=true` returns stale markets — use `?closed=false` / `categories[]=climate`.) Built the
+persistence-monitor scaffold `bot/monitor.py`: a pure, self-verifying transition core
+(OPEN/CLOSE/FLIP/WIDEN/NARROW) + the polymarket.us stream wired with the verified protocol. Remaining
+live wiring: Kalshi `orderbook_delta` auth/merge, the co-listed `{slug:ticker}` map, FLIP debounce,
+REST heartbeat. Recorded the owner's deployment constraint as
+[decision 0006](../decisions/0006-deploy-on-digitalocean-consult-first.md) (DigitalOcean droplet;
+consult before deploy) + a cross-session memory. WS protocol promoted into
+`research/polymarketus-api-auth.md` §3c (now CONFIRMED). Lessons L5 (per-frame flicker) + L6 (stale
+`active=true`) captured.
+
 ## 2026-06-08 — Step 1: confirm polymarket.us WebSocket (architecture fork resolved)
 
 Probed whether polymarket.us exposes a retail WebSocket — the one unknown blocking the persistence

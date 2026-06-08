@@ -54,8 +54,12 @@ markets in scope and compute the same metrics (net edge, fillable size, $) for e
       `wss://api.polymarket.us/v1/ws/markets`, slug-keyed, channels MARKET_DATA/LITE/TRADE, ≤100/sub,
       Ed25519 auth on handshake, frames identical to REST book (`scripts/probe_pmus_ws.py`; docs verified).
       Monitor is now **dual-stream**, not hybrid ([decision 0005](../decisions/0005-dual-stream-persistence-monitor.md)).
-      **Next:** authenticated WS handshake to confirm the signed-string for the upgrade → then build the
-      dual-stream transition logger + REST heartbeat.
+      **→ UPDATE 2026-06-08 (step 2):** WS auth VERIFIED — upgrade signs `{ts}GET/v1/ws/markets`,
+      camelCase subscribe, REST-book frames (`scripts/probe_pmus_ws_auth.py`). Monitor scaffold built
+      with a self-verifying transition core (`bot/monitor.py`: OPEN/CLOSE/FLIP/WIDEN/NARROW).
+      **Remaining for live:** co-listed `{slug:ticker}` map (`scan_all.py`) + Kalshi `orderbook_delta`
+      auth/merge + FLIP debounce + REST heartbeat; deploy GATED → DigitalOcean droplet, consult owner
+      ([decision 0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 - [x] **Bot accounting core** (`bot/ledger.py`) — per-market position ledger + PnL simulator;
       self-verifies additive-PnL + outcome-independence; models layer/rotate/hold/leg-risk. Decision
       rule: layer by default; rotate only if first's MTM > locked edge + round-trip cost AND exit

@@ -179,9 +179,11 @@ in the schema; confirm against a live binary market. ❓
 scheme as REST — `X-PM-Access-Key` / `X-PM-Timestamp` / `X-PM-Signature` on the connection
 **handshake**. ✅ Empirically the endpoint is live and auth-gated: an unauthenticated upgrade returns
 `401 unauthorized: valid API key authentication required` (`scripts/probe_pmus_ws.py`). ✅
-❓ The exact signed message for the WS upgrade is unconfirmed — REST signs `"{ts}{method}{path}"`;
-verify against a live authenticated connect (expect `101 Switching Protocols` + a snapshot frame with
-`eof:true`).
+✅ **CONFIRMED 2026-06-08** (`scripts/probe_pmus_ws_auth.py`): the WS upgrade signs the **same REST
+string** `"{ts}GET/v1/ws/markets"` → `101 Switching Protocols`. The **camelCase** subscribe envelope
+(`requestId` / `subscriptionType` / `marketSlugs`) works; frames carry `marketData.{bids,offers}`
+exactly like the REST book, with `state: MARKET_STATE_OPEN`. In practice frames repeat **without** an
+`eof:true` marker — treat each `marketData` frame as the latest book snapshot.
 
 **Subscribe** (keys on **`slug`**, same as the REST book): ✅
 ```json
@@ -204,6 +206,10 @@ unchanged. ✅
 **Limits:** ≤ **100 markets per subscription** ✅ (our ~200 co-listed universe → shard across ≥2 subs);
 respond to server heartbeats / keep-alive; the 20 req/s key cap applies to connection setup, not
 streamed frames. Architecture decision: [decisions/0005](../decisions/0005-dual-stream-persistence-monitor.md).
+
+⚠️ **Market-discovery gotcha (verified 2026-06-08):** the REST `?active=true` filter returns **stale
+backfilled** markets (e.g. Nov-2025 NFL games with `state=null`). To list **currently-open** markets
+use `?closed=false&archived=false`; for today's weather use `?categories[]=climate&closed=false`.
 
 Sources: `docs.polymarket.us/api-reference/websocket/{overview,markets,private}.md`.
 

@@ -47,10 +47,12 @@ Build the persistence monitor (`tasks/todo.md` #10) as a **dual-stream, event-dr
   `scan_all.py` reuse unchanged; `slug` keying needs no slug→symbol bridge.
 - **Auth:** the monitor must load the Ed25519 key (`scripts/.env`) and sign the WS upgrade — *unlike*
   the public REST book, the WS needs the key (project creds already verified, `tasks/todo.md`).
-- **⚠️ Residual unknown to resolve FIRST in step 2:** the exact signed message for the WS handshake.
-  REST signs `"{ts}{method}{path}"`; confirm it holds for the upgrade via a live authenticated connect
-  (expect `101 Switching Protocols` + a snapshot frame terminated by `eof:true`). This is the kickoff
-  task of the monitor build.
+- **✅ Residual unknown RESOLVED (2026-06-08, step 2):** the WS upgrade signs the same REST string
+  `"{ts}GET/v1/ws/markets"` → `101`; the camelCase subscribe envelope + REST-book frame shape are
+  verified live (`scripts/probe_pmus_ws_auth.py`). The monitor scaffold + self-verifying transition
+  core are built (`bot/monitor.py`). Remaining live wiring: Kalshi `orderbook_delta` auth/merge, the
+  co-listed `{slug:ticker}` map, FLIP debounce, REST heartbeat — and deploy is gated by
+  [0006](0006-deploy-on-digitalocean-consult-first.md).
 - **Limits:** ≤100 markets/subscription; respond to server heartbeats/keep-alive; the 20 req/s key cap
   applies only to connection setup, not to streamed frames.
 - **Revisit if:** polymarket.us changes the WS auth scheme or the 100-market cap, or the authenticated

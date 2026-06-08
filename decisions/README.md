@@ -24,3 +24,4 @@ be expensive or confusing to silently reverse. Capture *why*, not just *what* â€
 | [0003](0003-event-driven-persistence.md) | Edge persistence via event-driven detection, not fixed-cadence polling | Accepted (mechanism â†’ 0005) |
 | [0004](0004-ledger-layer-by-default.md) | Ledger decision rule: layer by default, rotate only on a real flip | Accepted |
 | [0005](0005-dual-stream-persistence-monitor.md) | Persistence monitor = dual-stream WebSocket (Kalshi + polymarket.us WS confirmed) | Accepted |
+| [0006](0006-deploy-on-digitalocean-consult-first.md) | Live loggers + bot deploy to a DigitalOcean droplet; consult owner before any deploy | Accepted |

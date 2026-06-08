@@ -49,6 +49,7 @@ read access, never to trade in this phase.
 - `scan_all.py` — unified scanner over the entire co-listed universe, uniform metrics ⭐
 - `persistence_scan.py` — repeated weather + sports snapshots over time (early persistence probe)
 - `probe_pmus_ws.py` — confirm the polymarket.us retail WebSocket exists (step-1 probe; live, auth-gated 401) ✅
+- `probe_pmus_ws_auth.py` — authenticated WS handshake + live snapshot; verifies signed-string + subscribe envelope ✅
 
 ⭐ = the current canonical script for that job.
 
