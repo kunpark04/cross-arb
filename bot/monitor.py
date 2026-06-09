@@ -133,6 +133,8 @@ class MarketTracker:
         (pb, po), (kb, ko) = self.books["P"], self.books["K"]
         px = make_px(pb, po, kb, ko)
         new = edge_state(px) if px else None
+        if new is not None and px is not None:     # per-venue YES touches -> adverse-selection (which side moved?) analysis
+            new["px"] = {k: (round(v, 4) if v is not None else None) for k, v in px.items()}
         if new and new["arb"]:
             try:                                   # additive instrumentation; never crash the collector
                 new["depth"] = self._depth(new["dir"])
@@ -217,6 +219,8 @@ class GameTracker:
 
     def evaluate(self):
         new = game_edge(self.pm[0], self.pm[1], self.ka, self.kb)
+        if new is not None:                        # per-side touches (pm YES bid/ask + the two Kalshi team asks)
+            new["px"] = {"pm_b": self.pm[0], "pm_a": self.pm[1], "ka": self.ka, "kb": self.kb}
         if new and new["arb"]:
             try:                                   # additive; guarded so it can't crash collection
                 new["depth"] = self._depth(new["dir"])
@@ -291,6 +295,8 @@ class TransitionLogger:
         if d: rec["depth"] = d                  # {c2,c1,c0} contracts fillable at gross >= 2c/1c/0c
         a = state.get("age")
         if a: rec["age"] = a                    # {p,k} seconds since each venue's book last changed (staleness)
+        p = state.get("px")
+        if p: rec["px"] = p                     # per-venue YES touches -> adverse-selection (which side moved on CLOSE)
         with open(os.path.join(self.dir, f"transitions-{event_partition(market)}.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
         return rec
@@ -564,7 +570,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                                                   # distinct from book-change `age`) -> beacon can expose a half-dead stream
 
     def _write(label, state, key):
-        rec = logger.write(key, label, state, int(time.time()))
+        rec = logger.write(key, label, state, round(time.time(), 3))   # ms precision: int seconds hid the sub-second
+                                                                       # fill regime (shadow_fill.py couldn't resolve <1s)
         print(f"[{rec['t']}] {key} {label} dir={rec['dir']} net={rec['net_edge']}")
     def emit(label, state, key):
         for lab, st, k in deb.feed(label, state, key, time.time()):
