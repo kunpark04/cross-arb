@@ -160,6 +160,9 @@ def game_edge(pm_bid, pm_ask, kA_ask, kB_ask):
     (out of scope for a CROSS-venue strategy). A strictly-crossed pm book is rejected as stale (C3)."""
     if pm_bid is not None and pm_ask is not None and pm_bid > pm_ask:   # strictly-crossed pm book -> stale
         return None
+    if pm_ask is not None and kA_ask is not None and abs(pm_ask - kA_ask) > 0.40:   # C3 orientation/identity guard:
+        return None   # pm-YES(=A) ask and Kalshi-A ask price the SAME team -> a >40c gap is a flip/mismatch (L1/L12),
+                      # NOT edge (real cross-venue arb is a few cents). Quarantines a mis-oriented YES=teamA pair.
     opts = []   # DETECTION uses the at-scale marginal Kalshi fee (no ceil) — capture any arb +EV at size
     if pm_ask is not None and kB_ask is not None:                       # PK: back A@P + B@K
         opts.append(("PK", round((1 - (pm_ask + kB_ask)) - pfee(pm_ask) - kfee(kB_ask, marginal=True), 4)))
@@ -557,6 +560,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     books = {}                                    # Kalshi ticker -> KalshiBook (shared so prune can free it)
     slug_k, absent = {}, {}                        # slug->[Kalshi tickers] for teardown ; slug->missed-heartbeats
     deb = FlipDebouncer(debounce)
+    last_rx = {"pm": 0.0, "k": 0.0}               # epoch of the LAST frame received per venue (stream liveness,
+                                                  # distinct from book-change `age`) -> beacon can expose a half-dead stream
 
     def _write(label, state, key):
         rec = logger.write(key, label, state, int(time.time()))
@@ -590,6 +595,9 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
         if rep[kind]:
             print(f"[coverage] WARNING unmapped {kind}: {rep[kind]} (MISSED until added to colisted_map.py)")
+    if rep.get("weather_bucket_MISALIGNED"):                      # C4: non-identical degF buckets are NOT paired
+        print(f"[coverage] WARNING {len(rep['weather_bucket_MISALIGNED'])} weather bucket misalignments "
+              f"(NOT paired - settlement-identity guard): {rep['weather_bucket_MISALIGNED'][:3]}")
     register(colisted)
     print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports "
           f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
@@ -599,45 +607,79 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                    "pmus": len(pm_targets), "kalshi": len(k_targets)})           # liveness beacon (startup)
 
     async def pmus_stream():
-        async with websockets.connect(PMUS_WS, additional_headers=_pmus_auth_headers()) as ws:
-            conns["pm"] = ws
-            slugs = list(pm_targets)
-            for i in range(0, len(slugs), shard_size):          # ≤100 slugs per subscription
-                await ws.send(json.dumps({"subscribe": {
-                    "requestId": f"md-{i}", "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
-                    "marketSlugs": slugs[i:i + shard_size]}}))
-            async for msg in ws:
-                md = (json.loads(msg) or {}).get("marketData")
-                fn = pm_targets.get((md or {}).get("marketSlug"))
-                if fn:
-                    fn(md.get("bids", []), md.get("offers", []))
+        # SUPERVISED reconnect loop: a CLEAN close (1000/1001 idle/LB-cycle) ends `async for` WITHOUT raising;
+        # without this loop the coroutine would just return and gather() would keep the process alive with this
+        # venue's book frozen (silent half-dead collector that no alarm catches). An abnormal close raises and is
+        # caught here too. Either way we re-subscribe the CURRENT targets (markets added during the outage included).
+        backoff = 1
+        while True:
+            try:
+                async with websockets.connect(PMUS_WS, additional_headers=_pmus_auth_headers()) as ws:
+                    conns["pm"] = ws
+                    slugs = list(pm_targets)
+                    for i in range(0, len(slugs), shard_size):          # ≤100 slugs per subscription
+                        await ws.send(json.dumps({"subscribe": {
+                            "requestId": f"md-{i}", "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+                            "marketSlugs": slugs[i:i + shard_size]}}))
+                    backoff = 1                                         # connected OK -> reset backoff
+                    async for msg in ws:
+                        last_rx["pm"] = time.time()
+                        md = (json.loads(msg) or {}).get("marketData")
+                        fn = pm_targets.get((md or {}).get("marketSlug"))
+                        if fn:
+                            fn(md.get("bids", []), md.get("offers", []))
+            except Exception as e:
+                print(f"[pmus] stream dropped ({e!r}); reconnect in {backoff}s")
+            else:
+                print(f"[pmus] stream closed cleanly; reconnect in {backoff}s")   # the dangerous case made non-fatal
+            finally:
+                conns.pop("pm", None)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
     async def kalshi_stream():
         # RSA-PSS handshake + orderbook_delta, merged via KalshiBook (bot/kalshi_book.py; validated
         # offline + live). seq is ONE per-connection counter -> a gap means resubscribe everything.
-        async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
-            conns["k"] = ws
-            async def subscribe(tickers):
-                await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
-                    "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}}))
-            await subscribe(list(k_targets))
-            st = SeqTracker()                          # books is shared (run_live scope) so prune can free it
-            async for raw in ws:
-                o = json.loads(raw)
-                if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> resync all
-                    books.clear(); st.reset(); await subscribe(list(k_targets))
-                    logger.resync({"seq": o["seq"]})            # mark it so analysis censors the re-OPENs
-                    continue
-                typ, msg = o.get("type"), o.get("msg", {}); tk = msg.get("market_ticker")
-                if typ == "orderbook_snapshot":
-                    books[tk] = KalshiBook(tk); books[tk].apply_snapshot(msg)
-                elif typ == "orderbook_delta" and tk in books:
-                    books[tk].apply_delta(msg)
-                else:
-                    continue
-                fn = k_targets.get(tk)
-                if fn:
-                    fn(books[tk])
+        # SUPERVISED reconnect loop (see pmus_stream): on (re)connect, clear+rebuild books from fresh snapshots
+        # and re-subscribe the CURRENT tickers. Tracker `state` is intentionally NOT reset (retained state avoids a
+        # phantom CLOSE on every edge; the tracker's K-book cache is separate from the global `books` dict).
+        backoff = 1
+        while True:
+            try:
+                async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
+                    conns["k"] = ws
+                    async def subscribe(tickers):
+                        await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                            "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}}))
+                    books.clear()                              # fresh connection -> rebuild every book from snapshots
+                    await subscribe(list(k_targets))
+                    st = SeqTracker()                          # books is shared (run_live scope) so prune can free it
+                    backoff = 1
+                    async for raw in ws:
+                        last_rx["k"] = time.time()
+                        o = json.loads(raw)
+                        if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> resync all
+                            books.clear(); st.reset(); await subscribe(list(k_targets))
+                            logger.resync({"seq": o["seq"]})            # mark it so analysis censors the re-OPENs
+                            continue
+                        typ, msg = o.get("type"), o.get("msg", {}); tk = msg.get("market_ticker")
+                        if typ == "orderbook_snapshot":
+                            books[tk] = KalshiBook(tk); books[tk].apply_snapshot(msg)
+                        elif typ == "orderbook_delta" and tk in books:
+                            books[tk].apply_delta(msg)
+                        else:
+                            continue
+                        fn = k_targets.get(tk)
+                        if fn:
+                            fn(books[tk])
+            except Exception as e:
+                print(f"[kalshi] stream dropped ({e!r}); reconnect in {backoff}s")
+            else:
+                print(f"[kalshi] stream closed cleanly; reconnect in {backoff}s")
+            finally:
+                conns.pop("k", None)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
     async def rest_heartbeat():     # periodic FULL re-discovery: subscribe NEW markets + coverage audit
         while True:
@@ -645,6 +687,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             fresh, r2 = await asyncio.to_thread(build_colisted_map)
             for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
                 if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
+            if r2.get("weather_bucket_MISALIGNED"):     # C4: surface newly-listed misaligned buckets each heartbeat
+                print(f"[coverage] {len(r2['weather_bucket_MISALIGNED'])} weather bucket misalignments (NOT paired)")
             new_pm, new_k = register(fresh)             # trackers for new weather days / games
             if new_pm and conns.get("pm"):
                 for i in range(0, len(new_pm), shard_size):
@@ -666,8 +710,12 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             if stale:
                 print(f"[prune] freed {len(stale)} settled markets; now tracking "
                       f"{len(pm_targets)} pmus / {len(k_targets)} Kalshi ({len(books)} live books)")
+            now = time.time()                                                   # per-venue stream-liveness in the beacon:
             logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
-                           "pmus": len(pm_targets), "kalshi": len(k_targets)})   # refresh liveness beacon
+                           "pmus": len(pm_targets), "kalshi": len(k_targets),
+                           "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
+                                      "k": round(now - last_rx["k"], 1) if last_rx["k"] else None}})  # off-box check can
+            # alert when one venue's rx_age stays high (stream silent/wedged) even though the process + beacon are live
 
     async def flusher():            # emit debounced CLOSEs whose flip-window elapsed
         while True:
@@ -692,7 +740,15 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                 print(f"[cli] poll error (continuing): {e!r}")     # never let CLI polling crash collection
             await asyncio.sleep(1800)
 
-    await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat(), flusher(), cli_stream())
+    # return_exceptions: belt-and-suspenders. Each task above is now an infinite supervised loop, so a single
+    # stream drop never tears down the others; if an unexpected error still escapes a task it's collected here
+    # (logged) rather than cancelling the whole collector. (A truly unrecoverable error -> task ends -> if all end
+    # the process exits -> systemd Restart=always; the silent clean-return hole is closed by the while-loops.)
+    results = await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat(), flusher(), cli_stream(),
+                                   return_exceptions=True)
+    for name, r in zip(("pmus", "kalshi", "heartbeat", "flusher", "cli"), results):
+        if isinstance(r, Exception):
+            print(f"[run_live] task {name} exited with {r!r}")
 
 
 if __name__ == "__main__":
