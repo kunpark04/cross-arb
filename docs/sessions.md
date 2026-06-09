@@ -6,6 +6,29 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-09 — Independent review → correctness fixes, settlement verified, de-filtering
+
+Ran a fresh-eyes adversarial review of the whole project (given only the thesis, none of our own findings)
+and acted on every confirmed finding. Saved as [tasks/independent-review-2026-06-09.md](../tasks/independent-review-2026-06-09.md).
+
+- **Confirmed bugs fixed** (`bot/ledger.py`, `bot/monitor.py`): per-**order** Kalshi fee (was per-contract,
+  over-charging) + a float-imprecision ceil overshoot (175.0000003→176) (**C1**); `ledger.enter` refuses a
+  non-positive-edge book (**C2**); crossed/locked-book rejection (**C3**); a Kalshi seq-resync now writes a
+  `kalshi_resync` marker the analyzer censors (**C6**). Lessons **L10–L13**.
+- **Instrumentation:** added per-venue **staleness (`age`)** to each transition + a `capital_sim`
+  **clean-fillable** filter (liquidity + freshness) to separate persistent-fillable from persistent-stale-
+  phantom (review **L2**).
+- **Settlement identity VERIFIED** (`scripts/verify_settlement.py`, the review's #1 risk): pulled both venues'
+  live weather rules → **same NWS CLI Daily + same station (incl. NYC = Central Park) + matching boundaries**
+  across 5 cities; *timing/revision* still open. → [research/settlement-verification.md](../research/settlement-verification.md).
+- **De-filtering** (owner's rule — filter a trade ONLY when its ACTUAL edge ≤ 0): **marginal-fee detection**
+  (the n=1 ceil fee over-charged 0.25–0.9c and dropped real at-size arbs; booking keeps the exact per-order
+  fee); **permissive analysis baseline** (every positive arb; 1c/liquidity/staleness are opt-in knobs); and
+  **per-direction pricing** so a one-sided book no longer drops the valid direction (`make_px`/`signal`/
+  `game_edge`). Lessons **L14–L15**; decision [0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md)
+  (filter on the ALL-IN edge — fees + spread IN; slippage/latency/leg-risk OUT, to model in the trade layer).
+- Monitor redeployed several times (live, `active`, 0 restarts). Pushed to `origin/main` through `34554dc`.
+
 ## 2026-06-09 — Deployed live + foolproof data pipeline + liveness alerting
 
 Took the read-only monitor from build-complete to **running 24/7 on a DigitalOcean droplet**, then made the
