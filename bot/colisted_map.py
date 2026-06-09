@@ -11,9 +11,11 @@ Freshness model (answers "does this miss new markets?"):
     lists every climate city + sports league polymarket.us is currently listing and flags any we don't
     map. Unmapped => we'd miss it until WX/LEAGUES is extended -> the report makes that LOUD, not silent.
 
-WX / LEAGUES mirror scripts/scan_all.py (the validated matcher). Keep them in sync; the coverage audit
-below is the backstop that catches drift. Matching is identity-based (city+date+bucket; league+date+
-abbrev|surname) - the no-false-positive invariant (lesson L1). No order books are fetched here (fast).
+WX / LEAGUES / ECON mirror scripts/scan_all.py (the validated matcher). Keep them in sync; the coverage
+audit below is the backstop that catches drift. Matching is identity-based (city+date+bucket; league+date+
+abbrev|surname; econ family+period+threshold) - the no-false-positive invariant (lesson L1). ECON
+(CPI/U-3/NFP/GDP/Fed) covers the cleanest US-legal subset; only SAME-orientation pairs are mapped
+(settlement identity verified by scripts/verify_econ_settlement.py). No order books are fetched here (fast).
 """
 import os, sys, re, json, time, urllib.request, urllib.error, collections, unicodedata
 try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -116,6 +118,81 @@ def pick_game(kbydate, kA, kB, join, date, slug_dated):
         if len(near) == 1: return near[0]
     return None
 
+# --- ECON (macro) co-listing: pmus binary threshold/categorical <-> Kalshi cumulative "Above T" / categorical.
+#     VERIFIED 2026-06-09 (scripts/verify_econ_settlement.py): same family/period/threshold + same govt source
+#     (BLS/BEA/Fed). Only SAME-ORIENTATION pairs are co-listed: pmus ">=T" YES == Kalshi "Above T" YES, and Fed
+#     categorical label==label (the pmus /book is YES-oriented regardless of the outcomes-array order, verified
+#     pm book mid ~ Kalshi YES mid). SKIPPED+flagged: pmus "<=T" tails (pmus-YES = Kalshi-NO, opposite) and
+#     "exactly X%" POINT buckets (no cumulative Kalshi twin). Residual: a print EXACTLY on T resolves >= vs >
+#     oppositely (narrow, like the weather downward-correction).
+ECON = {"cpic": ("KXCPIYOY", "cpi"), "urc": ("KXU3", "u3"), "nfpc": ("KXPAYROLLS", "nfp"),
+        "gdpc": ("KXGDP", "gdp"), "rdc": ("KXFEDDECISION", "fed")}
+_EMON = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_FEDLBL = {"maintains": "fed maintains rate", "hike25bps": "hike 25bps", "hikegt25bps": "hike >25bps",
+           "cut25bps": "cut 25bps", "cutgt25bps": "cut >25bps"}
+def _enum(tok):
+    t = tok.lower().replace("pct", "").strip(); mult = 1
+    if t.endswith("k"): mult = 1000; t = t[:-1]
+    t = t.replace("pt", ".")
+    try: return float(t) * mult
+    except ValueError: return None
+def econ_parse(slug):
+    """pmus econ slug -> {fam, period(Kalshi token), thr, ineq, label} or None. ineq in '>=','<=','==','cat'."""
+    s = str(slug).lower(); pre = s.split("-")[0]
+    if pre not in ECON: return None
+    if pre == "rdc":
+        m = re.search(r"-(maintains|cut25bps|cutgt25bps|hike25bps|hikegt25bps)$", s)
+        dm = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+        return {"fam": pre, "period": (f"{dm.group(1)[2:]}{MON[int(dm.group(2))-1]}" if dm else None),
+                "thr": None, "ineq": "cat", "label": (m.group(1) if m else None)}
+    tail = re.search(r"-(lte|gte)([0-9pt]+)pct$", s) or re.search(r"-(atl|atm)([0-9ptk]+)$", s)
+    if tail:
+        ineq = "<=" if tail.group(1) == "lte" else ">="; thr = _enum(tail.group(2))
+    else:
+        pt = re.search(r"-([0-9pt]+)pct$", s)
+        if not pt: return None
+        ineq = "=="; thr = _enum(pt.group(1))
+    if pre == "cpic":
+        mm = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*?(\d{4})yoy", s)
+        per = f"{mm.group(2)[2:]}{MON[_EMON[mm.group(1)[:3]]-1]}" if mm else None
+    elif pre == "gdpc":
+        dm = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+        per = f"{dm.group(1)[2:]}{MON[int(dm.group(2))-1]}{dm.group(3)}" if dm else None
+    else:
+        mm = re.search(r"-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-", s); ym = re.search(r"(\d{4})-\d{2}-\d{2}", s)
+        per = f"{ym.group(1)[2:]}{MON[_EMON[mm.group(1)[:3]]-1]}" if (mm and ym) else None
+    return {"fam": pre, "period": per, "thr": thr, "ineq": ineq, "label": None}
+def econ_colisted(allm):
+    """Full econ discovery -> (entries, flags). Only SAME-orientation pairs (>=threshold + Fed categorical)."""
+    macro = [m for m in allm if m.get("category") == "macro"]
+    bypre = collections.defaultdict(list)
+    for m in macro: bypre[str(m.get("slug", "")).split("-")[0]].append(m)
+    out, flags = [], collections.Counter()
+    for pre, (kser, fam) in ECON.items():
+        if not bypre.get(pre): continue
+        kd = get(f"{KAL}?series_ticker={kser}&limit=400"); time.sleep(0.25)
+        kby, klab = collections.defaultdict(dict), collections.defaultdict(dict)
+        for m in kd.get("markets", []):
+            tk = str(m.get("ticker", "")); pm_ = re.search(r"-(\d{2}[A-Z]{3}\d{0,2})-", tk)
+            per = pm_.group(1) if pm_ else None
+            kby[per][m.get("floor_strike")] = tk; klab[per][str(m.get("yes_sub_title", "")).lower()] = tk
+        for x in bypre[pre]:
+            p = econ_parse(x.get("slug"))
+            if not p: continue
+            if p["ineq"] == "cat":
+                tk = klab.get(p["period"], {}).get(_FEDLBL.get(p["label"]))
+                if tk: out.append({"cat": "econ", "family": fam, "period": p["period"],
+                                   "slug": str(x.get("slug")), "kalshi": tk, "outcome": p["label"]})
+                else: flags["fed_nomatch"] += 1
+            elif p["ineq"] == ">=":
+                tk = kby.get(p["period"], {}).get(p["thr"])
+                if tk: out.append({"cat": "econ", "family": fam, "period": p["period"], "thr": p["thr"],
+                                   "slug": str(x.get("slug")), "kalshi": tk})
+                else: flags["ge_nomatch"] += 1
+            elif p["ineq"] == "<=": flags["le_skip_OPPOSITE_orientation"] += 1   # pmus-YES = Kalshi-NO (not paired)
+            else: flags["point_bucket_skip"] += 1                               # no cumulative Kalshi twin
+    return out, dict(flags)
+
 def pm_catalog():
     allm, off = [], 0
     while True:
@@ -196,15 +273,22 @@ def build_colisted_map():
                            "kalshi_a": pl[mA], "kalshi_b": pl[mB], "void_clean": False,
                            "teamA": (lo.get("team") or {}).get("name"), "teamB": (ot.get("team") or {}).get("name")})
 
+    # ---- ECON (macro): pmus threshold/categorical <-> Kalshi cumulative/categorical, SAME-orientation only ----
+    econ, econ_flags = econ_colisted(allm)
+    pm_macro_fams = {str(m.get("slug", "")).split("-")[0] for m in allm if m.get("category") == "macro"}
+
     report = {
         "weather_cities_mapped": sorted(c for c in pm_cities if c in WX),
         "weather_cities_UNMAPPED": sorted(c for c in pm_cities if c not in WX),
         "sports_leagues_mapped": sorted(l for l in pm_leagues if l in LEAGUES),
         "sports_leagues_UNMAPPED": sorted(l for l in pm_leagues if l not in LEAGUES),
         "weather_bucket_MISALIGNED": bucket_misaligned,   # non-identical degF ranges -> NOT paired (settlement-identity)
-        "counts": {"weather_pairs": len(weather), "sports_pairs": len(sports)},
+        "econ_families_mapped": sorted(f for f in pm_macro_fams if f in ECON),
+        "econ_families_UNMAPPED": sorted(f for f in pm_macro_fams if f not in ECON),
+        "econ_SKIPPED": econ_flags,                       # <=tails (opposite orient) + point-buckets + no-match
+        "counts": {"weather_pairs": len(weather), "sports_pairs": len(sports), "econ_pairs": len(econ)},
     }
-    return {"weather": weather, "sports": sports}, report
+    return {"weather": weather, "sports": sports, "econ": econ}, report
 
 def weather_monitor_map(colisted):
     """The 1:1 {slug: ticker} dict the current monitor consumes (weather subset; sports needs the
@@ -247,7 +331,16 @@ def _selftest():
     # surname join still resolves two distinct players to two distinct tickers
     pl = {"djokovic": "K-DJO", "alcaraz": "K-ALC"}
     assert pick_game({"2026-06-09": [pl]}, "djokovic", "alcaraz", "surname", "2026-06-09", slug_dated=True)[1:] == ("djokovic", "alcaraz")
-    print("OK - helpers, smatch L1-collision rejection, C4 bucket boundary, C2 exact-date game binding")
+    # --- ECON: pmus econ slug -> (family, period, threshold, inequality); only >= + Fed-cat are co-listed ---
+    assert econ_parse("gdpc-us-saa-q2-2026-07-30-atl2pt0") == {"fam": "gdpc", "period": "26JUL30", "thr": 2.0, "ineq": ">=", "label": None}
+    assert econ_parse("cpic-uscpi-may2026yoy-2026-06-10-lte3pt7pct") == {"fam": "cpic", "period": "26MAY", "thr": 3.7, "ineq": "<=", "label": None}
+    assert econ_parse("cpic-uscpi-may2026yoy-2026-06-10-3pt8pct")["ineq"] == "=="   # point bucket -> not co-listed
+    nfp = econ_parse("nfpc-uschange-gte-june-2026-07-02-atl250k")
+    assert nfp["thr"] == 250000.0 and nfp["period"] == "26JUN" and nfp["ineq"] == ">="
+    fed = econ_parse("rdc-usfed-fomc-2026-06-17-maintains")
+    assert fed["ineq"] == "cat" and fed["label"] == "maintains" and fed["period"] == "26JUN"
+    assert econ_parse("aec-mlb-x-y-2026-06-10") is None and econ_parse("tc-temp-laxhigh-2026-06-09-gte73") is None
+    print("OK - helpers, smatch L1-collision rejection, C4 bucket boundary, C2 exact-date game binding, econ parse")
 
 
 if __name__ == "__main__":
@@ -255,9 +348,14 @@ if __name__ == "__main__":
         _selftest(); sys.exit(0)
     print("full co-listed discovery (read-only)...\n")
     colisted, rep = build_colisted_map()
-    print(f"weather pairs: {rep['counts']['weather_pairs']}   sports pairs: {rep['counts']['sports_pairs']}\n")
+    print(f"weather pairs: {rep['counts']['weather_pairs']}   sports pairs: {rep['counts']['sports_pairs']}   econ pairs: {rep['counts']['econ_pairs']}\n")
     print(f"weather cities mapped:   {rep['weather_cities_mapped']}")
     print(f"sports leagues mapped:   {rep['sports_leagues_mapped']}")
+    print(f"econ families mapped:    {rep['econ_families_mapped']}   (skipped: {rep['econ_SKIPPED']})")
+    if colisted["econ"]:
+        print("  econ pairs (sample):")
+        for e in colisted["econ"][:8]:
+            print(f"    {e.get('family')} {e.get('period')} {e.get('thr', e.get('outcome'))}  {e['slug']} <-> {e['kalshi']}")
     um_c, um_l = rep["weather_cities_UNMAPPED"], rep["sports_leagues_UNMAPPED"]
     if um_c or um_l:
         print("\n!!! COVERAGE GAP - polymarket.us lists these, but WX/LEAGUES does NOT map them (would be MISSED):")

@@ -579,7 +579,9 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
 
     def register(colisted):                       # add trackers for NEW markets; return (new slugs, new tickers)
         new_pm, new_k = [], []
-        for e in colisted["weather"]:             # WEATHER = 1:1 binary MarketTracker
+        # WEATHER + ECON = 1:1 binary same-outcome MarketTracker (pm /book is YES-oriented; econ >= matches
+        # Kalshi "Above T" YES, verified scripts/verify_econ_settlement.py + colisted_map ECON).
+        for e in colisted["weather"] + colisted.get("econ", []):
             if e["slug"] in pm_targets: continue
             trk = MarketTracker(e["slug"])
             def pm_fn(b, o, trk=trk, key=e["slug"]): trk.set_book("P", b, o); emit(*trk.evaluate(), key)
@@ -606,12 +608,12 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
         print(f"[coverage] WARNING {len(rep['weather_bucket_MISALIGNED'])} weather bucket misalignments "
               f"(NOT paired - settlement-identity guard): {rep['weather_bucket_MISALIGNED'][:3]}")
     register(colisted)
-    print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports "
-          f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
-    logger.session_start({"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
-                          "pmus": len(pm_targets), "kalshi": len(k_targets)})   # restart marker
-    logger.health({"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
-                   "pmus": len(pm_targets), "kalshi": len(k_targets)})           # liveness beacon (startup)
+    print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports + "
+          f"{len(colisted.get('econ', []))} econ ({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
+    _counts = {"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
+               "econ": len(colisted.get("econ", [])), "pmus": len(pm_targets), "kalshi": len(k_targets)}
+    logger.session_start(_counts)   # restart marker
+    logger.health(_counts)          # liveness beacon (startup)
 
     async def pmus_stream():
         # SUPERVISED reconnect loop: a CLEAN close (1000/1001 idle/LB-cycle) ends `async for` WITHOUT raising;
@@ -710,7 +712,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                 print(f"[discovery] +{len(new_pm)} new markets subscribed")
             # FREE settled markets: anything gone from discovery for PRUNE_THRESHOLD heartbeats. Keeps the
             # working set = the live universe, so memory stays flat over a multi-week run (no leak).
-            current = {e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
+            current = ({e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
+                       | {e["slug"] for e in fresh.get("econ", [])})   # incl. econ or it'd be pruned each heartbeat
             stale = prune_decision(set(pm_targets), current, absent)
             for slug in stale:
                 teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent)
@@ -719,6 +722,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                       f"{len(pm_targets)} pmus / {len(k_targets)} Kalshi ({len(books)} live books)")
             now = time.time()                                                   # per-venue stream-liveness in the beacon:
             logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
+                           "econ": len(fresh.get("econ", [])),
                            "pmus": len(pm_targets), "kalshi": len(k_targets),
                            "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
                                       "k": round(now - last_rx["k"], 1) if last_rx["k"] else None}})  # off-box check can

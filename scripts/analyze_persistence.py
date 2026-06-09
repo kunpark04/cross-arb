@@ -21,9 +21,11 @@ duration. READ-ONLY. Run `--selftest` for the synthetic verification; no args an
 import os, sys, re, gzip, json, glob, argparse
 
 WEATHER_PFX, SPORTS_PFX = "tc-", "aec-"
+ECON_PFX = ("cpic-", "gdpc-", "nfpc-", "urc-", "rdc-")   # CPI / GDP / NFP / U-3 / Fed (bot/colisted_map.ECON)
 def category(slug):
     if slug.startswith(WEATHER_PFX): return "weather"
     if slug.startswith(SPORTS_PFX):  return "sports"
+    if slug.startswith(ECON_PFX):    return "econ"
     return "other"
 
 
@@ -224,6 +226,8 @@ def summarize(records, sessions, episodes, edge_min, window_min):
 # ============================================================================================
 def _selftest():
     print("persistence-analysis self-test")
+    assert category("urc-us-seasonadj-gte-june-2026-07-02-atl4pt6") == "econ" and category("rdc-usfed-fomc-2026-06-17-maintains") == "econ"
+    assert category("tc-temp-x") == "weather" and category("aec-mlb-x") == "sports"
     def tr(t, m, lab, net, d="PK", c2=None, age=None):
         r = {"t": t, "market": m, "transition": lab, "dir": d, "net_edge": net}
         if c2 is not None: r["depth"] = {"c2": c2, "c1": c2, "c0": c2}

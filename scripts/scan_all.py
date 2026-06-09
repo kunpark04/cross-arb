@@ -4,7 +4,9 @@ market (no edge pruning) with uniform metrics, for the live bot's later trade-se
   - Sports moneyline: every co-listed league. Team/esport -> abbreviation join; individual -> surname.
 Metric per market (2 complementary outcomes A/B): net = 1 - (min askA + min askB) - fees;
 fillable size + $ on positive edges. Output -> _data/scan_all.json (+ summary)."""
-import json, os, re, urllib.request, urllib.error, time, math, collections, unicodedata
+import json, os, sys, re, urllib.request, urllib.error, time, math, collections, unicodedata
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
+from colisted_map import econ_colisted   # ECON co-listing (verified same-orientation >=threshold + Fed categorical)
 
 UA={"User-Agent":"Mozilla/5.0","Accept":"application/json"}
 def get(url,tries=4):
@@ -169,6 +171,15 @@ for L,(series,join) in LEAGUES.items():
         mt=metric(pa,pas,round(1-pb,3),pbs,kaA,kAsz,kaB,kBsz)
         if mt: rows.append({"cat":"sports","group":L,"date":date,
                             "A":(lo.get("team") or {}).get("name"),"B":(ot.get("team") or {}).get("name"),**mt})
+
+# ---------- ECON (macro): pmus threshold/categorical <-> Kalshi, SAME-orientation only (verified) ----------
+econ_pairs, econ_flags = econ_colisted(allm)
+for e in econ_pairs:
+    (pb,pbs),(pa,pas)=pm_book(str(e["slug"])); time.sleep(0.12)
+    kyb,kybs,kya,kyas=k_ob(e["kalshi"]); time.sleep(0.12)
+    mt=metric(pa,pas,(round(1-pb,2) if pb is not None else None),pbs, kya,kyas,(round(1-kyb,2) if kyb else None),kybs)
+    if mt: rows.append({"cat":"econ","group":e["family"],"date":e.get("period"),
+                        "A":str(e.get("thr",e.get("outcome"))),"B":"complement","slug":str(e["slug"]),**mt})
 
 # ---------- output ----------
 json.dump(rows,open(os.path.join(os.path.dirname(__file__),"_data","scan_all.json"),"w"),indent=1)

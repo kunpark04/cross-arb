@@ -85,7 +85,7 @@ def analyze(recs):
             continue
         counts[tag] += 1
         cheap_moves.append(abs(cm or 0.0)); dear_moves.append(abs(dm or 0.0))
-    return {"weather_open_close_pairs": len(pairs), "with_px_and_weather_dir": len(rows),
+    return {"binary_open_close_pairs": len(pairs), "with_px_and_binary_dir": len(rows),   # weather + econ (dir P/K)
             "attributed": sum(counts.values()), "counts": counts,
             "med_cheap_move": _med(cheap_moves), "med_dear_move": _med(dear_moves)}
 
@@ -99,8 +99,8 @@ def report(data_dir):
     a = analyze(recs)
     L = ["=" * 68, "ADVERSE SELECTION  (which venue moved when the edge closed?)", "=" * 68]
     L.append(f"transitions read       : {len(recs)}")
-    L.append(f"weather OPEN->CLOSE     : {a['weather_open_close_pairs']}")
-    L.append(f"  with px + weather dir : {a['with_px_and_weather_dir']}")
+    L.append(f"binary OPEN->CLOSE      : {a['binary_open_close_pairs']}  (weather + econ, dir P/K)")
+    L.append(f"  with px + binary dir  : {a['with_px_and_binary_dir']}")
     if a["attributed"] == 0:
         L += ["", "No attributable episodes yet. The `px` field (per-venue YES touches) is logged by bot/monitor.py",
               "as of the 2026-06-09 enhancement; data collected BEFORE the next droplet deploy lacks it. Re-pull",
