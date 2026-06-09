@@ -56,7 +56,8 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       today we filter only the QUOTED taker-fee-net edge (fees + spread in; **slippage / latency / leg-fill
       risk OUT**). Build the all-in filter: size-aware slippage (from `depth`, + net-marginal depth curve),
       a measured **latency** haircut (order-ack study), and a **leg-fill-failure** EV term
-      (`P(both)·quoted − P(one)·naked-loss`). Also: `make_px` per-direction (one-sided books).
+      (`P(both)·quoted − P(one)·naked-loss`). [`make_px`/`signal`/`game_edge` per-direction pricing for
+      one-sided books — **done 2026-06-09**.]
 - [ ] **Open items from the review** — settlement **timing/revision** (pmus rulebook) + middle-bucket
       boundaries; **cost-of-carry** in `capital_sim`; live **mid-divergence** guard (L1 in the monitor);
       WS snapshot-vs-delta confirmation.

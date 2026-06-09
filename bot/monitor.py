@@ -32,15 +32,14 @@ def best_px(levels):
     return float(levels[0]["px"]["value"]) if levels else None
 
 def make_px(p_bids, p_offers, k_bids, k_offers):
-    """Build the {p_yb,p_ya,k_yb,k_ya} YES bid/ask quad ledger.signal() expects, from both venues'
-    YES-side books. Returns None if any of the four touches is missing (can't price an arb)."""
-    p_yb, p_ya = best_px(p_bids), best_px(p_offers)
-    k_yb, k_ya = best_px(k_bids), best_px(k_offers)
-    if None in (p_yb, p_ya, k_yb, k_ya):
-        return None
-    if p_yb > p_ya or k_yb > k_ya:          # strictly-crossed/locked book = stale/in-play, not a real quad (C3)
-        return None
-    return {"p_yb": p_yb, "p_ya": p_ya, "k_yb": k_yb, "k_ya": k_ya}
+    """Build the {p_yb,p_ya,k_yb,k_ya} YES bid/ask quad signal() consumes. A touch may be None (one-sided
+    book) — signal() prices each direction on the two quotes it needs. Returns None ONLY if NEITHER
+    direction is fully quoted (nothing priceable). Crossed-book rejection is per-direction in signal()."""
+    px = {"p_yb": best_px(p_bids), "p_ya": best_px(p_offers),
+          "k_yb": best_px(k_bids), "k_ya": best_px(k_offers)}
+    dir_p = px["p_ya"] is not None and px["k_yb"] is not None     # YES@P + NO@K  needs P-ask + K-bid
+    dir_k = px["k_ya"] is not None and px["p_yb"] is not None     # YES@K + NO@P  needs K-ask + P-bid
+    return px if (dir_p or dir_k) else None
 
 def edge_state(px):
     """Reduce a price quad to the comparable edge state: arb present? which direction? net edge."""
@@ -159,15 +158,16 @@ def game_edge(pm_bid, pm_ask, kA_ask, kB_ask):
     'KP' = back A@Kalshi + B@polymarket. Returns {arb,dir,net} or None. Same-venue configs are excluded
     by construction: a complete pm set (A@P+B@P) costs >=$1, and both-on-Kalshi is an intra-Kalshi arb
     (out of scope for a CROSS-venue strategy). A strictly-crossed pm book is rejected as stale (C3)."""
-    if None in (pm_bid, pm_ask, kA_ask, kB_ask):
+    if pm_bid is not None and pm_ask is not None and pm_bid > pm_ask:   # strictly-crossed pm book -> stale
         return None
-    if pm_bid > pm_ask:                                        # strictly-crossed pm book -> stale
+    opts = []   # DETECTION uses the at-scale marginal Kalshi fee (no ceil) — capture any arb +EV at size
+    if pm_ask is not None and kB_ask is not None:                       # PK: back A@P + B@K
+        opts.append(("PK", round((1 - (pm_ask + kB_ask)) - pfee(pm_ask) - kfee(kB_ask, marginal=True), 4)))
+    if kA_ask is not None and pm_bid is not None:                       # KP: back A@K + B@P
+        pm_backB = round(1 - pm_bid, 4)
+        opts.append(("KP", round((1 - (kA_ask + pm_backB)) - kfee(kA_ask, marginal=True) - pfee(pm_backB), 4)))
+    if not opts:
         return None
-    pm_backB = round(1 - pm_bid, 4)
-    opts = [   # DETECTION uses the at-scale marginal Kalshi fee (no ceil) — capture any arb +EV at size
-        ("PK", round((1 - (pm_ask + kB_ask)) - pfee(pm_ask) - kfee(kB_ask, marginal=True), 4)),       # A@P + B@K
-        ("KP", round((1 - (kA_ask + pm_backB)) - kfee(kA_ask, marginal=True) - pfee(pm_backB), 4)),    # A@K + B@P
-    ]
     best = max(opts, key=lambda o: o[1])
     return {"arb": best[1] > 0, "dir": best[0], "net": best[1]}
 
@@ -425,10 +425,14 @@ def _selftest():
     kb = KalshiBook("KB"); kb.apply_snapshot({"no_dollars_fp": [["0.56", "30"]]})    # yes ask 1-.56=.44
     g.feed_kalshi("A", ka); g.feed_kalshi("B", kb)
     assert g._depth("PK") == {"c2": 8, "c1": 8, "c0": 8}, g._depth("PK")             # min(pm 8, kB 30) = 8 pairs
-    # crossed/locked-book rejection (C3): a strictly-crossed venue book is not a real quad / edge
-    assert make_px(lv([(0.70, 9)]), lv([(0.60, 9)]), lv([(0.50, 9)]), lv([(0.52, 9)])) is None   # P bid>ask
-    assert game_edge(0.70, 0.60, 0.55, 0.44) is None                                              # pm bid>ask
-    print("OK - depth: signalled-direction pairs walk; weather/sports; Kalshi offer_pairs; crossed-book reject")
+    # crossed-book reject (now per-direction in signal/game_edge) + ONE-SIDED books still price the valid side
+    cross = make_px(lv([(0.70, 9)]), lv([(0.60, 9)]), lv([(0.50, 9)]), lv([(0.52, 9)]))   # P crossed (bid>ask)
+    cs = edge_state(cross); assert cs is not None and not cs["arb"]                        # crossed venue -> no arb
+    assert game_edge(0.70, 0.60, 0.55, 0.44) is None                                       # crossed pm -> None
+    one = make_px([], lv([(0.55, 9)]), lv([(0.62, 9)]), lv([(0.70, 9)]))                   # P has NO bid (one-sided)
+    os1 = edge_state(one); assert os1 and os1["arb"] and os1["dir"] == "P"                 # dir P still prices (was dropped before)
+    assert game_edge(None, 0.50, 0.55, 0.44)["dir"] == "PK"                                # one-sided pm (no bid) -> PK still prices
+    print("OK - depth: signalled-direction pairs walk; crossed reject + ONE-SIDED books price per-direction")
 
 
 # ============================================================================================

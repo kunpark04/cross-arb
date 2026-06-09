@@ -35,23 +35,25 @@ def pfee(p, n=1, taker=True):
 FEE = {"P": pfee, "K": kfee}
 
 def signal(px):
-    """Best cross-venue arb from prices px={p_yb,p_ya,k_yb,k_ya}. Returns dict (with no_arb when none).
-    dir 'P' = buy YES@P + NO@K ;  dir 'K' = buy YES@K + NO@P."""
-    # reject an internally-crossed/locked venue book (yes_bid >= yes_ask) — almost always stale or
-    # in-play data, and it manufactures a phantom 'edge'. Treat as no-arb (C3).
-    if px["p_yb"] > px["p_ya"] or px["k_yb"] > px["k_ya"]:        # strictly crossed (locked bid==ask is ok)
-        return {"dir": "P", "yes_ask": px["p_ya"], "no_ask": round(1 - px["k_yb"], 4),
-                "net_edge": 0.0, "no_arb": True, "crossed": True}
-    # DETECTION uses the at-scale MARGINAL Kalshi fee (no ceil): the question is "is this +EV at SOME size?"
-    # — using the n=1 ceil fee over-charges ~0.25-0.9c and would drop a real arb that's only +EV at size.
-    # The exact per-order ceil fee is applied later at booking (Ledger.enter), where the size is known.
+    """Best cross-venue arb from px={p_yb,p_ya,k_yb,k_ya} (any quote may be None for a one-sided book).
+    Each direction is evaluated on ONLY the two quotes it needs — 'P' = YES@P(p_ya)+NO@K(1-k_yb),
+    'K' = YES@K(k_ya)+NO@P(1-p_yb) — so a one-sided book never kills the direction that doesn't use the
+    missing quote. A strictly-crossed venue (bid>ask, when both touches present) is stale: every direction
+    touching it is skipped. DETECTION uses the at-scale MARGINAL Kalshi fee (no ceil) so nothing +EV-at-size
+    is dropped; the exact per-order ceil fee is applied at booking (Ledger.enter)."""
+    p_yb, p_ya, k_yb, k_ya = px.get("p_yb"), px.get("p_ya"), px.get("k_yb"), px.get("k_ya")
+    p_x = p_yb is not None and p_ya is not None and p_yb > p_ya   # venue crossed (only when both touches present)
+    k_x = k_yb is not None and k_ya is not None and k_yb > k_ya
     opts = []
-    ay, an = px["p_ya"], 1-px["k_yb"]                     # YES@P + NO@K
-    net = (1-(ay+an)) - pfee(ay) - kfee(an, marginal=True)
-    opts.append(("P", ay, an, round(net, 4)))
-    ay, an = px["k_ya"], 1-px["p_yb"]                     # YES@K + NO@P
-    net = (1-(ay+an)) - kfee(ay, marginal=True) - pfee(an)
-    opts.append(("K", ay, an, round(net, 4)))
+    if p_ya is not None and k_yb is not None and not (p_x or k_x):   # dir P: YES@P + NO@K
+        ay, an = p_ya, 1 - k_yb
+        opts.append(("P", ay, an, round((1-(ay+an)) - pfee(ay) - kfee(an, marginal=True), 4)))
+    if k_ya is not None and p_yb is not None and not (p_x or k_x):   # dir K: YES@K + NO@P
+        ay, an = k_ya, 1 - p_yb
+        opts.append(("K", ay, an, round((1-(ay+an)) - kfee(ay, marginal=True) - pfee(an), 4)))
+    if not opts:                                                    # nothing priceable (one-sided both ways, or crossed)
+        return {"dir": "P", "yes_ask": p_ya, "no_ask": (round(1-k_yb, 4) if k_yb is not None else None),
+                "net_edge": 0.0, "no_arb": True, "crossed": p_x or k_x}
     best = max(opts, key=lambda o: o[3])
     return {"dir": best[0], "yes_ask": best[1], "no_ask": best[2], "net_edge": best[3]} if best[3] > 0 else \
            {"dir": best[0], "yes_ask": best[1], "no_ask": best[2], "net_edge": best[3], "no_arb": True}

@@ -51,9 +51,11 @@ During the **read-only collection phase** this is deliberately **split**:
    haircut and/or gate on `age`. `scripts/capital_sim.py --haircut` is the manual stand-in (defaults 0).
 3. **Leg-fill failure** — **unmodeled** (review B1, the dominant cost). Model:
    `all_in = P(both fill)·quoted − P(one fills)·E[naked-leg loss]`. One naked-leg loss erases many good arbs.
-4. **One-sided-book over-strictness** — `make_px` requires all four touches, so a one-sided book kills **both**
-   directions even though each needs only **two** (the ask where you buy YES + the bid where you buy NO).
-   Evaluate each direction independently. Minor/rare (live markets are two-sided).
+4. **One-sided-book over-strictness — FIXED 2026-06-09.** `make_px` / `signal` / `game_edge` now price **each
+   direction on only its two quotes** (the ask where you buy YES + the bid where you buy NO), so a one-sided
+   book no longer kills the direction that doesn't use the missing quote. `make_px` returns the partial quad
+   when ≥1 direction is fully quoted; the crossed-book check moved into `signal` (a venue is "crossed" only
+   when both its touches are present and bid>ask, so a missing touch isn't mistaken for crossed).
 
 ## Consequences
 
