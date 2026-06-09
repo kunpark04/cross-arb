@@ -40,9 +40,16 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       (OPEN→CLOSE per market, restart-aware via `sessions.jsonl`) → edge-magnitude / persistence (fill
       window) / capturable-rate / scalability proxy. Self-tested; validated on preliminary data (0.8 h:
       median edge ~0.7c, median duration ~2 s with a thin persistent tail — the MLB line-lag). Re-run as
-      the dataset grows; **the methodology + thresholds want a stats review before the actual verdict.**
-- [ ] **Go/no-go gate** — from the accumulated data (via `analyze_persistence.py`), decide whether the
-      edge is persistent/scalable enough to build the live bot. File the verdict as a decision when reached.
+      the dataset grows.
+- [x] **Depth-logging + capital/throughput simulator** — monitor logs per-transition fillable depth
+      (`depth:{c2,c1,c0}` = contracts at gross marginal edge ≥2c/1c/0c, both legs); `scripts/capital_sim.py`
+      models hold-to-settlement concurrency (Little's Law) → required-capital ↔ daily-return frontier,
+      W-sensitivity + intraday arrival profile. Self-tested; validated end-to-end (data still too sparse for
+      a read). MLB edges show **thousands of contracts of depth** (e.g. `lad-pit` c2≈4800).
+- [ ] **Size the bankroll + intraday strategy** — as data accumulates, re-run the harness + simulator to
+      set the initial capital (peak concurrent), per-arb clip (depth-capped), and intraday allocation
+      (verify/refute the evening-cluster hypothesis). Per the owner this is sizing/tuning, **not** a hard
+      go/no-go gate (confident the arb works).
 - [ ] **(then, per user) Live-bot trade-selection** — wire `ledger.py` to live monitor signals: capital
       allocation, per-market layer/rotate, leg-risk fill management. Exits the read-only phase.
 

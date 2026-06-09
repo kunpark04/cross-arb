@@ -51,7 +51,8 @@ read access, never to trade in this phase.
 - `probe_pmus_ws.py` — confirm the polymarket.us retail WebSocket exists (step-1 probe; live, auth-gated 401) ✅
 - `probe_pmus_ws_auth.py` — authenticated WS handshake + live snapshot; verifies signed-string + subscribe envelope ✅
 - `probe_kalshi_ws.py` — validate the Kalshi `orderbook_delta` WS (RSA-PSS handshake + snapshot VERIFIED with read-only key) ✅
-- `analyze_persistence.py` — **analysis harness**: reconstructs cross-venue edge EPISODES (OPEN->CLOSE per market, restart-aware) from the pulled `../../data/cross-arb/transitions-*.jsonl[.gz]` + `sessions.jsonl`; reports edge magnitude / persistence (fill window) / capturable rate / scalability — the go/no-go metrics. `--selftest` for the offline check ⭐
+- `analyze_persistence.py` — **analysis harness**: reconstructs cross-venue edge EPISODES (OPEN->CLOSE per market, restart-aware) from the pulled `../../data/cross-arb/transitions-*.jsonl[.gz]` + `sessions.jsonl`; reports edge magnitude / persistence (fill window) / capturable rate / scalability. `--selftest` ⭐
+- `capital_sim.py` — **capital / throughput model**: from the same data (incl. the monitor's `depth` field) models hold-to-settlement concurrency (Little's Law) -> required-capital <-> daily-return frontier, W-sensitivity, and the intraday arrival profile; answers "how much initial capital / how to maximize the day". `--selftest` ⭐
 
 ⭐ = the current canonical script for that job.
 
