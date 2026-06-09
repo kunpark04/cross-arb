@@ -130,10 +130,15 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
 - [ ] **(then, per user) Live-bot trade-selection** — wire `ledger.py` to live monitor signals: capital
       allocation, per-market layer/rotate, leg-risk fill management. Exits the read-only phase.
 
-## Open coverage note
-`colisted_map.py`'s audit flags unmapped polymarket.us categories every run. Currently unmapped: `twc`
-(influencer soccer, 1 mkt, no Kalshi co-listing) — intentionally not mapped. If a *real* new co-listed
-city/league appears, add it to `WX`/`LEAGUES` (in `colisted_map.py` **and** `scan_all.py`).
+## Coverage (all US-legal series)
+- [x] **ECON mapped (2026-06-09)** — `colisted_map.ECON` covers CPI/U-3/NFP/GDP/Fed (24 clean same-orientation
+      pairs); settlement identity via `scripts/verify_econ_settlement.py`. Monitor + analyses now cover the full
+      US-legal universe (weather + sports + econ), not a subset.
+- [ ] **Politics** (103 pmus markets, US-legal, long-dated) — not yet mapped; needs a per-race rule audit +
+      accepts months-long capital lockup. Lower priority. `colisted_map` audit flags it.
+- `colisted_map.py`'s audit flags unmapped polymarket.us categories every run: currently `twc` (influencer
+  soccer, 1 mkt, no Kalshi co-listing) + `cod` (esports, evaluate). Add real co-listed ones to `WX`/`LEAGUES`/
+  `ECON` (in `colisted_map.py` **and** `scan_all.py`).
 
 ## Key finding (2026-06-08)
 Edge lives in INEFFICIENT corners, not deep books. Tennis/UFC/ITF (deepest liquidity) = $0 cross-venue

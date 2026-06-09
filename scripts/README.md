@@ -33,6 +33,7 @@ read access, never to trade in this phase.
 - `kalshi_calendar.py` — forward calendar per matched series; soonest settle dates
 - `verify_settlement.py` — **settlement-identity check (weather)**: pulls BOTH venues' live rules per co-listed weather city, diffs source/station/boundary/timing + flags mismatches (resolves the #1 thesis risk) ⭐
 - `verify_sports_settlement.py` — **settlement-identity check (sports, review C5)**: per league, diffs the named result SOURCE + the void/postponement/forfeit handling on both venues (a contested game can settle the two legs opposite). `--league`
+- `verify_econ_settlement.py` — **settlement-identity / co-listing check (econ)**: joins pmus↔Kalshi CPI/U-3/NFP/GDP/Fed on family+period+threshold, flags the ≥-vs-> boundary, the ≤-tail opposite-orientation, and point-buckets. Established the 24 clean econ pairs now in `colisted_map.ECON`. `--family`
 - `cli_revisions.py` — **settlement residual-risk gauge**: from the monitor's `_data/cli.jsonl`, reports the NWS CLI daily-max **revision rate** (and the **downward** rate + drop magnitude — the settlement-relevant direction) per station-day; upper-bounds the "downward 8–10 AM correction splits the venues" loss rate. `--selftest`
 
 **Weather**

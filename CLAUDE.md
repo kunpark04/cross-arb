@@ -27,6 +27,11 @@ See [deploy/README.md](deploy/README.md).
   so the spread is event-driven. **Only crypto is genuinely US-blocked** (absent from polymarket.us). So the
   US-legal overlap is **econ + weather + sports** (+ politics). *(Corrected 2026-06-09 reviewer audit C7 — the
   earlier "CPI/FOMC US-blocked, overlap = weather+sports" was refuted by the project's own live catalog pull.)*
+  Econ is now **MAPPED + tracked** (`bot/colisted_map.py` `ECON`, 2026-06-09): **24 clean co-listed pairs**
+  (U-3 9, GDP 6, Fed 5, NFP 3, CPI 1) on same family/period/threshold + same govt source, settlement identity
+  verified (`scripts/verify_econ_settlement.py`); only SAME-orientation `≥`-threshold + Fed-categorical pairs
+  mapped (pmus `≤`-tails = opposite orientation, and "exactly X%" point-buckets, are skipped+flagged). So the
+  monitor/analyses now cover **the full US-legal universe** (weather + sports + econ), not a subset.
 - **Settlement identity for weather: source + station + bucket boundaries VERIFIED**
   (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped cities grade off the **same** NWS Climatological
   Report (Daily), at the **same station** (incl. NYC = Central Park). Bucket boundaries verified on a low-tail

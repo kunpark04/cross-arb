@@ -54,6 +54,16 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   `adverse_selection.py` (instrumented, accruing). Acted on the findings: `bot/monitor.py` now logs **ms
   timestamps** (un-hides the sub-second fill regime) + per-venue `px` touches (enables adverse-selection) — both
   take effect on the next gated deploy. Rust deferred (Tier 4; compute is irrelevant at this latency scale).
+- **ECON coverage added — "include ALL series" (2026-06-09).** The coverage map mapped only weather + sports;
+  **econ (the cleanest US-legal subset) was silently excluded from every analysis.** Fixed: built
+  `scripts/verify_econ_settlement.py` (establishes settlement identity — same family/period/threshold + same
+  BLS/BEA/Fed source), then added `ECON` to `bot/colisted_map.py` (+ `scan_all.py` mirror) matching pmus
+  CPI/U-3/NFP/GDP/Fed ↔ Kalshi on family+period+threshold. **24 clean co-listed pairs** now tracked (U-3 9,
+  GDP 6, Fed 5, NFP 3, CPI 1); only SAME-orientation `≥`-threshold + Fed-categorical pairs are mapped (pmus
+  `/book` verified YES-oriented), with `≤`-tails (opposite orientation) + "exactly X%" point-buckets skipped+
+  flagged. Wired into the monitor (`MarketTracker`, like weather; fixed the prune-set so econ isn't dropped each
+  heartbeat) + the analysis category functions (econ gets 0 void-haircut — cleanest settlement). Full universe
+  now 60 weather + ~216 sports + 24 econ. 11/11 self-tests green.
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 
