@@ -41,6 +41,11 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   weeks** (else last-traded), so a game replayed in that gap settles real-winner on pmus but void on Kalshi →
   both-legs loss. Esports/WNBA non-completion: pmus last-price vs Kalshi silent. Updated CLAUDE.md +
   settlement-verification.md + research/README; mitigation (don't hold MLB through a postponement) tracked in todo.
+- **Sports-void EV term BUILT** (first pass): grounded the MLB postpone rate in public data (29/31 per ~2430
+  games in 2024/2023 ≈ 1.3%, mlbschedulegrid.com), added `capital_sim.void_haircut()` (`P(postpone)·P(2d-2wk
+  gap)·loss`, MLB ~0.26c / other sports ~0.10c / weather 0, `--void-mult` knob) → modeled sports edge drops ~7%
+  ($825→$767/day). Tagged every sports pair `void_clean=False` in `colisted_map`. Decision 0010 item 3b. The
+  `p_gap`/`loss_frac` are estimates pending makeup-game data; latency + leg-fill EV (0010 items 2/3) still open.
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 

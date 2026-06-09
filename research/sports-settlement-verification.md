@@ -40,13 +40,16 @@ routine, so this is not a rare tail.
 
 1. **Per-league read — DONE for the co-listed set** (MLB, UFC, WNBA, CS2/LoL/Valorant, ATP/WTA/ITF; NBA/NHL not
    co-listed right now — re-run in season). The material finding is the **MLB 2-day-vs-2-week reschedule window**.
-2. **Model the asymmetric-void EV term** in the all-in cost model
-   ([0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md)): `P(postpone)·P(replayed in the 2d–2wk
-   gap)·loss` + a general `P(void)·(Kalshi-fairprice − pmus-lasttraded)` term, alongside leg-fill-failure. For
-   MLB specifically, weight by the empirical rain-postponement rate.
-3. **Gate sports arbs behind a per-league `void_settlement_verified` flag** (default False), and for MLB do not
-   hold a pair through a postponement — **unwind before the 2-day Kalshi window expires**, or avoid weather-risk
-   games. The bot must treat a postponement as a settlement-divergence event, not a delay.
+2. **Asymmetric-void EV term — FIRST PASS BUILT (2026-06-09).** `scripts/capital_sim.py` `void_haircut()` now
+   charges `P(postpone)·P(2d–2wk gap)·loss` per sports contract, grounded in the empirical MLB rain-postponement
+   rate (**29/31 postponements per ~2430 games in 2024/2023**, `mlbschedulegrid.com/rainouts` ≈ **1.3%**), with
+   `p_gap≈0.4` and `loss_frac≈0.5` as tunable estimates → MLB ~**0.26c/contract**, other sports ~0.10c, weather 0
+   (`--void-mult` knob). It cuts the modeled sports edge ~7% ($825→$767/day on the live archive). Decision
+   [0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md) item 3b. **Still to refine:** `p_gap`/
+   `loss_frac` with real makeup-game scheduling data; a general `P(void)·(Kalshi-fairprice − pmus-lasttraded)` term.
+3. **Per-league gate — `void_clean=False` now tagged** on every sports pair in `bot/colisted_map.py` (no league
+   is void-clean; clean only for completed games). The eventual trade layer must read it and, for MLB, **unwind
+   before the 2-day Kalshi window** — treat a postponement as a settlement-divergence event, not a delay.
 
 ## Sources
 

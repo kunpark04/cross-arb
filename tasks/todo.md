@@ -43,11 +43,16 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       reschedule window is **2 days** vs pmus **2 weeks**, so a game replayed in that gap settles real-winner on
       pmus but fair-price-void on Kalshi → both-legs loss on the proof case. Esports/WNBA: pmus last-price vs
       Kalshi silent. In [research/sports-settlement-verification.md](../research/sports-settlement-verification.md).
-- [ ] **Still open (owner / next session):** (a) **bot rule** — never hold an MLB pair through a postponement
-      (unwind before the 2-day Kalshi window) + a per-league `void_settlement_verified` gate; (b) model the
-      void EV term (`P(postpone)·P(replay in 2d–2wk gap)·loss` + `P(void)·(Kalshi-fairprice − pmus-lasttraded)`)
-      and latency/leg-fill EV in the cost model (0010); (c) re-run NBA/NHL in season; (d) the downward-CLI-
-      correction *rate* as `cli.jsonl` accrues over weeks.
+- [x] **Sports-void EV term BUILT + gate added (2026-06-09):** `capital_sim.void_haircut()` charges the MLB
+      postpone divergence (`P(postpone)1.3% · P(2d–2wk gap)0.4 · loss0.5` ≈ 0.26c/contract MLB, 0.10c other
+      sports; `--void-mult` knob) — sports profit drops ~7% ($825→$767/day). `colisted_map` tags every sports
+      pair `void_clean=False`. Decision [0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md) item 3b.
+      Postpone rate grounded in mlbschedulegrid.com (29/31 per ~2430 games, 2024/2023).
+- [ ] **Still open (needs the trade layer or in-season data):** (a) the **bot unwind rule** — close an MLB pair
+      before Kalshi's 2-day window (don't hold through a postponement); reads `void_clean`; (b) `p_gap`/`loss_frac`
+      are estimates — refine with real makeup-game scheduling data; **latency + leg-fill EV** (0010 items 2/3)
+      still unmodeled; (c) re-run NBA/NHL settlement read in season; (d) downward-CLI-correction *rate* as
+      `cli.jsonl` accrues over weeks.
 
 ## Done (discovery → matcher → scanner → monitor)
 - [x] **1–5. Sports matcher** — Kalshi game structure discovered; robust `(league, date, abbrev)` join

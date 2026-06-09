@@ -15,9 +15,12 @@ Model + assumptions (all knobs):
   • size/arb   = min(open depth c2 [contracts net-ish], --max-clip).  c2 = fillable while GROSS marginal
                  edge >= 2c (~net-positive after fees) — a conservative net-deployable proxy.
   • capital/arb= size x (1 - open_net) ~ ~$0.97/pair (you pay ~(1-edge) per $1 payout).
-  • profit/arb = size x max(0, BOOK-AVG edge - --haircut), where book-avg ~ (open_net + 2c-boundary)/2 (the
+  • profit/arb = size x max(0, BOOK-AVG edge - --haircut - VOID), where book-avg ~ (open_net + 2c-boundary)/2 (the
                  edge DECAYS down the depth; touch edge is captured only on the touch pair). Counted ONCE per
                  market (re-detections of the same market = one held position, not N concurrent ones - review C8).
+  • VOID/arb   = sports settlement-void expected cost (review C5; 0 for weather). The venues' postpone/void rules
+                 diverge — MLB Kalshi waits <=2d vs pmus <=2wk -> a replay in that gap breaks the lock into a naked
+                 leg. ~P(postpone)*P(2d-2wk gap)*loss (MLB ~0.26c, other sports ~0.10c; --void-mult 0 to disable).
   • hold       = open_t -> settlement proxy (event-date in the slug + --settle-offset-h). Uncertain, so a
                  W-SENSITIVITY sweep shows how capital scales with the assumed hold.
   • BASE CASE models ONE clip per capturable open; intra-episode LAYERING (add on WIDEN) is reported as
@@ -73,6 +76,30 @@ def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None):
 DEPTH_BOUNDARY_NET = 0.005   # net edge of the DEEPEST fillable pair (~2c gross threshold minus ~1.5c fees); the
                              # book-average realized edge across c2 contracts is ~(open_net + this)/2, not open_net.
 
+# --- SPORTS settlement-void haircut (review C5 / research/sports-settlement-verification.md). A held cross-venue
+#     sports pair is a clean lock ONLY if the game completes on schedule. The venues' void/postpone rules DIVERGE,
+#     materially for MLB: Kalshi waits for a replay only if rescheduled <=2 days (else voids to a fair price), pmus
+#     waits <=2 weeks (else last-traded) -> a game replayed in that 2d-2wk gap settles real-winner on pmus but a
+#     void on Kalshi -> the lock breaks into a NAKED directional leg (ledger.py S5). We charge the expected cost.
+MLB_POSTPONE_RATE = 0.013    # ~29 (2024) / 31 (2023) postponements per ~2430 games (mlbschedulegrid.com/rainouts)
+P_GAP             = 0.4      # fraction of postponements rescheduled into the 2d-2wk asymmetric window (vs next-day
+                             # doubleheaders <=2d which stay ALIGNED, or >2wk where both void). ESTIMATE - tune w/ data.
+VOID_LOSS_FRAC    = 0.5      # when the lock breaks the hedge is gone (coin-flip on full notional); conservative
+                             # expected-shortfall charge ~half notional. ESTIMATE.
+SPORTS_VOID_RATE  = 0.005    # generic non-MLB sports void/walkover/no-contest divergence rate (esports abandonment,
+                             # pre-match walkover). ESTIMATE - per-league rates are a TODO (0010).
+
+def void_haircut(market, mult=1.0):
+    """Expected per-contract settlement-void cost for a market (0 for weather; weather's void risk is the
+    CLI-revision path, handled separately). Sports: P(postpone & replayed-in-gap) * loss_fraction, MLB-weighted."""
+    m = str(market)
+    if not m.startswith("aec-"):                  # weather (tc-) / unknown -> no sports-void term
+        return 0.0
+    parts = m.split("-")
+    league = parts[1] if len(parts) > 1 else ""
+    rate = MLB_POSTPONE_RATE if league == "mlb" else SPORTS_VOID_RATE
+    return mult * rate * P_GAP * VOID_LOSS_FRAC
+
 def one_per_market(cap):
     """Collapse re-detections of the SAME market into ONE held position. A market that OPENs->CLOSEs->re-OPENs
     is NOT N concurrent arbs -- under the hold-to-settlement base case you ENTER at the first open and hold, so
@@ -85,22 +112,24 @@ def one_per_market(cap):
         if m not in rep or e["open_t"] < rep[m]["open_t"]: rep[m] = e
     return list(rep.values())
 
-def simulate(cap, max_clip, haircut, offset_h, fixed_w=None):
+def simulate(cap, max_clip, haircut, offset_h, fixed_w=None, void_mult=1.0):
     """-> (intervals, peak_capital, avg_capital, daily_profit_sum). One interval PER MARKET (not per episode),
-    and profit is the BOOK-AVERAGE edge across the filled depth (trapezoid touch..2c-boundary), not touch x depth."""
+    profit is the BOOK-AVERAGE edge across the filled depth (trapezoid touch..2c-boundary) minus the expected
+    settlement-void cost (sports only; C5). void_mult=0 disables the void term."""
     intervals, profit = [], 0.0
     for e in one_per_market(cap):                       # C8: de-double-count same-market re-detections
         size = min(e["open_c2"], max_clip)
         capital = size * max(0.1, 1.0 - e["open_net"])
         avg_edge = max(DEPTH_BOUNDARY_NET, (e["open_net"] + DEPTH_BOUNDARY_NET) / 2.0)  # walk-the-book decay
-        profit += size * max(0.0, avg_edge - haircut)   # touch edge only on the touch pair; less as the book fills
+        vh = void_haircut(e["market"], void_mult)       # sports settlement-void expected cost (0 for weather)
+        profit += size * max(0.0, avg_edge - haircut - vh)
         end = (e["open_t"] + fixed_w) if fixed_w else settle_t(e["market"], e["open_t"], offset_h)
         intervals.append((e["open_t"], end, capital))
     peak, avg = peak_and_avg(intervals)
     return intervals, peak, avg, profit
 
 
-def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floor, max_age):
+def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floor, max_age, void_mult=1.0):
     out = []; P = out.append
     cap = capturable(episodes, edge_min, window_min, liq_floor=liq_floor, max_age=max_age)   # baseline = every +arb
     robust = capturable(episodes, max(edge_min, 0.01), max(window_min, 30),                  # illustrative robust subset
@@ -128,7 +157,16 @@ def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floo
     lay = [e["peak_c2"] / e["open_c2"] for e in cap if e["open_c2"] > 0]
     if lay: P(f"  layering headroom: median peak/open depth = {_pct(lay,50):.1f}x  (depth that appears AFTER open -> add-on room)")
 
-    _, peak, avg, profit = simulate(cap, max_clip, haircut, offset_h)
+    n_sports = sum(1 for e in one_per_market(cap) if str(e["market"]).startswith("aec-"))
+    n_mlb = sum(1 for e in one_per_market(cap) if str(e["market"]).split("-")[1:2] == ["mlb"])
+    if n_sports and void_mult:
+        P("")
+        P(f"SPORTS SETTLEMENT-VOID HAIRCUT  (C5; sports positions only — {n_sports} markets, {n_mlb} MLB)")
+        P(f"  MLB void cost ~{void_haircut('aec-mlb-x', void_mult)*100:.2f}c/contract "
+          f"(P(postpone){MLB_POSTPONE_RATE*100:.1f}% x P(2d-2wk gap){P_GAP:.1f} x loss{VOID_LOSS_FRAC:.1f}); "
+          f"other sports ~{void_haircut('aec-atp-x', void_mult)*100:.2f}c. Subtracted from sports edge below "
+          f"(--void-mult 0 to disable). A postponed MLB pair must be UNWOUND before Kalshi's 2-day window.")
+    _, peak, avg, profit = simulate(cap, max_clip, haircut, offset_h, void_mult=void_mult)
     P("")
     P(f"CAPITAL (event-date settlement proxy, +{offset_h:.0f}h; one clip/arb, haircut {haircut*100:.1f}c)")
     P(f"  PEAK concurrent capital : ${peak:,.0f}    <- the initial bankroll to never miss a fill")
@@ -139,7 +177,7 @@ def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floo
     P("FRONTIER  capital vs return as you raise the per-arb clip (saturates at book depth)")
     P("   max-clip   peak $cap   $profit/day   %/day")
     for clip in (50, 200, 1000, 5000, 10**9):
-        _, pk, _, pf = simulate(cap, clip, haircut, offset_h)
+        _, pk, _, pf = simulate(cap, clip, haircut, offset_h, void_mult=void_mult)
         tag = "  (uncapped)" if clip == 10**9 else ""
         P(f"   {('inf' if clip==10**9 else clip):>8}   {pk:>9,.0f}   {per_day(pf):>11,.0f}   {(per_day(pf)/pk*100 if pk else 0):>5.1f}{tag}")
 
@@ -147,7 +185,7 @@ def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floo
     P(f"W-SENSITIVITY  peak capital vs assumed hold time (clip {max_clip}; settlement time is uncertain)")
     P("    hold      peak $cap")
     for w_h in (2, 4, 8, 12, 24):
-        _, pk, _, _ = simulate(cap, max_clip, haircut, offset_h, fixed_w=w_h * 3600)
+        _, pk, _, _ = simulate(cap, max_clip, haircut, offset_h, fixed_w=w_h * 3600, void_mult=void_mult)
         P(f"   {w_h:>3}h     {pk:>9,.0f}")
 
     P("")
@@ -182,15 +220,21 @@ def _selftest():
     ep = [{"market": "aec-mlb-x-y-2026-06-10", "cat": "sports", "open_t": 0, "duration": 100,
            "open_net": 0.02, "open_c2": 800, "peak_c2": 1200}]
     cap = capturable(ep, 0.01, 30); assert len(cap) == 1
-    ints, peak, _, profit = simulate(cap, 500, 0.0, 28)               # size capped 500
+    ints, peak, _, profit = simulate(cap, 500, 0.0, 28, void_mult=0)  # size capped 500; void term isolated off
     avg_edge = (0.02 + DEPTH_BOUNDARY_NET) / 2.0                      # book-average (trapezoid), NOT touch x depth
     assert abs(profit - 500 * avg_edge) < 1e-9                        # $6.25 (not the old $10 touch x depth)
     assert profit < 500 * 0.02, "walk-the-book decay must reduce profit below touch x depth"
     assert abs(peak - 500 * (1 - 0.02)) < 1e-6                        # $490 locked
+    # C5: sports settlement-void haircut — MLB > other sports > 0 ; weather = 0 ; it reduces sports profit
+    assert void_haircut("tc-temp-laxhigh-2026-06-09-gte73") == 0.0    # weather: no sports-void term
+    assert void_haircut("aec-mlb-x-y-2026-06-10") > void_haircut("aec-atp-x-y-2026-06-10") > 0.0
+    _, _, _, pf_void = simulate(cap, 500, 0.0, 28)                    # MLB market WITH void term (default mult=1)
+    assert abs(pf_void - 500 * (avg_edge - void_haircut("aec-mlb-x-y-2026-06-10"))) < 1e-9
+    assert pf_void < profit, "void haircut must reduce the MLB sports profit"
     # C8: 3 re-detections of the SAME market (overlapping, same settle) collapse to ONE position, not 3
     re3 = [{**ep[0], "open_t": t, "open_net": n} for t, n in [(0, 0.02), (50, 0.05), (90, 0.03)]]
     cap3 = capturable(re3, 0.01, 30); assert len(cap3) == 3
-    i3, pk3, _, pf3 = simulate(cap3, 500, 0.0, 28)
+    i3, pk3, _, pf3 = simulate(cap3, 500, 0.0, 28, void_mult=0)
     assert len(i3) == 1, "same-market re-detections must collapse to ONE interval (no 3x concurrent capital)"
     assert abs(pk3 - 500 * (1 - 0.02)) < 1e-6, "peak capital is ONE position (first-entry rep), not 3 summed"
     assert abs(pf3 - 500 * (0.02 + DEPTH_BOUNDARY_NET) / 2.0) < 1e-9  # FIRST entry (0.02) counted ONCE, book-averaged
@@ -216,6 +260,7 @@ if __name__ == "__main__":
     ap.add_argument("--settle-offset-h", type=float, default=28.0, help="settlement = event-date 00:00 UTC + this")
     ap.add_argument("--liq-floor", type=int, default=1, help="min open depth c2 (default 1 = no liquidity filter)")
     ap.add_argument("--max-age", type=float, default=0.0, help="max book staleness s at open (default 0 = no age filter)")
+    ap.add_argument("--void-mult", type=float, default=1.0, help="scale the sports settlement-void haircut (C5; 0 = disable)")
     a = ap.parse_args()
     if a.selftest:
         _selftest(); sys.exit(0)
@@ -226,4 +271,4 @@ if __name__ == "__main__":
     recs, sessions = load(data_dir)
     print(f"loaded {len(recs)} transitions + {len(sessions)} restarts from {data_dir}\n")
     print(report(build_episodes(recs, sessions), a.edge_min, a.window_min, a.max_clip, a.haircut,
-                 a.settle_offset_h, a.liq_floor, a.max_age))
+                 a.settle_offset_h, a.liq_floor, a.max_age, void_mult=a.void_mult))

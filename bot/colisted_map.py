@@ -189,8 +189,11 @@ def build_colisted_map():
             found = pick_game(kbydate, kA, kB, join, date, slug_dated=sm is not None)
             if not found: continue
             pl, mA, mB = found
+            # void_clean=False for ALL leagues: settlement is identical only for a game that COMPLETES on schedule;
+            # the postpone/void tail DIVERGES (MLB 2d-vs-2wk reschedule window etc) -> the bot must not hold a pair
+            # through a postponement / size into an un-vetted void path. See research/sports-settlement-verification.md.
             sports.append({"cat": "sports", "league": L, "date": date, "slug": str(x.get("slug")),
-                           "kalshi_a": pl[mA], "kalshi_b": pl[mB],
+                           "kalshi_a": pl[mA], "kalshi_b": pl[mB], "void_clean": False,
                            "teamA": (lo.get("team") or {}).get("name"), "teamB": (ot.get("team") or {}).get("name")})
 
     report = {
