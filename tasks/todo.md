@@ -58,9 +58,10 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       a measured **latency** haircut (order-ack study), and a **leg-fill-failure** EV term
       (`P(both)·quoted − P(one)·naked-loss`). [`make_px`/`signal`/`game_edge` per-direction pricing for
       one-sided books — **done 2026-06-09**.]
-- [ ] **Open items from the review** — settlement **timing/revision** (pmus rulebook) + middle-bucket
-      boundaries; **cost-of-carry** in `capital_sim`; live **mid-divergence** guard (L1 in the monitor);
-      WS snapshot-vs-delta confirmation.
+- [ ] **Open items from the review** — settlement timing **researched** (both ~8 AM ET / same morning CLI;
+      residual = downward-correction asymmetry → owner: confirm pmus post-8 AM policy + log prelim-vs-corrected
+      CLI to measure the rate) + middle-bucket boundaries; **cost-of-carry** in `capital_sim`; live
+      **mid-divergence** guard (L1 in the monitor); WS snapshot-vs-delta confirmation.
 - [ ] **Size the bankroll + intraday strategy** — as data accumulates, re-run the harness + simulator to
       set the initial capital (peak concurrent), per-arb clip (depth-capped), and intraday allocation
       (verify/refute the evening-cluster hypothesis). Per the owner this is sizing/tuning, **not** a hard

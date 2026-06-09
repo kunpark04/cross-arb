@@ -26,8 +26,10 @@ See [deploy/README.md](deploy/README.md).
 - **Settlement identity for weather is VERIFIED** (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped
   cities grade off the **same** NWS Climatological Report (Daily), at the **same station** (incl. NYC =
   Central Park), with **matching** sampled bucket boundaries — refuting the old NWS-vs-Wunderground
-  source-divergence fear (`miami-temp-arb.html`). **Open:** settlement *timing/revision* (in the pmus
-  rulebook, not the API). See [research/settlement-verification.md](research/settlement-verification.md).
+  source-divergence fear (`miami-temp-arb.html`). Settlement *timing* now researched (2026-06-09): both
+  settle ~8 AM ET off the **same morning CLI**; one narrow residual risk — a *downward* morning CLI
+  correction (Kalshi delays to 11 AM & can take the lower value; pmus locks at 8 AM per its FAQ), so a
+  boundary day could split. See [research/settlement-verification.md](research/settlement-verification.md).
 - Edge appears in **inefficient corners, not deep books** — deep liquid books (tennis/UFC/ITF) are ~$0
   cross-venue; live edges show in **MLB** (new-venue line lag) + **weather** (intermittent). **Magnitudes
   are PRELIMINARY:** an independent review (2026-06-09,
