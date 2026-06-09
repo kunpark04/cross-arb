@@ -32,7 +32,7 @@ Disk is a non-issue: at **119 bytes/transition**, even 100k transitions/day is ~
 runway on 25 GB. Bandwidth (small order-book delta frames) is far under DO's included monthly transfer.
 
 **Bottom line:** verified tiny **and flat over time** — the binding constraint is "stays up 24/7," not
-capacity. **$6 / 1 GB / NYC3 / Ubuntu 24.04 LTS** is the right pick; 2 GB only buys on-box analysis room.
+capacity. **$6 / 1 GB / NYC1 / Ubuntu 24.04 LTS** is the right pick; 2 GB only buys on-box analysis room.
 
 ## What's here
 
@@ -62,8 +62,11 @@ whole repo; (3) `scp` the two secrets **out-of-band**; (4) `provision.sh`; (5) `
 A dedicated unprivileged **`cross-arb`** system user (no login shell) owns **only** `/opt/cross-arb`, mode
 **`0700`** (readable by that user + root only). The unit runs as `cross-arb` with `ProtectSystem=strict`
 (whole FS read-only **except** `scripts/_data/` via `ReadWritePaths`), `ProtectHome`, `NoNewPrivileges`,
-`PrivateTmp`. The process can do exactly one thing: append to its JSONL logs — it cannot place an order,
-modify its own code, or read other users' data even if compromised.
+`PrivateTmp`, plus syscall/namespace/address-family restrictions. This filesystem + syscall hardening means a
+compromised process **cannot modify its own code or read other users' data** — but it is FS-scoped, **not** an
+egress restriction: the box itself retains outbound network. Order-placement is impossible **only** because the
+loaded Kalshi key is **read-only on Kalshi's side** (a venue-side ACL, [decision 0007](../decisions/0007-readonly-kalshi-key-least-privilege.md)),
+not because of droplet confinement. So **never stage a trade-capable key here.**
 
 > systemd has **no inline comments** — `Directive=value   # note` silently breaks the value. Keep comments
 > on their own line. (This bit us: `ProtectSystem=strict  # …` parsed as a bad value and was ignored until

@@ -114,6 +114,9 @@ def kalshi_ws_headers(path=KALSHI_WS_PATH):
             k, v = s.split("=", 1); env[k.strip()] = v.strip()
     pem = env["KALSHI_PRIVATE_KEY_PATH"]
     pem = pem if os.path.isabs(pem) else os.path.join(os.path.dirname(__file__), "..", "scripts", pem)
+    if os.path.basename(pem) != "kalshi_readonly.pem":
+        print(f"WARNING: read-only-phase invariant (decision 0007) expects 'kalshi_readonly.pem' but loaded "
+              f"'{os.path.basename(pem)}' — this key may be trade-capable.", file=sys.stderr)
     priv = serialization.load_pem_private_key(open(pem, "rb").read(), password=None)
     ts = str(int(time.time() * 1000))
     sig = base64.b64encode(priv.sign(f"{ts}GET{path}".encode(),

@@ -113,14 +113,29 @@ foreach ($raw in (Get-ChildItem -LiteralPath $LocalDir -Filter 'transitions-*.js
 #    the local .gz is verified to DECOMPRESS to the remote sha256. Live files (today/sessions/health) stay.
 $moved = 0
 if (-not $KeepRemote) {
-    $del = @()
+    $cand = @()
     foreach ($name in $remote.Keys) {
         if ($name -notmatch '^transitions-(\d{4}-\d{2}-\d{2})\.jsonl$') { continue }    # dated transitions only
         if ($Matches[1] -ge $TodayUtc) { continue }                                     # finalized (past) only
         $gz = Join-Path $LocalDir "$name.gz"
         if (-not (Test-Path -LiteralPath $gz)) { continue }                             # need the local archive
         if ((Get-GzHash $gz) -ne $remote[$name]) { Write-Warning "local .gz != remote for $name — NOT deleting remote"; continue }
-        $del += $name
+        $cand += $name
+    }
+    # RE-HASH the LIVE remote NOW, just before deleting, to close the list->delete TOCTOU: only delete a file
+    # whose CURRENT remote hash still equals the step-1 listing hash. A past-event-date market still appending
+    # across UTC-midnight will have grown -> hash differs -> we skip it (re-pulled next run) instead of truncating.
+    $del = @()
+    if ($cand.Count -gt 0) {
+        $fresh = @{}
+        $reCmd = "cd '$RemoteDir' && sha256sum " + (($cand | ForEach-Object { "'$_'" }) -join ' ') + " 2>/dev/null"
+        foreach ($ln in (Invoke-Ssh $reCmd -split "`n")) {
+            if ($ln.Trim() -match '^([0-9a-f]{64})\s+(.+)$') { $fresh[$Matches[2]] = $Matches[1] }
+        }
+        foreach ($name in $cand) {
+            if ($fresh.ContainsKey($name) -and $fresh[$name] -eq $remote[$name]) { $del += $name }
+            else { Write-Warning "remote $name changed since listing (still appending?) — NOT deleting" }
+        }
     }
     if ($del.Count -gt 0) {
         $rmArgs = ($del | ForEach-Object { "'$RemoteDir/$_'" }) -join ' '
