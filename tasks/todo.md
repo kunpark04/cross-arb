@@ -39,9 +39,15 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       - [x] **Sports settlement verifier RUN** → finding: clean for completed games, **void/abandonment tail
             diverges** (esports → pmus "last fair price" vs Kalshi silent; tennis >2wk reschedule → $0.50).
             New brief [research/sports-settlement-verification.md](../research/sports-settlement-verification.md).
-- [ ] **Still open (owner / next session):** per-league sports void read (esp. **MLB suspended-game** —
-      `verify_sports_settlement.py --league mlb`); model the asymmetric-void EV term + latency/leg-fill EV in the
-      cost model (still 0010); resolve the downward-CLI-correction *rate* as `cli.jsonl` accrues over weeks.
+- [x] **Per-league sports void read DONE (2026-06-09, 10 leagues)** — material finding: **MLB** Kalshi
+      reschedule window is **2 days** vs pmus **2 weeks**, so a game replayed in that gap settles real-winner on
+      pmus but fair-price-void on Kalshi → both-legs loss on the proof case. Esports/WNBA: pmus last-price vs
+      Kalshi silent. In [research/sports-settlement-verification.md](../research/sports-settlement-verification.md).
+- [ ] **Still open (owner / next session):** (a) **bot rule** — never hold an MLB pair through a postponement
+      (unwind before the 2-day Kalshi window) + a per-league `void_settlement_verified` gate; (b) model the
+      void EV term (`P(postpone)·P(replay in 2d–2wk gap)·loss` + `P(void)·(Kalshi-fairprice − pmus-lasttraded)`)
+      and latency/leg-fill EV in the cost model (0010); (c) re-run NBA/NHL in season; (d) the downward-CLI-
+      correction *rate* as `cli.jsonl` accrues over weeks.
 
 ## Done (discovery → matcher → scanner → monitor)
 - [x] **1–5. Sports matcher** — Kalshi game structure discovered; robust `(league, date, abbrev)` join

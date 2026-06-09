@@ -34,10 +34,13 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
 - **Settlement residuals closed (same session, read-only):** (a) **weather-FAQ timing contradiction RESOLVED**
   by re-reading the live FAQ — pmus *does* specify 8 AM / 11 AM-if-CLI≠METAR (the catalog brief was right);
   asymmetry narrows, not eliminated. (b) **Middle 2° bucket boundary VERIFIED** (SFO 66-67° ↔ pmus gte66lt67f,
-  both `[66,67]`, same source/station). (c) **Sports settlement verifier RUN** → new finding + brief
-  [research/sports-settlement-verification.md](../research/sports-settlement-verification.md): clean for
-  completed games, but the **void/abandonment/reschedule tail diverges** (esports → pmus "last fair price" vs
-  Kalshi silent). Updated CLAUDE.md + settlement-verification.md + research/README accordingly.
+  both `[66,67]`, same source/station). (c) **Sports settlement verifier RUN, then per-league read (10 leagues)** → new brief
+  [research/sports-settlement-verification.md](../research/sports-settlement-verification.md): clean for games
+  that complete on schedule, but the postpone/void tail diverges — **materially for MLB** (the proof case):
+  Kalshi waits for a replay only if rescheduled **≤2 days** (else voids to "a fair price"), pmus waits **≤2
+  weeks** (else last-traded), so a game replayed in that gap settles real-winner on pmus but void on Kalshi →
+  both-legs loss. Esports/WNBA non-completion: pmus last-price vs Kalshi silent. Updated CLAUDE.md +
+  settlement-verification.md + research/README; mitigation (don't hold MLB through a postponement) tracked in todo.
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 

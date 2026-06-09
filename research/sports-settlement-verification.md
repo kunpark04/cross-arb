@@ -8,42 +8,51 @@ number), sports settles off an official-result **call**, and that call can diver
 brief records the first live diff. Probe: `scripts/verify_sports_settlement.py` (read-only; both venues' live
 rules, per league).
 
-## Result (2026-06-09 live run; ATP, ITF-M, ITF-W, CS2, LoL sampled)
+## Result (2026-06-09 live run; MLB, UFC, WNBA, CS2, LoL, Valorant, ATP, WTA, ITF-M/W — 10 leagues)
 
-**Normal completed games agree on the winner** (same factual outcome, deterministic). The divergence is in the
-**tail** — postponed / abandoned / retired / forfeited / rescheduled games — where the two rulebooks differ:
+**Normal completed games agree on the winner** (same factual outcome, deterministic). The divergence is entirely
+in the **tail** — postponed / rescheduled / cancelled / abandoned / retired / forfeited / no-contest games —
+where the two rulebooks differ, sometimes materially:
 
 | Edge case | Kalshi | polymarket.us | Verdict |
 |---|---|---|---|
-| **Tennis (ATP/ITF) — match not played / walkover** | resolves only *"after a ball has been played"*; pre-match walkover/injury/forfeiture/cancellation handled by `rules_secondary` | tie/draw → **$0.50**; postponed/delayed/rescheduled → settle date amended to the reschedule; **if rescheduled >2 weeks → $0.50** | ⚠️ **different mechanics**; the *">2-week reschedule → $0.50"* rule is pmus-only |
-| **Esports (CS2/LoL) — no-result / abandonment / forfeit** | rules **SILENT** (no void/abandonment language found) | *"no result (NR), abandonment, or cancellation … resolve to the **last fair market price**"* | ⚠️ **clear divergence**: pmus pins last-traded price; Kalshi has no stated void rule |
-| **Tie / draw** | resolves Yes/No on the winner | settles **$0.50** per instrument | ⚠️ different (rare in these sports, but defined differently) |
-| **Source of truth** | league official (e.g. *ATP*) + AP/Sportradar chain | *"official … result"* / its DCM rulebook | ✅ usually the same factual winner, but **not the same named provider** |
+| **MLB — postponed & replayed (rain, doubleheader)** | settles on the replay **only if rescheduled ≤ 2 DAYS**; cancelled or **> 2 days → resolves to "a fair price"** (voids; does NOT settle on the actual game) | waits & settles on the replay **if ≤ 2 WEEKS**; else **last-traded prices** | 🔴 **MATERIAL window mismatch (2 days vs 2 weeks).** A game replayed 3–14 days later → **pmus pays the real winner while Kalshi voids to fair price** → the YES/NO legs no longer offset → both-legs risk on the depth-and-edge proof case |
+| **Void PRICE basis (when BOTH void)** | *"a fair price in accordance with the rules"* | *"last-traded prices"* (esports/WNBA: *"last fair market price"*) | ⚠️ even a *symmetric* void doesn't offset to $1 — Kalshi's rule-derived fair value ≠ pmus's last-traded |
+| **Esports (CS2/LoL/Valorant) & WNBA — abandonment / not officially completed** | **SILENT** (esports) / silent (WNBA) | → **last fair market price** | 🔴 pmus pins a price; Kalshi has no stated rule → asymmetric |
+| **UFC — no-contest** | explicit *"tie or no contest"* handling in `rules_secondary` | *"no-contest … settle at last-traded prices"* (only tie/draw → $0.50 is explicit) | ⚠️ different resolutions for a no-contest |
+| **Tennis/ITF — walkover / retirement / forfeit** | resolves only *"after a ball has been played"* | retire after start → official result; walkover/forfeit/withdrawal **before** start → **last-traded prices** | ⚠️ different mechanics around the "ball played" line |
+| **Tie / draw** | resolves Yes/No on the winner | **$0.50** per instrument | ⚠️ different (rare in these sports) |
+| **Source of truth** | league official (ATP/UFC/…) + AP/Sportradar | *"official … result"* / DCM rulebook | ✅ same factual winner, ≠ same named provider |
 
 ## Conclusion
 
-For a **game that completes normally**, both venues grade off the same factual winner → the cross-venue pair is
-settlement-clean. But the **void/abandonment/reschedule tail is NOT identical**: a contested game can settle the
-two legs to **different values** (e.g. an abandoned esports match → pmus "last fair price" vs Kalshi's
-unstated/void handling; a tennis match rescheduled >2 weeks → pmus $0.50 vs Kalshi's "ball played" condition),
-which on a held YES+NO pair is a **both-legs loss**. This is exactly the invariant-#1 risk for the deep MLB/
-esports positions the scalability thesis rides on — and it is **unmitigated in code** beyond the live
-`game_edge` >40c orientation/price-sanity guard (which only catches gross mispricings, not a clean void).
+For a **game that completes on schedule**, both venues grade off the same factual winner → the cross-venue pair
+is settlement-clean. But the **postpone/void/reschedule tail is NOT identical**, and for **MLB — the depth-and-
+edge proof case — the divergence is material**: Kalshi's reschedule window is **2 days**, pmus's is **2 weeks**,
+so a rain-postponed game replayed within that 12-day gap settles to the **real winner on pmus but to a fair-price
+void on Kalshi**. On a held YES+NO lock that is a **both-legs loss event**, not a wash. Even a *symmetric* void
+doesn't fully offset, because Kalshi's *"fair price per the rules"* and pmus's *"last-traded price"* are computed
+differently. This is the invariant-#1 risk, **unmitigated in code** beyond the live `game_edge` price-sanity
+guard (which catches gross mispricings, not a clean void). MLB rain-postponements rescheduled 3+ days out are
+routine, so this is not a rare tail.
 
 ## Still to close before deploying sports capital
 
-1. **Per-league void/postponement read.** MLB (suspended/called/rain — "official game" rules), NBA/NHL/WNBA, and
-   UFC (no-contest / weigh-in failure) were not in this sample — run `verify_sports_settlement.py --league mlb`
-   (etc.) and read each rulebook. MLB is highest-priority (it's the depth-and-edge proof case).
+1. **Per-league read — DONE for the co-listed set** (MLB, UFC, WNBA, CS2/LoL/Valorant, ATP/WTA/ITF; NBA/NHL not
+   co-listed right now — re-run in season). The material finding is the **MLB 2-day-vs-2-week reschedule window**.
 2. **Model the asymmetric-void EV term** in the all-in cost model
-   ([0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md)): `P(void)·P(asymmetric resolution)·
-   naked-leg-loss`, alongside the leg-fill-failure term. Until then, treat sports settlement as **clean only for
-   games expected to complete**, and size the void tail as a real cost.
-3. **Gate sports arbs behind a per-league `void_settlement_verified` flag** (default False) so the eventual bot
-   cannot size into an un-vetted void path.
+   ([0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md)): `P(postpone)·P(replayed in the 2d–2wk
+   gap)·loss` + a general `P(void)·(Kalshi-fairprice − pmus-lasttraded)` term, alongside leg-fill-failure. For
+   MLB specifically, weight by the empirical rain-postponement rate.
+3. **Gate sports arbs behind a per-league `void_settlement_verified` flag** (default False), and for MLB do not
+   hold a pair through a postponement — **unwind before the 2-day Kalshi window expires**, or avoid weather-risk
+   games. The bot must treat a postponement as a settlement-divergence event, not a delay.
 
 ## Sources
 
 Live rules pulls 2026-06-09 via `scripts/verify_sports_settlement.py` (Kalshi `rules_primary`/`rules_secondary`
-per single-team market; pmus market `description`/rule fields). Sample: ATP S-Hertogenbosch, M25 Värnamo,
-W35 Cuiabá, IEM Cologne (CS2), EWC SA/LATAM Qualifier (LoL).
+per single-team market; pmus market `description`/rule fields), 10 co-listed leagues: **MLB** (AZ vs MIA),
+**UFC** (Gaethje vs Topuria), **WNBA** (DAL vs MIN), CS2 (Falcons vs G2), LoL (paiN vs LOS), Valorant
+(Global vs XLG), ATP (Hurkacz vs Fucsovics), WTA (Navarro vs McNally), ITF-M (Mridha vs Ferri), ITF-W
+(Price vs Candiotto). Full MLB rules text pulled directly to confirm the 2-day vs 2-week reschedule windows.
+NBA/NHL were not co-listed at run time (re-run in season).

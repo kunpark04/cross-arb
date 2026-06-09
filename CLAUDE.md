@@ -38,12 +38,15 @@ See [deploy/README.md](deploy/README.md).
   (not a downward CLI correction). So the one residual is a *downward* 8–11 AM CLI correction on a boundary day
   (asymmetry **narrowed**, not eliminated); its **rate** is logged live (`monitor.py` `cli_stream` → `cli.jsonl`
   → `scripts/cli_revisions.py`). See [research/settlement-verification.md](research/settlement-verification.md).
-- **Settlement identity for SPORTS: clean only for games that COMPLETE normally** (new 2026-06-09,
-  `scripts/verify_sports_settlement.py`): both venues agree on a normal winner, but the **void/abandonment/
-  reschedule tail diverges** (esports abandonment → pmus *"last fair market price"* vs Kalshi silent; tennis
-  reschedule >2 wks → pmus $0.50) → a contested game can lose **both legs**. Unmitigated beyond the live
-  `game_edge` price-sanity guard; per-league void rules (esp. MLB suspended-game) still to read.
-  See [research/sports-settlement-verification.md](research/sports-settlement-verification.md).
+- **Settlement identity for SPORTS: clean only for games that COMPLETE on schedule** (new 2026-06-09,
+  `scripts/verify_sports_settlement.py`, 10 leagues read): normal completed games agree, but the **postpone/
+  void tail diverges — materially for MLB, the depth-and-edge proof case.** Kalshi waits for a replay only if
+  rescheduled **≤2 days** (else voids to *"a fair price"*); pmus waits **≤2 weeks** (else *last-traded*). So a
+  rain-postponed game replayed in that **2-day–2-week gap settles to the real winner on pmus but a fair-price
+  void on Kalshi** → the YES/NO legs stop offsetting → **both-legs loss** (and even a symmetric void doesn't
+  net: Kalshi *"fair price"* ≠ pmus *"last-traded"*). Esports/WNBA non-completion: pmus → last-price, Kalshi
+  silent. **Mitigation TODO**: don't hold an MLB pair through a postponement (unwind before the 2-day window);
+  model the void EV term (0010). See [research/sports-settlement-verification.md](research/sports-settlement-verification.md).
 - **Edge-location and scale-capacity are DIFFERENT axes.** *Edge* (the gap) lives in **inefficient corners**
   (thin, intermittent — line lag, settlement quirks); *capacity* (deployable size before you walk the book
   past the edge) lives in **depth**, and the efficient deep books (tennis/UFC/ITF) are ~$0 cross-venue
