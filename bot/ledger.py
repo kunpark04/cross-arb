@@ -71,6 +71,13 @@ class Ledger:
     def enter(self, px, size, direction=None, t=None, force=False):
         s = signal(px)
         d = direction or s["dir"]
+        if (s.get("crossed") or s.get("no_arb")) and not force:   # C3: honor the crossed/stale/no-arb rejection
+            raise ValueError(f"refusing entry on crossed/stale/no-arb book "    # (signal saw no priceable +edge)
+                             f"(crossed={s.get('crossed')}, no_arb={s.get('no_arb')}); pass force=True to override")
+        need = ("p_ya", "k_yb") if d == "P" else ("k_ya", "p_yb")  # the two touches this direction must price
+        miss = [k for k in need if px.get(k) is None]
+        if miss and not force:                                    # unpriceable dir -> clean refusal, not a raw TypeError
+            raise ValueError(f"refusing entry: dir {d} unpriceable on this book (missing {miss}); force=True to override")
         if d == "P":
             vy, ay, vn, an = "P", px["p_ya"], "K", 1-px["k_yb"]
         else:
@@ -97,10 +104,12 @@ class Ledger:
         for v in ("P", "K"):
             ybid = px["p_yb"] if v == "P" else px["k_yb"]
             yask = px["p_ya"] if v == "P" else px["k_ya"]
-            no_bid = 1 - yask
             yq, nq = self.pos[v]["YES"], self.pos[v]["NO"]
-            total += yq*ybid - FEE[v](ybid, yq)
-            total += nq*no_bid - FEE[v](no_bid, nq)
+            if yq and ybid is not None:                    # un-quoted leg = unsellable now (0 proceeds), never a crash
+                total += yq*ybid - FEE[v](ybid, yq)
+            if nq and yask is not None:                    # NO bid = 1 - YES ask; absent if the venue is one-sided
+                no_bid = 1 - yask
+                total += nq*no_bid - FEE[v](no_bid, nq)
         return round(total, 3)
 
     def settlement_pnl(self, outcome):
@@ -115,10 +124,11 @@ class Ledger:
         for v in ("P", "K"):
             ybid = px["p_yb"] if v == "P" else px["k_yb"]
             yask = px["p_ya"] if v == "P" else px["k_ya"]
-            no_bid = 1 - yask
             yq, nq = self.pos[v]["YES"], self.pos[v]["NO"]
-            proceeds = yq*ybid - FEE[v](ybid, yq) + nq*no_bid - FEE[v](no_bid, nq)
-            realized += proceeds
+            if yq and ybid is not None:                    # one-sided book -> that leg can't be sold (0 proceeds)
+                realized += yq*ybid - FEE[v](ybid, yq)
+            if nq and yask is not None:
+                realized += nq*(1 - yask) - FEE[v](1 - yask, nq)
             self.pos[v]["YES"] = 0.0; self.pos[v]["NO"] = 0.0
         self.cash += realized
         return round(realized, 3)
@@ -150,7 +160,8 @@ def _show(L, px=None):
     print(line)
 
 def run():
-    EPS = 0.011  # 1 fee-cent tolerance for the ceil() in Kalshi fees
+    EPS = 0.011  # rounding tolerance: each entry stores net_edge round()ed to 3dp (the ceil cancels exactly
+                 # on both sides of the additive identity, so this guards 3dp rounding, NOT fee-ceil drift)
     print("="*92)
     print("S1 — SAME direction re-entry (edge reappears the same way): purely additive")
     print("="*92)
@@ -230,6 +241,16 @@ def run():
     crossed = {"p_yb":0.70,"p_ya":0.60,"k_yb":0.30,"k_ya":0.32}     # P internally crossed (bid > ask)
     assert signal(crossed).get("crossed") and signal(crossed).get("no_arb")
     print("  C3: signal() rejects an internally-crossed venue book as no-arb (was a phantom +edge)")
+    stale = {"p_yb":0.30,"p_ya":0.32,"k_yb":0.70,"k_ya":0.60}       # K crossed w/ STALE-HIGH bid -> 1-k_yb=0.30 looks cheap
+    assert signal(stale).get("crossed") and signal(stale).get("no_arb")
+    try:
+        Ledger("x").enter(stale, 100); raise AssertionError("enter should refuse a crossed/stale book")
+    except ValueError:
+        print("  C3b: enter() now ALSO refuses the crossed/stale book (was a phantom +edge via 1-stale_bid; force=True overrides)")
+    L1 = Ledger("os"); L1.enter({"p_yb":0.59,"p_ya":0.61,"k_yb":0.67,"k_ya":0.70}, 100)  # dir P -> K holds 100 NO
+    assert L1.mtm({"p_yb":0.59,"p_ya":0.61,"k_yb":None,"k_ya":0.70}) is not None          # one-sided K book: no crash
+    assert L1.unwind_all({"p_yb":0.59,"p_ya":None,"k_yb":None,"k_ya":0.70}) is not None    # missing touches -> unsellable, not TypeError
+    print("  WARN-fix: mtm()/unwind_all() treat an un-quoted leg as unsellable (no TypeError on one-sided books)")
 
     print("\nAll invariants asserted OK (additive PnL + outcome-independence for locked books).")
 
