@@ -32,9 +32,14 @@ See [deploy/README.md](deploy/README.md).
   10 AM EDT — it waits past 8 AM); pmus's *"locks at 8 AM"* is **still third-party** (its FAQ *and* live market
   object carry no timing language). The **revision rate** is now logged live (`monitor.py` `cli_stream` →
   `cli.jsonl` → `scripts/cli_revisions.py`). See [research/settlement-verification.md](research/settlement-verification.md).
-- Edge appears in **inefficient corners, not deep books** — deep liquid books (tennis/UFC/ITF) are ~$0
-  cross-venue; live edges show in **MLB** (new-venue line lag) + **weather** (intermittent). **Magnitudes
-  are PRELIMINARY:** an independent review (2026-06-09,
+- **Edge-location and scale-capacity are DIFFERENT axes.** *Edge* (the gap) lives in **inefficient corners**
+  (thin, intermittent — line lag, settlement quirks); *capacity* (deployable size before you walk the book
+  past the edge) lives in **depth**, and the efficient deep books (tennis/UFC/ITF) are ~$0 cross-venue
+  precisely *because* they're arbitraged. The scalable money is their **intersection** — a deep book
+  *transiently* dislocated: **MLB new-venue line-lag** shows edge **and** thousands of contracts of depth
+  (`lad-pit` c2≈4800), while **weather** is real edge but thin. So scaling = **breadth of depth-AND-edge
+  events** sized to each book's depth, not bigger clips in one corner ([tasks/lessons.md](tasks/lessons.md) L16).
+  **Magnitudes are PRELIMINARY:** an independent review (2026-06-09,
   [tasks/independent-review-2026-06-09.md](tasks/independent-review-2026-06-09.md)) found the earlier
   "$/day" prose unsupported by the thin data + a wrong fee model — treat edge size as unproven until the
   live monitor + `scripts/capital_sim.py` accumulate. The bot decides what to trade.

@@ -170,3 +170,20 @@ trade) or **unreliable data** (stale/crossed = effectively ≤ 0). Magnitude/liq
 analysis lenses** that must always show the unfiltered baseline alongside — never silent defaults. A thin
 book is *small* size, not *no* trade (size down, don't skip). Detection uses the **marginal (at-scale)** fee
 so nothing +EV-at-size is dropped (L10); booking uses the exact per-order fee.
+
+## L16 — Edge-location and scale-capacity are DIFFERENT axes; target their intersection
+
+**Pattern:** a core finding read "edge appears in inefficient corners, **not** deep books." True about *where
+the gap is*, but it silently conflated two orthogonal axes and made the strategy look un-scalable. **Edge**
+(the gap) comes from inefficiency, which correlates with **thinness**; **capacity** (size you can deploy
+before walking the book past the edge) comes from **depth**. Efficient books are deep *because* they're
+arbitraged, so edge and depth usually **anti-correlate** — which is exactly why "edge ≠ deep books" reads as
+a dead end. It hides the only case that scales: a deep book that is *transiently* dislocated.
+
+**Rule:** measure "where's the edge" and "how much can I deploy" as **separate** quantities and hunt their
+**intersection** — depth AND edge co-occurring. The proof case is **MLB new-venue line-lag** (`lad-pit`
+c2≈4800 contracts *on* a live gap); weather corners are edge-but-thin; tennis/UFC are depth-but-no-edge.
+Scaling = **breadth of depth-and-edge events × per-event depth-capped size**, never bigger clips in one thin
+corner. Initial capital is sized to **peak concurrent deployable depth** (`capital_sim.py`), not to
+opportunity count. Keep thin corners in scope (real edge, just small size — L15), but the bankroll thesis
+rides on depth-and-edge events.

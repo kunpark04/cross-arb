@@ -68,8 +68,10 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       **mid-divergence** guard (L1 in the monitor); WS snapshot-vs-delta confirmation.
 - [ ] **Size the bankroll + intraday strategy** — as data accumulates, re-run the harness + simulator to
       set the initial capital (peak concurrent), per-arb clip (depth-capped), and intraday allocation
-      (verify/refute the evening-cluster hypothesis). Per the owner this is sizing/tuning, **not** a hard
-      go/no-go gate (confident the arb works).
+      (verify/refute the evening-cluster hypothesis). **The scalable lever is breadth of depth-AND-edge
+      events** (MLB line-lag — edge *with* depth), each sized to its own book, **not** larger clips in a thin
+      corner; capital is sized to peak concurrent *deployable depth*, not opportunity count ([L16](lessons.md)).
+      Per the owner this is sizing/tuning, **not** a hard go/no-go gate (confident the arb works).
 - [ ] **(then, per user) Live-bot trade-selection** — wire `ledger.py` to live monitor signals: capital
       allocation, per-market layer/rotate, leg-risk fill management. Exits the read-only phase.
 
