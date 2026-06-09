@@ -6,6 +6,35 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
 
 > **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
 
+## Reviewer audit (2026-06-09) — fixes ([reviewer-audit-2026-06-09.md](reviewer-audit-2026-06-09.md))
+
+Second adversarial review (92-agent find→verify pass + manual cross-read). 8 CRITICAL root causes + cheap
+WARNs. **All landed + self-tests green this session (2026-06-09):**
+
+- [x] **C1 — `ledger.enter()` bypasses crossed/no-arb guard** → now refuses crossed/stale/no-arb + unpriceable
+      dirs; S6 regression added. *(+ WARN: mtm/unwind None-guards for one-sided books)*
+- [x] **C2 — sports date-join binds the WRONG game** → now uses the pm slug ET date + exact-match (`pick_game`),
+      unique-±1 fallback only when slug undated. Mirrored `colisted_map.py` + `scan_all.py`. (173 live pairs.)
+- [x] **C3 — sports leg ORIENTATION unverified** → `game_edge` >40c orientation/identity price-guard (live path);
+      `verify_sports_settlement.py` written.
+- [x] **C4 — weather bucket pairing was a blind positional zip** → pair only on canonical inclusive `[lo,hi]`
+      boundary equality (`pm_bounds`/`kbounds`, live-verified convention); loud MISALIGNED report. All 3 matchers.
+      (60 live pairs, 0 false misalignments.)
+- [x] **C5 — sports settlement-identity** → `scripts/verify_sports_settlement.py` (source + void/postpone diff
+      per league); CLAUDE.md tempered (sports cleanliness UNVERIFIED). *Owner: run it live per league.*
+- [x] **C6 — monitor WS streams now have supervised reconnect-with-backoff** (clean-close half-dead hole closed);
+      `return_exceptions=True`; per-venue `rx_age` in the health beacon.
+- [x] **C7 — econ-legality corrected** across CLAUDE.md + README + research/README + decisions/0001 + catalog brief.
+- [x] **C8 — capital/profit de-double-counted** (`one_per_market`) + book-average (trapezoid) profit; self-test.
+      Corrected live headline: peak ≈ **$13.6k** (was $100k), **~6%/day** (was 8.2%). *(+ persistence headline now
+      depth/age-gated + excludes restart-censored; `load()` per-date dedup.)*
+- [x] **WARN/INFO sweep** — `smatch` ≤1-char prefix guard + `colisted_map._selftest`; `weather_arb_scan` date
+      de-hardcoded (5 cities); pull-data TOCTOU re-hash; security/deploy egress hardening + RO-key warning +
+      `.env.example`; settlement-VERIFIED / `age` / brief-count wording.
+- [ ] **Residual (owner / next session):** run `verify_sports_settlement.py` per league; resolve the pmus
+      weather-FAQ timing contradiction (WebFetch the live FAQ); verify middle-bucket inclusive/exclusive edge on
+      a live 2°F bucket; latency/leg-fill EV terms in the cost model (still 0010).
+
 ## Done (discovery → matcher → scanner → monitor)
 - [x] **1–5. Sports matcher** — Kalshi game structure discovered; robust `(league, date, abbrev)` join
       (`sports_match_v2.py`); 2-outcome arb metric; **no false positives** (price-sanity guard, [L1](lessons.md)); MLB ~$23.
@@ -82,8 +111,11 @@ city/league appears, add it to `WX`/`LEAGUES` (in `colisted_map.py` **and** `sca
 
 ## Key finding (2026-06-08)
 Edge lives in INEFFICIENT corners, not deep books. Tennis/UFC/ITF (deepest liquidity) = $0 cross-venue
-(sharp). Real edge: **MLB** (~$23, new-venue line lag) + **weather** (~$20/day, intermittent) — the live
-monitor has logged real MLB + weather transitions. Keep ALL in scope; the bot decides when/what to trade.
+(sharp). Real edge: **MLB** (new-venue line lag) + **weather** (intermittent) — the live monitor has logged
+real MLB + weather transitions. Keep ALL in scope; the bot decides when/what to trade.
+> **Magnitudes PRELIMINARY** — the old "~$23 MLB / ~$20/day weather" were a single ~8h window under a
+> since-fixed fee model + a ~6–7× capital double-count (corrected: peak ≈ $13.6k / ~6%/day). See
+> [reviewer-audit C8](reviewer-audit-2026-06-09.md). MLB depth-and-edge is n=1, not yet a class property.
 
 ## Status / context
 - **Read-only phase** (no orders). Creds verified: polymarket.us (Ed25519) + Kalshi **read-only** key

@@ -6,6 +6,32 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-09 — Second adversarial review (92-agent audit) + full fix landing
+
+Ran a second, deeper reviewer audit (10-dimension multi-agent find→adversarially-verify pass + manual
+cross-read) → [tasks/reviewer-audit-2026-06-09.md](../tasks/reviewer-audit-2026-06-09.md) (8 CRITICAL root
+causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + live-reverified.**
+
+- **Invariant-#2 guards added to the live matcher** (`bot/colisted_map.py`, mirrored to `scan_all.py`/
+  `persistence_scan.py`): C2 sports games bind on the **pm-slug ET date exactly** (`pick_game`) — kills the
+  adjacent-series wrong-game mispair from UTC-truncated `gameStartTime`+`dnear±1`; C4 weather buckets pair
+  only on **canonical inclusive `[lo,hi]` boundary equality** (`pm_bounds`/`kbounds`) — the blind positional
+  index-zip is gone; `smatch` got a ≤1-char prefix guard (rejects martin~martinez); first-ever `_selftest`.
+- **C3 orientation guard** in `game_edge` (>40c pm-A vs Kalshi-A reject) + `scripts/verify_sports_settlement.py`
+  (C5 — sports settlement-identity was never verified; owner runs it per league).
+- **C6 monitor reconnect**: both WS streams now supervised reconnect-with-backoff (the clean-close silent
+  half-dead-collector hole is closed), `return_exceptions=True`, per-venue `rx_age` in the health beacon.
+- **C1/ledger**: `enter()` honors the crossed/no-arb + priceability guards; `mtm`/`unwind_all` survive
+  one-sided books.
+- **C8 economics**: `capital_sim` de-double-counts re-detections (`one_per_market`) + book-average (trapezoid)
+  profit → corrected headline **peak ≈ $13.6k (was $100k) / ~6%/day (was 8.2%)**; persistence headline now
+  depth/age-gated; `analyze_persistence.load()` per-date dedup; `pull-data.ps1` TOCTOU re-hash.
+- **C7 econ-legality corrected** across CLAUDE.md + README + research/README + decisions/0001 + catalog brief
+  (econ IS US-legal on pmus; only crypto blocked). Settlement "VERIFIED" / `age` wording tempered. Deploy
+  egress-hardening + read-only-key warning (`bot/kalshi_book.py`) + `.env.example`.
+- **Lesson [L17](../tasks/lessons.md):** a guard on an unverified external convention (bucket inclusivity) must
+  be reverified on LIVE data + raw source — two offline-green iterations were silently wrong (caught only live).
+
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 
 Closed the review's last settlement-timing open item two ways — read the primary source, then built the

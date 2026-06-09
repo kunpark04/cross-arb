@@ -66,9 +66,13 @@ python bot/monitor.py --live N # bounded ~N-second READ-ONLY dual-stream run (no
   games (`register`); `FlipDebouncer` coalesces a CLOSE + opposite-direction OPEN within ~1s into one FLIP
   (same-dir reopen = suppressed flicker). Both live-verified 2026-06-08 (captured a full LAX weather edge
   OPEN→WIDEN→NARROW→CLOSE + live MLB edges).
-- **Per-transition fill inputs** — every arb transition also logs `depth` (`{c2,c1,c0}` = contracts
-  fillable at gross marginal edge ≥2¢/1¢/0¢ on both legs) + `age` (per-venue book staleness) — the raw
+- **Per-transition fill inputs** — every arb transition also logs `depth` (`{c2,c1,c0}` = **displayed**
+  contracts at gross marginal edge ≥2¢/1¢/0¢ on both legs — an *upper bound* on takeable size, never pinged)
+  + `age` (per-venue book *staleness* — a coarse hint, not a per-venue stream-liveness certificate) — the raw
   inputs to the ALL-IN cost model ([0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md)).
+- **Stream resilience** (2nd review C6) — each venue WS runs in a supervised reconnect-with-backoff loop, so a
+  clean or abnormal close re-subscribes the current targets instead of silently half-killing the collector;
+  the health beacon carries per-venue `rx_age` so a wedged-but-connected stream is observable off-box.
 - **NWS CLI revision stream** (`cli_stream`) — polls the NWS Climatological Report for 5 stations
   (NYC/LAX/MDW/MIA/SFO) every 30 min and logs each distinct `(station, report_date, daily-max)` to
   `_data/cli.jsonl`; feeds `scripts/cli_revisions.py`, the settlement **revision-rate** gauge that

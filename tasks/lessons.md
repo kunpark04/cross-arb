@@ -187,3 +187,21 @@ Scaling = **breadth of depth-and-edge events × per-event depth-capped size**, n
 corner. Initial capital is sized to **peak concurrent deployable depth** (`capital_sim.py`), not to
 opportunity count. Keep thin corners in scope (real edge, just small size — L15), but the bankroll thesis
 rides on depth-and-edge events.
+
+## L17 — A guard resting on an UNVERIFIED external convention must be reverified on LIVE data + the raw source, not just a self-test
+
+**Pattern:** the 2nd-review C4 fix (weather bucket boundary-equality guard) was written + offline-self-tested
+**three different ways**, and the first two were *wrong* — they silently dropped 40 / 10 legitimate live pairs
+because the self-test baked in the same guessed inclusive/exclusive convention the code used. The offline test
+couldn't catch it: both sides shared the wrong assumption. Only running the guard on the **live discovery
+path** surfaced the mass false-misalignment, and only **inspecting the raw Kalshi `floor_strike`/`cap_strike`
++ `yes_sub_title` next to the pm slugs** revealed the true (non-uniform) convention — Kalshi *middle* buckets
+are `[floor, cap]` inclusive while *tails* encode the boundary exclusively (`floor+1`/`cap-1`), and pm
+`gteXltY` is the 2°-wide `[X, Y]` bucket. So you must **canonicalize BOTH venues to one representation**
+(inclusive `[lo,hi]`) before comparing — never compare raw venue-specific encodings.
+
+**Rule:** when a settlement-/identity-critical guard rests on a premise the project itself marks UNVERIFIED
+(here: bucket inclusivity), an offline self-test is necessary but **NOT sufficient** — reverify end-to-end on
+live data and confirm the decoding against the **primary raw fields**. A test written from the same wrong
+mental model passes while the guard quietly destroys coverage (false negatives) or admits false positives.
+"Tests green" ≠ "correct" when test and code share an unproven assumption.
