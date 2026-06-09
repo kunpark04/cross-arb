@@ -299,6 +299,12 @@ class TransitionLogger:
         with open(os.path.join(self.dir, "sessions.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
         return rec
+    def cli(self, rec):
+        """Append one NWS CLI issuance reading to cli.jsonl (settlement timing/revision measurement)."""
+        rec = {"t": int(time.time()), **rec}
+        with open(os.path.join(self.dir, "cli.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return rec
     def session_start(self, info):
         """Append a session_start marker (one per monitor boot) to sessions.jsonl."""
         rec = {"t": int(time.time()), "event": "session_start", **info}
@@ -434,6 +440,16 @@ def _selftest():
     assert game_edge(None, 0.50, 0.55, 0.44)["dir"] == "PK"                                # one-sided pm (no bid) -> PK still prices
     print("OK - depth: signalled-direction pairs walk; crossed reject + ONE-SIDED books price per-direction")
 
+    # --- NWS CLI parse (settlement timing/revision measurement) ---
+    cli_sample = ("CDUS41 KOKX 090619\nCLINYC\nCLIMATE REPORT\nNATIONAL WEATHER SERVICE NEW YORK, NY\n"
+                  "219 AM EDT TUE JUN 09 2026\n...THE CENTRAL PARK NY CLIMATE SUMMARY FOR JUNE 8 2026...\n"
+                  "TEMPERATURE (F)\n  MAXIMUM         75   1200 PM  95    1933  78     -3       76\n"
+                  "  MINIMUM         60    459 AM\n MAXIMUM TEMPERATURE (F)   78        97      1933\n")
+    pc = parse_cli(cli_sample, "NYC")
+    assert pc and pc["max"] == 75 and pc["report_date"] == "2026-06-08" and pc["wmo"] == "CDUS41 KOKX 090619", pc
+    assert _cli_iso("JUNE 8 2026") == "2026-06-08"
+    print("OK - NWS CLI parse: daily max + report-date + WMO id (settlement-revision rate logging)")
+
 
 # ============================================================================================
 # LIVE LAYER  (both venue streams validated; weather=MarketTracker, sports=GameTracker; deploy gated)
@@ -486,6 +502,47 @@ def teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent):
         books.pop(tk, None)
     deb.forget(slug)
     absent.pop(slug, None)
+
+
+# --- NWS CLI revision logging: MEASURE how often the morning preliminary daily-max is later CORRECTED.
+#     Both venues settle ~8am ET off the SAME morning NWS Climatological Report (CLI); a *downward* morning
+#     correction can split a bucket-boundary day (Kalshi delays + takes the lower value, polymarket.us locks
+#     at 8am) -> the settlement timing/revision risk (research 2026-06-09 / research/settlement-verification.md).
+#     We log every DISTINCT CLI issuance per station to quantify the rate. Read-only public NWS product. ------
+CLI_STATIONS = ["NYC", "LAX", "MDW", "MIA", "SFO"]    # Central Park / LA / Chicago-Midway / Miami / SF (= WX cities)
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"])}
+
+def _cli_iso(s):                                       # "JUNE 8 2026" -> "2026-06-08"
+    p = str(s).upper().split()
+    try: return f"{int(p[2]):04d}-{_MONTHS[p[0]]:02d}-{int(p[1]):02d}"
+    except Exception: return str(s)
+
+def parse_cli(txt, station):
+    """Parse an NWS Daily Climate Report -> {station, report_date, max, issued, wmo} or None. The first
+    'MAXIMUM <n>' line is the daily observed max; 'SUMMARY FOR <MONTH D YEAR>' is the date the data is FOR."""
+    txt = re.sub(r"<[^>]+>", "", txt)
+    wmo = re.search(r"^([A-Z]{4}\d{2}[ \t]+[A-Z]{4}[ \t]+\d{6}(?:[ \t]+[A-Z]{3})?)", txt, re.M)  # BBB stays on-line
+    iss = re.search(r"^\s*(\d{1,4}\s+(?:AM|PM)\s+[A-Z]{2,4}\s+[A-Z]{3}\s+[A-Z]{3}\s+\d{1,2}\s+\d{4})", txt, re.M)
+    rd = re.search(r"SUMMARY FOR\s+([A-Z]+\s+\d{1,2}\s+\d{4})", txt, re.I)
+    mx = re.search(r"^\s*MAXIMUM\s+(-?\d+)\b", txt, re.M)
+    if not (mx and rd):
+        return None
+    return {"station": station, "report_date": _cli_iso(rd.group(1)), "max": int(mx.group(1)),
+            "issued": (iss.group(1).strip() if iss else None), "wmo": (wmo.group(1).strip() if wmo else None)}
+
+def fetch_cli(station):
+    """Fetch + parse the live CLI for a station id ('NYC','LAX',...). Returns the dict or None on any error."""
+    import urllib.request
+    url = (f"https://forecast.weather.gov/product.php?site=NWS&issuedby={station}"
+           f"&product=CLI&format=TXT&version=1&glossary=0")
+    try:
+        html = urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "cross-arb/1.0"}), timeout=20).read().decode("utf-8", "replace")
+        m = re.search(r"<pre[^>]*>(.*?)</pre>", html, re.S | re.I)
+        return parse_cli(m.group(1) if m else html, station)
+    except Exception:
+        return None
 
 
 async def run_live(logger, refresh_sec=300, debounce=1.0):
@@ -618,7 +675,24 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             for lab, st, k in deb.flush(time.time()):
                 _write(lab, st, k)
 
-    await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat(), flusher())
+    async def cli_stream():         # poll NWS CLI per station every 30min; log each DISTINCT issuance
+        last = {}                   # station -> (report_date, max); log only when the daily MAX changes (a revision),
+        while True:                 # not on issuance-time flap (NWS version=1 can re-serve a same-max issuance)
+            try:
+                for st in CLI_STATIONS:
+                    rec = await asyncio.to_thread(fetch_cli, st)
+                    if not rec:
+                        continue
+                    key = (rec["report_date"], rec["max"])
+                    if last.get(st) != key:
+                        last[st] = key
+                        logger.cli(rec)
+                        print(f"[cli] {st} {rec['report_date']} max={rec['max']} ({rec['issued']})")
+            except Exception as e:
+                print(f"[cli] poll error (continuing): {e!r}")     # never let CLI polling crash collection
+            await asyncio.sleep(1800)
+
+    await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat(), flusher(), cli_stream())
 
 
 if __name__ == "__main__":

@@ -6,6 +6,24 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
+
+Closed the review's last settlement-timing open item two ways — read the primary source, then built the
+empirical gauge for the residual risk (owner: *"do 1 and quantify the residual risk"*).
+
+- **Live-object read** (`scripts/verify_settlement.py`, owner item #1): a live MIA pair shows Kalshi's rules
+  name the *"official … **final** value"* with **expiry 10 AM EDT** (waits past 8 AM for the *final*), while
+  pmus's market object carries **no** timing/preliminary/revision language (only *"Outcome verified from NWS
+  Climatological Report"*). So the downward-correction asymmetry is now **half primary-source-confirmed**
+  (Kalshi side documented; pmus's 8 AM-lock still third-party → needs QCX support or one observed correction
+  day). → [research/settlement-verification.md](../research/settlement-verification.md).
+- **CLI revision logger BUILT + LIVE** (`bot/monitor.py` `cli_stream`): polls the NWS CLI for 5 stations
+  (NYC/LAX/MDW/MIA/SFO) every 30 min, logs each distinct `(station, report_date, max)` to `_data/cli.jsonl`
+  (deduped on max, so NWS `version=1` issuance-flap doesn't log). `scripts/cli_revisions.py` reports the
+  revision / **downward** / drop-magnitude rates per station-day — an **upper bound** on the
+  "downward 8–10 AM correction splits the venues" loss rate. Both self-tested; redeployed (`active`, 0
+  restarts). Day-1 read: **0 revisions / 5 station-days** — accrues over weeks.
+
 ## 2026-06-09 — Independent review → correctness fixes, settlement verified, de-filtering
 
 Ran a fresh-eyes adversarial review of the whole project (given only the thesis, none of our own findings)

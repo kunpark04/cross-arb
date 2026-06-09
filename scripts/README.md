@@ -32,6 +32,7 @@ read access, never to trade in this phase.
 - `settlement_timing.py` — measure settlement hold duration + capital lockup per family
 - `kalshi_calendar.py` — forward calendar per matched series; soonest settle dates
 - `verify_settlement.py` — **settlement-identity check**: pulls BOTH venues' live rules per co-listed weather city, diffs source/station/boundary/timing + flags mismatches (resolves the #1 thesis risk) ⭐
+- `cli_revisions.py` — **settlement residual-risk gauge**: from the monitor's `_data/cli.jsonl`, reports the NWS CLI daily-max **revision rate** (and the **downward** rate + drop magnitude — the settlement-relevant direction) per station-day; upper-bounds the "downward 8–10 AM correction splits the venues" loss rate. `--selftest`
 
 **Weather**
 - `nyc_align_check.py` — resolve the NYC 74–75 bucket alignment between venues
@@ -69,6 +70,7 @@ read access, never to trade in this phase.
 | `persistence_log.jsonl` | Per-snapshot persistence-probe rows |
 | `persistence_summary.txt` | Aggregated persistence summary |
 | `transitions.jsonl` | **Live monitor output** — edge state-transitions (OPEN/CLOSE/FLIP/WIDEN/NARROW) from `bot/monitor.py` |
+| `cli.jsonl` | **Live monitor output** — distinct NWS CLI daily-max issuances per `(station, report_date)` (settlement-revision tracking; read by `cli_revisions.py`) |
 
 > `persistence_scan.py` (fixed-cadence) is **superseded** by the build-complete **event-driven
 > dual-stream monitor** `bot/monitor.py` (writes `transitions.jsonl`) — see [decisions/0003](../decisions/0003-event-driven-persistence.md)

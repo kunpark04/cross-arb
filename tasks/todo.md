@@ -58,9 +58,13 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       a measured **latency** haircut (order-ack study), and a **leg-fill-failure** EV term
       (`P(both)·quoted − P(one)·naked-loss`). [`make_px`/`signal`/`game_edge` per-direction pricing for
       one-sided books — **done 2026-06-09**.]
-- [ ] **Open items from the review** — settlement timing **researched** (both ~8 AM ET / same morning CLI;
-      residual = downward-correction asymmetry → owner: confirm pmus post-8 AM policy + log prelim-vs-corrected
-      CLI to measure the rate) + middle-bucket boundaries; **cost-of-carry** in `capital_sim`; live
+- [ ] **Open items from the review** — settlement timing **researched + live-object-read** (both ~8 AM ET /
+      same morning CLI; residual = downward-correction asymmetry. Kalshi side now **primary-source confirmed**
+      via `verify_settlement.py` — rules say *"final value"*, MIA expiry 10 AM EDT; pmus's 8 AM-lock is **still
+      third-party** (live object has no timing language) → owner: confirm via QCX support / one observed
+      correction day). **Revision-rate logger BUILT + LIVE** (`monitor.py` `cli_stream` → `_data/cli.jsonl`;
+      `scripts/cli_revisions.py` reports revised / **downward** / drop-magnitude; day-1 = 0/5 station-days,
+      accrues over weeks). Remaining: middle-bucket boundaries; **cost-of-carry** in `capital_sim`; live
       **mid-divergence** guard (L1 in the monitor); WS snapshot-vs-delta confirmation.
 - [ ] **Size the bankroll + intraday strategy** — as data accumulates, re-run the harness + simulator to
       set the initial capital (peak concurrent), per-arb clip (depth-capped), and intraday allocation

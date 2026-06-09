@@ -17,7 +17,7 @@ for each co-listed weather city and diffs source / station / bucket-boundary / s
 | **Settlement source** | **Both venues: "NWS Climatological Report (Daily)."** pmus descriptions say so explicitly; Kalshi `rules_primary` says so. | ✅ identical |
 | **Station** | Identical per city — LAX→LAX airport (KLAX), MDW→Chicago Midway (KMDW), MIA→Miami Intl (KMIA), **NYC→Central Park (KNYC)**, SFO→SF airport. The NYC station the review specifically doubted **matches**. | ✅ identical |
 | **Bucket boundary** | Matches on the sampled (low-tail) buckets: e.g. LAX Kalshi "less than 67° / 66° or below" == pmus "less than or equal to 66F". | ✅ matches (sampled) |
-| **Settlement timing / revision** | Researched 2026-06-09 (both rulebooks + NWS): both settle ~**8 AM ET next day off the same morning CLI** (Kalshi snapshots the morning *preliminary*, not a fully-final CLI — same value pmus reads), so timing matches. Residual **asymmetry on a *downward* morning correction**: Kalshi delays to 11 AM & can take the lower value; pmus locks at 8 AM. | ⚠️ matched; narrow residual risk |
+| **Settlement timing / revision** | Researched 2026-06-09 (both rulebooks + NWS) **+ live market objects** (`verify_settlement.py`): both grade off the same next-morning CLI. **Primary-source asymmetry now read directly:** Kalshi's rules name the *"official and **final** value"* and a live MIA market's **expiry is 10 AM EDT** (`2026-06-10T14:00Z`) — so Kalshi waits past 8 AM for the *final*; pmus's live object says only *"Outcome verified from NWS Climatological Report"* with **no timing/correction language at all**. So on a *downward* 8–10 AM correction the two can split. The **rate** of such corrections is now logged live (`cli.jsonl` → `cli_revisions.py`). | ⚠️ matched; narrow residual risk, now being measured |
 
 ## Conclusion
 
@@ -36,14 +36,24 @@ crossed-book rejection).
    terms snapshot the morning *preliminary* value (same as pmus) and only ignore revisions landing *after*
    expiration. **Residual risk** is asymmetric + narrow: on a **bucket-boundary day with a *downward* morning
    CLI correction**, Kalshi's rules **delay to 11 AM ET and can settle on the lower corrected value**, while
-   pmus (per its public FAQ) **locks at 8 AM** — so the two could resolve to **opposite buckets → lose both
-   legs**. *Upward* morning corrections are guarded by neither, so they stay aligned. **Owner to confirm:**
-   (a) pmus's post-8 AM correction policy — the FAQ is silent; the "only the final report matters" claim is
-   third-party, not primary (ask QCX support, read a live `tc-temp-*high*` market's full resolution text, or
-   observe one real correction day); (b) the empirical rate — log the morning preliminary CLI **and** any
-   same-day corrected CLI per station to measure how often the daily max actually moves. **Primary refs:**
-   [Kalshi `NHIGH` terms](https://kalshi-public-docs.s3.amazonaws.com/contract_terms/NHIGH.pdf) (live `KXHIGH*`)
-   · [polymarket.us weather FAQ](https://docs.polymarket.us/faqs/weather-faqs).
+   pmus (per the third-party "only the final report matters" claim) **locks at 8 AM** — so the two could
+   resolve to **opposite buckets → lose both legs**. *Upward* morning corrections are guarded by neither, so
+   they stay aligned. **Status 2026-06-09:**
+   - **(a) live-object read — DONE, partially resolved.** `verify_settlement.py` pulled a live MIA pair: Kalshi's
+     `rules_secondary` names the *"official and **final** value"* and its **expiry is 10 AM EDT**
+     (`2026-06-10T14:00Z`) — Kalshi's side of the asymmetry (waits past 8 AM, takes the *final*) is now
+     **primary-source confirmed**. pmus's live market object carries **no** timing/preliminary/final/revision
+     language (only *"Outcome verified from NWS Climatological Report"*) — so its 8 AM-lock policy is **still
+     not in primary text**; the FAQ is silent and the live object is silent. Closing it fully needs QCX support
+     or one observed correction day.
+   - **(b) empirical rate — NOW BEING MEASURED.** `bot/monitor.py` (`cli_stream`) logs every distinct
+     `(station, report_date, max)` to `_data/cli.jsonl`; `scripts/cli_revisions.py` reports the revision rate,
+     the **downward** rate (the settlement-relevant direction), and the drop-magnitude distribution. It's an
+     **upper bound** on the loss rate (counts any intra-day downward move, not just 8–10 AM boundary-straddling
+     ones). Live on the droplet since 2026-06-09; day-1 read = 0 revisions / 5 station-days (accrues over weeks).
+
+   **Primary refs:** [Kalshi `NHIGH` terms](https://kalshi-public-docs.s3.amazonaws.com/contract_terms/NHIGH.pdf)
+   (live `KXHIGH*`) · [polymarket.us weather FAQ](https://docs.polymarket.us/faqs/weather-faqs).
 2. **Middle buckets** — the probe sampled low-tail buckets today; re-run when 2°-wide middle buckets are
    listed to confirm their inclusive/exclusive inequality alignment per the 1:1 map.
 
