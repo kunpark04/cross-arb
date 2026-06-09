@@ -36,8 +36,13 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       `sessions.jsonl` restart marker. `deploy/pull-data.ps1` = copy-keep + sha256-verified + idempotent
       mirror to `Kalshi/data/cross-arb/`, gzips finalized days; scheduled daily (`PullCrossArbData`, 8:30am).
 - [ ] **Let it run + pull** — accumulate ≥days of `Kalshi/data/cross-arb/` data; spot-check the daily pull.
-- [ ] **Go/no-go gate** — from the collected data, decide whether the edge is persistent/scalable enough
-      to build the live trading bot. File the verdict as a decision when reached.
+- [x] **Persistence-analysis harness** (`scripts/analyze_persistence.py`) — reconstructs edge episodes
+      (OPEN→CLOSE per market, restart-aware via `sessions.jsonl`) → edge-magnitude / persistence (fill
+      window) / capturable-rate / scalability proxy. Self-tested; validated on preliminary data (0.8 h:
+      median edge ~0.7c, median duration ~2 s with a thin persistent tail — the MLB line-lag). Re-run as
+      the dataset grows; **the methodology + thresholds want a stats review before the actual verdict.**
+- [ ] **Go/no-go gate** — from the accumulated data (via `analyze_persistence.py`), decide whether the
+      edge is persistent/scalable enough to build the live bot. File the verdict as a decision when reached.
 - [ ] **(then, per user) Live-bot trade-selection** — wire `ledger.py` to live monitor signals: capital
       allocation, per-market layer/rotate, leg-risk fill management. Exits the read-only phase.
 
