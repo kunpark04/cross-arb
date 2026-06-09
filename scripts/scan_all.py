@@ -34,7 +34,23 @@ def dnear(a,b):
 def surname(name):
     n=unicodedata.normalize("NFKD",str(name)).encode("ascii","ignore").decode().lower()
     n=re.sub(r"[^a-z \-]"," ",n); t=[x for x in n.split() if x]; return t[-1] if t else ""
-def smatch(a,b): return a==b or (len(a)>=4 and len(b)>=4 and (a.startswith(b) or b.startswith(a)))
+def smatch(a,b):  # exact OR <=1-char prefix; the <=1 guard rejects distinct players (martin~martinez) - L1
+    if a==b: return True
+    if len(a)<4 or len(b)<4: return False
+    return (a.startswith(b) or b.startswith(a)) and abs(len(a)-len(b))<=1
+def pm_bounds(slug):                          # pm bucket -> inclusive (lo,hi) degF (mirrors bot/colisted_map.py)
+    s=str(slug).lower()
+    m=re.search(r"gte(\d+)lt(\d+)",s)
+    if m: return (int(m.group(1)),int(m.group(2)))
+    m=re.search(r"-lt(\d+)f",s)
+    if m: return (None,int(m.group(1))-1)
+    m=re.search(r"gte(\d+)",s)
+    return (int(m.group(1)),None) if m else (None,None)
+def kbounds(m):                               # Kalshi -> inclusive (lo,hi): middle [floor,cap]; tails floor+1/cap-1
+    fls,cap=m.get("floor_strike"),m.get("cap_strike")
+    if fls is None and cap is not None: return (None,cap-1)
+    if cap is None and fls is not None: return (fls+1,None)
+    return (fls,cap)
 def pm_book(slug):
     md=(get(f"https://gateway.polymarket.us/v1/markets/{slug}/book") or {}).get("marketData",{})
     offs=[(fl(x['px']['value']),fl(x['qty'])) for x in md.get("offers",[]) if x.get('px')]
@@ -90,6 +106,8 @@ for city,kser in WX.items():
         pm=sorted(bydate[date],key=lambda m:pm_lo(str(m.get("slug")).lower()))
         kb=sorted(kby[date],key=lambda m:(m.get("floor_strike") if m.get("floor_strike") is not None else -999))
         for i in range(min(len(pm),len(kb))):
+            if pm_bounds(pm[i].get("slug"))!=kbounds(kb[i]):   # C4: boundary-NUMBER equality guard
+                continue                                       # non-identical floor/cap -> don't pair (settlement-identity)
             (pb,pbs),(pa,pas)=pm_book(str(pm[i].get("slug"))); time.sleep(0.12)
             kyb,kybs,kya,kyas=k_ob(kb[i].get("ticker")); time.sleep(0.12)
             mt=metric(pa,pas,(round(1-pb,2) if pb is not None else None),pbs, kya,kyas,(round(1-kyb,2) if kyb else None),kybs)
@@ -124,17 +142,19 @@ for L,(series,join) in LEAGUES.items():
         lo=next((s for s in sides if s.get("long")),sides[0]); ot=next((s for s in sides if s is not lo),sides[1])
         if join=="abbrev": kA=(lo.get("team") or {}).get("abbreviation","").lower(); kB=(ot.get("team") or {}).get("abbreviation","").lower()
         else: kA=surname((lo.get("team") or {}).get("name")); kB=surname((ot.get("team") or {}).get("name"))
-        date=str(x.get("gameStartTime"))[:10]
-        # find kalshi game
+        sm=re.search(r"(\d{4}-\d{2}-\d{2})",str(x.get("slug")))   # C2: pm slug ET date == Kalshi ticker date (exact join)
+        date=sm.group(1) if sm else str(x.get("gameStartTime"))[:10]
+        def _mg(pl, kA=kA, kB=kB, join=join):
+            ks=list(pl.keys())
+            mA=next((s for s in ks if (s==kA if join=="abbrev" else smatch(s,kA))),None)
+            mB=next((s for s in ks if (s==kB if join=="abbrev" else smatch(s,kB))),None)
+            return (pl,mA,mB) if (mA and mB and mA!=mB) else None
         found=None
-        for kdt in list(kbydate.keys()):
-            if not kdt or not dnear(kdt,date): continue
-            for pl in kbydate[kdt]:
-                ks=list(pl.keys())
-                mA=next((s for s in ks if (s==kA if join=="abbrev" else smatch(s,kA))),None)
-                mB=next((s for s in ks if (s==kB if join=="abbrev" else smatch(s,kB))),None)
-                if mA and mB and mA!=mB: found=(pl,mA,mB); break
-            if found: break
+        if date in kbydate:                                       # EXACT date -> kills the adjacent-series mispair
+            found=next((g for pl in kbydate[date] if (g:=_mg(pl))),None)
+        if not found and sm is None:                              # no slug date -> +/-1 fallback only if UNIQUE
+            near=[g for kdt in kbydate if kdt and dnear(kdt,date) for pl in kbydate[kdt] if (g:=_mg(pl))]
+            found=near[0] if len(near)==1 else None
         if not found: continue
         pl,mA,mB=found
         (pb,pbs),(pa,pas)=pm_book(str(x.get("slug"))); time.sleep(0.12)

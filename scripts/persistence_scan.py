@@ -53,6 +53,19 @@ def pm_book(slug):
 def pm_lo(slug):
     m = re.search(r"-lt(\d+)f", slug);  m2 = re.search(r"gte(\d+)", slug)
     return (int(m.group(1))-100) if m else (int(m2.group(1)) if m2 else 0)
+def pm_bounds(slug):                          # pm bucket -> inclusive (lo,hi) degF (mirrors bot/colisted_map.py)
+    s = str(slug).lower()
+    m = re.search(r"gte(\d+)lt(\d+)", s)
+    if m: return (int(m.group(1)), int(m.group(2)))
+    m = re.search(r"-lt(\d+)f", s)
+    if m: return (None, int(m.group(1)) - 1)
+    m = re.search(r"gte(\d+)", s)
+    return (int(m.group(1)), None) if m else (None, None)
+def kbounds(m):                               # Kalshi -> inclusive (lo,hi): middle [floor,cap]; tails floor+1/cap-1
+    fls, cap = m.get("floor_strike"), m.get("cap_strike")
+    if fls is None and cap is not None: return (None, cap - 1)
+    if cap is None and fls is not None: return (fls + 1, None)
+    return (fls, cap)
 
 def weather_snapshot(climate):
     edges, rows = [], 0
@@ -73,7 +86,10 @@ def weather_snapshot(climate):
             kb = sorted(kby[date], key=lambda m: (m.get("floor_strike") if m.get("floor_strike") is not None else -999))
             pm = sorted(bycity[city][date], key=lambda x: pm_lo(str(x.get("slug")).lower()))
             for i in range(min(len(kb), len(pm))):
-                km, pmm = kb[i], pm[i]; rows += 1
+                km, pmm = kb[i], pm[i]
+                if pm_bounds(pmm.get("slug")) != kbounds(km):   # C4 boundary-NUMBER equality guard
+                    continue                                    # non-identical floor/cap -> skip (settlement-identity)
+                rows += 1
                 ob = get(f"https://external-api.kalshi.com/trade-api/v2/markets/{km.get('ticker')}/orderbook").get("orderbook_fp", {})
                 yb = [(fl(p), fl(s)) for p,s in ob.get("yes_dollars",[])]; nb = [(fl(p), fl(s)) for p,s in ob.get("no_dollars",[])]
                 k_yb, k_yb_sz = (max(yb) if yb else (0.0,0)); nbid, nbid_sz = (max(nb) if nb else (0.0,0))
