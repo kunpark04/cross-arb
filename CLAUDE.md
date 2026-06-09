@@ -19,16 +19,24 @@ user ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)), collectin
 persistence dataset pulled daily to `Kalshi/data/cross-arb/` ([0009](decisions/0009-event-date-partition-copy-keep-pull.md)).
 See [deploy/README.md](deploy/README.md).
 
-## Core findings (as of 2026-06-08)
+## Core findings (as of 2026-06-09)
 
 - The clean-settlement universe (CPI/FOMC/crypto) is **US-blocked** — it only lists on *international*
   Polymarket, which a US person can't legally trade. The US-legal overlap is **weather + sports**.
-- Edge lives in **inefficient corners, not deep books.** Deep liquid books (tennis/UFC/ITF) are
-  fully arbitraged ($0 cross-venue). Real edge: **MLB** (~$23 right now, new-venue line lag) and
-  **weather** (~$20/day gross, intermittent). Both kept in scope; the bot decides what to trade.
-- The original fat ~24¢ "edge" (`miami-temp-arb.html`) was a **source divergence** (Kalshi=NWS vs intl
-  Polymarket=Wunderground). The US-legal venue grades on the *same* NWS number, so that gap collapses
-  to ~5¢ — real and clean, but small.
+- **Settlement identity for weather is VERIFIED** (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped
+  cities grade off the **same** NWS Climatological Report (Daily), at the **same station** (incl. NYC =
+  Central Park), with **matching** sampled bucket boundaries — refuting the old NWS-vs-Wunderground
+  source-divergence fear (`miami-temp-arb.html`). **Open:** settlement *timing/revision* (in the pmus
+  rulebook, not the API). See [research/settlement-verification.md](research/settlement-verification.md).
+- Edge appears in **inefficient corners, not deep books** — deep liquid books (tennis/UFC/ITF) are ~$0
+  cross-venue; live edges show in **MLB** (new-venue line lag) + **weather** (intermittent). **Magnitudes
+  are PRELIMINARY:** an independent review (2026-06-09,
+  [tasks/independent-review-2026-06-09.md](tasks/independent-review-2026-06-09.md)) found the earlier
+  "$/day" prose unsupported by the thin data + a wrong fee model — treat edge size as unproven until the
+  live monitor + `scripts/capital_sim.py` accumulate. The bot decides what to trade.
+- **Hardened post-review:** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
+  `bot/monitor.py`) plus per-transition depth + staleness instrumentation, so a persistent-**fillable** edge
+  is distinguished from a persistent-**stale-phantom** one. Open items tracked in [tasks/todo.md](tasks/todo.md).
 
 ## Managerial docs index
 

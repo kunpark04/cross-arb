@@ -103,3 +103,56 @@ nothing about whether confinement worked **or** whether the monitor could still 
 **Rule:** verify the **specific property you changed**, not a proxy. After enabling `ProtectSystem=strict`,
 confirm both that it's effective (`systemctl show`) **and** that the intended write still succeeds (the log
 file grew). "It started" is not "it does what I changed it to do."
+
+## L10 — Kalshi fee is per-ORDER (ceil once), and naive `ceil()` overshoots on float noise
+
+**Pattern:** `kfee` charged `ceil(0.07·p(1-p))` **per contract** then summed — over-charging vs the published
+`ceil(0.07·N·p(1-p))` rounded **once per order** (100@0.5: $2.00 vs $1.75). Worse, `0.07*100*0.25*100`
+floats to `175.00000000000003`, so `ceil` jumped to **176** → a spurious extra cent.
+
+**Rule:** model exchange fees on the **whole order** (size known at booking), not per-contract-summed; and
+when `ceil`-ing money, subtract a tiny epsilon (`ceil(x - 1e-9)`) so float noise at a cent boundary doesn't
+manufacture a cent. Detection (`signal`, per-$1) may keep the conservative per-unit fee — but flag it as an
+upper bound, and use the real per-order fee anywhere you compute actual PnL.
+
+## L11 — An accounting/entry function must REFUSE a non-positive-edge book, not silently book it
+
+**Pattern:** `ledger.enter()` computed the edge but booked the pair **regardless of sign** — fed a no-arb
+book it locked a guaranteed loss (net −4.19) with no guard. Wired to a live bot, a stale snapshot books a
+losing "arb."
+
+**Rule:** the order-booking path refuses `net_edge ≤ 0` (and a forced-direction negative) loudly (raise),
+with an explicit `force=True` override for tests. Never let the accounting core book a position the signal
+says is a loss.
+
+## L12 — A crossed/locked venue book manufactures a PHANTOM arb; reject it
+
+**Pattern:** when a single venue's book is internally crossed (`yes_bid > yes_ask`, e.g. from a stale/in-play
+mid-update), the cross-venue math reports a fat "edge" (and depth) that isn't takeable — and the depth code
+even paired that venue with *itself*. Crossed/locked books are almost always stale.
+
+**Rule:** reject any book with `best_bid > best_ask` on a venue (allow `==`, a legitimate locked book), and
+compute depth on the **signalled cross-venue direction** so both legs are always on different venues. This
+guard belongs in the **live** transition path, not just the offline scanner (the >40¢ mid-divergence guard
+of L1 should follow it there too — still TODO).
+
+## L13 — "Persistent edge" ≠ "fillable edge"; instrument staleness + liquidity and filter on them
+
+**Pattern:** the persistence harness measured how long an edge *state* lasted, but a wide gap can persist
+precisely because the cheap side is a **stale phantom quote** nobody can hit, or a 5-contract one-sided book.
+Persistent-and-fillable and persistent-and-stale were indistinguishable.
+
+**Rule:** log the inputs that decide fillability — per-venue book **staleness** (`age`) and **depth** at the
+edge — and gate "capturable" on them (fresh both sides + depth ≥ floor), not just on net + duration. An edge
+on a stale or thin book is a measurement artifact until proven otherwise.
+
+## L14 — Prose conclusions must not outrun the code/data; an independent adversarial review is cheap insurance
+
+**Pattern:** an independent reviewer (given only the thesis, none of our findings) confirmed the engineering
+was sound but caught that managerial-doc prose stated "the edge is real / MLB ~$23 / ~$20/day" as conclusions
+that 9 transitions + 17 minutes of data + a wrong fee model couldn't support — and that one load-bearing
+assumption (settlement identity) was self-contradicted across our own briefs and never closed.
+
+**Rule:** a `research/`/`README` claim must be traceable to code that does what it says + data that supports
+the magnitude; otherwise mark it preliminary/unverified. Periodically run a **fresh-eyes adversarial review**
+scoped to *only* the thesis (no spoon-fed conclusions) — it found 4 real bugs and the #1 thesis gap in one pass.

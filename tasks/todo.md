@@ -46,6 +46,15 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       models hold-to-settlement concurrency (Little's Law) → required-capital ↔ daily-return frontier,
       W-sensitivity + intraday arrival profile. Self-tested; validated end-to-end (data still too sparse for
       a read). MLB edges show **thousands of contracts of depth** (e.g. `lad-pit` c2≈4800).
+- [x] **Independent review + hardening (2026-06-09)** — fresh-eyes adversarial review
+      ([tasks/independent-review-2026-06-09.md](independent-review-2026-06-09.md)) → fixed per-order fee +
+      float-ceil (C1), entry guard (C2), crossed-book rejection (C3), seq-resync marker (C6); added
+      per-transition staleness (`age`) + clean-fillable filter (L2); **verified settlement identity**
+      (`scripts/verify_settlement.py` → same NWS CLI Daily + station + boundary, 5 cities;
+      [research/settlement-verification.md](../research/settlement-verification.md)).
+- [ ] **Open items from the review** — settlement **timing/revision** (pmus rulebook) + middle-bucket
+      boundaries; **leg-fill-failure** model + **cost-of-carry** in `capital_sim`; order-ack **latency**
+      study; live **mid-divergence** guard (L1 in the monitor); WS snapshot-vs-delta confirmation.
 - [ ] **Size the bankroll + intraday strategy** — as data accumulates, re-run the harness + simulator to
       set the initial capital (peak concurrent), per-arb clip (depth-capped), and intraday allocation
       (verify/refute the evening-cluster hypothesis). Per the owner this is sizing/tuning, **not** a hard

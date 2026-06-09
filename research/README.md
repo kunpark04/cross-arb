@@ -21,6 +21,7 @@ even compatible?" down to "here's a measured live edge."
 | 7 | [settlement-map.md](settlement-map.md) | Decision-grade settlement-identity × US-legality map per family *(partly superseded by #6)* |
 | 8 | [backtest-feasibility-and-prior-art.md](backtest-feasibility-and-prior-art.md) | Historical-data availability + backtest design + prior art |
 | 9 | [live-edge-findings.md](live-edge-findings.md) | **First validated** cross-venue weather scan — fill depth + net edges |
+| 10 | [settlement-verification.md](settlement-verification.md) | **Live rules diff (2026-06-09)** — both venues' weather markets grade off the *same* NWS CLI Daily + *same* station + matching boundaries (timing still open); resolves the settlement-identity risk. Probe: `scripts/verify_settlement.py` |
 
 ## The one-line takeaway
 
