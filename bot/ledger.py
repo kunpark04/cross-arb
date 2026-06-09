@@ -19,16 +19,27 @@ Key invariants this file demonstrates + asserts:
 """
 import math
 
-# ---- fee models (per contract, USD) ----
-def kfee(p, taker=True):
-    return (math.ceil(0.07*100*p*(1-p))/100) * (1.0 if taker else 0.25) if 0 < p < 1 else 0.0
-def pfee(p, taker=True):
-    return (0.05*p*(1-p)) * (1.0 if taker else 0.0) if 0 < p < 1 else 0.0
+# ---- fee models (USD). n = order size in contracts. Kalshi rounds the WHOLE order up to the next cent
+#      (summing per-contract ceils over-charges, e.g. 100@0.5 -> $2.00 vs the correct $1.75); polymarket
+#      fee is linear (no ceil), so per-order = n x per-contract. n=1 = the conservative per-unit fee that
+#      edge DETECTION (signal) uses; pass the real size where the order size is known (ledger booking).
+def kfee(p, n=1, taker=True):
+    if not 0 < p < 1: return 0.0
+    cents = math.ceil(0.07 * n * p*(1-p) * 100 - 1e-9)   # whole order up to next cent; eps guards float noise
+    return (cents / 100.0) * (1.0 if taker else 0.25)
+def pfee(p, n=1, taker=True):
+    if not 0 < p < 1: return 0.0
+    return (0.05 * n * p*(1-p)) * (1.0 if taker else 0.0)
 FEE = {"P": pfee, "K": kfee}
 
 def signal(px):
-    """Best cross-venue arb from prices px={p_yb,p_ya,k_yb,k_ya}. Returns dict or None.
+    """Best cross-venue arb from prices px={p_yb,p_ya,k_yb,k_ya}. Returns dict (with no_arb when none).
     dir 'P' = buy YES@P + NO@K ;  dir 'K' = buy YES@K + NO@P."""
+    # reject an internally-crossed/locked venue book (yes_bid >= yes_ask) — almost always stale or
+    # in-play data, and it manufactures a phantom 'edge'. Treat as no-arb (C3).
+    if px["p_yb"] > px["p_ya"] or px["k_yb"] > px["k_ya"]:        # strictly crossed (locked bid==ask is ok)
+        return {"dir": "P", "yes_ask": px["p_ya"], "no_ask": round(1 - px["k_yb"], 4),
+                "net_edge": 0.0, "no_arb": True, "crossed": True}
     opts = []
     # YES@P + NO@K
     ay, an = px["p_ya"], 1-px["k_yb"]
@@ -52,19 +63,22 @@ class Ledger:
         self.entries = []
 
     # buy `size` of an arb pair. dir 'P' = YES@P + NO@K ; 'K' = YES@K + NO@P
-    def enter(self, px, size, direction=None, t=None):
+    def enter(self, px, size, direction=None, t=None, force=False):
         s = signal(px)
         d = direction or s["dir"]
         if d == "P":
             vy, ay, vn, an = "P", px["p_ya"], "K", 1-px["k_yb"]
         else:
             vy, ay, vn, an = "K", px["k_ya"], "P", 1-px["p_yb"]
-        feeY, feeN = FEE[vy](ay), FEE[vn](an)
+        feeY, feeN = FEE[vy](ay, size), FEE[vn](an, size)      # per-ORDER fees (the size is known here)
         cost = ay + an
-        net_edge = ((1-cost) - feeY - feeN) * size
+        net_edge = (1-cost)*size - feeY - feeN
+        if net_edge <= 0 and not force:                        # C2: never silently book a guaranteed loss
+            raise ValueError(f"refusing non-positive-edge entry (dir {d}, net {net_edge:+.3f}); "
+                             f"pass force=True to book it anyway")
         self.pos[vy]["YES"] += size
         self.pos[vn]["NO"] += size
-        out = cost*size + (feeY+feeN)*size
+        out = cost*size + feeY + feeN
         self.cash -= out
         self.cost_basis += out
         e = {"t": t, "dir": d, "size": size, "cost": round(cost, 3),
@@ -80,8 +94,8 @@ class Ledger:
             yask = px["p_ya"] if v == "P" else px["k_ya"]
             no_bid = 1 - yask
             yq, nq = self.pos[v]["YES"], self.pos[v]["NO"]
-            total += yq*ybid - FEE[v](ybid)*yq
-            total += nq*no_bid - FEE[v](no_bid)*nq
+            total += yq*ybid - FEE[v](ybid, yq)
+            total += nq*no_bid - FEE[v](no_bid, nq)
         return round(total, 3)
 
     def settlement_pnl(self, outcome):
@@ -98,7 +112,7 @@ class Ledger:
             yask = px["p_ya"] if v == "P" else px["k_ya"]
             no_bid = 1 - yask
             yq, nq = self.pos[v]["YES"], self.pos[v]["NO"]
-            proceeds = yq*ybid - FEE[v](ybid)*yq + nq*no_bid - FEE[v](no_bid)*nq
+            proceeds = yq*ybid - FEE[v](ybid, yq) + nq*no_bid - FEE[v](no_bid, nq)
             realized += proceeds
             self.pos[v]["YES"] = 0.0; self.pos[v]["NO"] = 0.0
         self.cash += realized
@@ -190,11 +204,25 @@ def run():
     L = Ledger("S5")
     px = {"p_yb":0.59,"p_ya":0.61,"k_yb":0.67,"k_ya":0.70}
     # simulate filling only the YES@P leg (hedge leg missed)
-    L.pos["P"]["YES"] += 100; out = px["p_ya"]*100 + pfee(px["p_ya"])*100; L.cash -= out; L.cost_basis += out
+    L.pos["P"]["YES"] += 100; out = px["p_ya"]*100 + pfee(px["p_ya"], 100); L.cash -= out; L.cost_basis += out
     print(f"  filled only YES@P (no hedge). book: {L.book()}")
     print(f"  settle if YES wins: {L.settlement_pnl('YES'):+.2f}   settle if NO wins: {L.settlement_pnl('NO'):+.2f}")
     print("  -> outcome-DEPENDENT now (can lose ~$61 if NO wins). This is where 'negative' is real money,")
     print("     and a later opportunity is used to REPAIR/exit the naked leg, not to stack.")
+
+    print("\n"+"="*92)
+    print("S6 — review fixes: per-ORDER fee (C1), entry guard (C2), crossed-book rejection (C3)")
+    print("="*92)
+    assert abs(kfee(0.5, 100) - 1.75) < 1e-9 and abs(100*kfee(0.5, 1) - 2.00) < 1e-9
+    print(f"  C1: kfee(.5, n=100) = ${kfee(0.5,100):.2f}/order   vs   100x per-contract = ${100*kfee(0.5,1):.2f} (old over-charge)")
+    flat = {"p_yb":0.59,"p_ya":0.61,"k_yb":0.59,"k_ya":0.61}        # venues agree -> no positive edge
+    try:
+        Ledger("g").enter(flat, 100); raise AssertionError("enter should have refused a no-edge book")
+    except ValueError:
+        print("  C2: enter() refuses a non-positive-edge book (ValueError); force=True overrides")
+    crossed = {"p_yb":0.70,"p_ya":0.60,"k_yb":0.30,"k_ya":0.32}     # P internally crossed (bid > ask)
+    assert signal(crossed).get("crossed") and signal(crossed).get("no_arb")
+    print("  C3: signal() rejects an internally-crossed venue book as no-arb (was a phantom +edge)")
 
     print("\nAll invariants asserted OK (additive PnL + outcome-independence for locked books).")
 
