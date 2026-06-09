@@ -24,10 +24,18 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       ([0004](../decisions/0004-ledger-layer-by-default.md)).
 
 ## Next
-- [ ] **Collect persistence data** — run `bot/monitor.py` continuously for ≥1 day to capture how edges
-      persist / flip / fade. This = the **DigitalOcean droplet deploy**, GATED on owner sign-off
-      ([0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)). On-host: secrets off-git,
-      process supervision (systemd), durable `transitions.jsonl`, log pull-back.
+- [x] **Idle-market pruning** — `run_live` frees settled markets (gone from discovery for
+      `PRUNE_THRESHOLD=2` heartbeats; symmetric teardown). Verified flat heap ~7 MB over 30 sim-days vs
+      ~216 MB unpruned (`scripts/probe_monitor_footprint.py`) → droplet = **1 vCPU·1 GB·NYC1·Ubuntu 24.04**.
+- [x] **DEPLOYED + LIVE (2026-06-09)** — monitor runs 24/7 on the DO droplet (`cross-arb-droplet`,
+      `198.199.67.245`) as a confined **`cross-arb`** user (owns only `/opt/cross-arb`, `0700`;
+      `ProtectSystem=strict`). `deploy/deploy.sh` ships only the runtime cone via scp; secrets out-of-band.
+      Both streams up, logging real MLB + weather transitions. RSS ~76 MB.
+- [x] **Foolproof data pipeline** ([0009](../decisions/0009-event-date-partition-copy-keep-pull.md)) —
+      monitor partitions by **event-date** (`transitions-<date>.jsonl`, lifecycle never split at midnight) +
+      `sessions.jsonl` restart marker. `deploy/pull-data.ps1` = copy-keep + sha256-verified + idempotent
+      mirror to `Kalshi/data/cross-arb/`, gzips finalized days; scheduled daily (`PullCrossArbData`, 8:30am).
+- [ ] **Let it run + pull** — accumulate ≥days of `Kalshi/data/cross-arb/` data; spot-check the daily pull.
 - [ ] **Go/no-go gate** — from the collected data, decide whether the edge is persistent/scalable enough
       to build the live trading bot. File the verdict as a decision when reached.
 - [ ] **(then, per user) Live-bot trade-selection** — wire `ledger.py` to live monitor signals: capital

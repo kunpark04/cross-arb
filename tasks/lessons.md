@@ -80,3 +80,26 @@ new league) matches nothing and vanishes silently. The first discovery run surfa
 *live* universe against the config and **loudly reports** anything unmapped. `build_colisted_map()`
 returns that report and the monitor logs it every heartbeat. Detection ≠ auto-inclusion — a human still
 decides whether a flagged category is worth mapping ([decision 0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)).
+
+## L8 — systemd has NO inline comments; a trailing `# …` silently breaks the directive
+
+**Pattern:** the `cross-arb-monitor.service` unit had `ProtectSystem=strict          # whole FS read-only`
+and `ReadWritePaths=/opt/cross-arb/scripts/_data   # … except the JSONL sink`. systemd parsed the **entire
+rest of the line** as the value → "Failed to parse protect system value, ignoring" and "ReadWritePaths path
+is not absolute, ignoring: #". Both hardening directives were **silently dropped** (non-fatal warnings), so
+the service ran *without* the read-only-FS confinement I thought I'd applied. Caught only because
+post-deploy verification ran `systemctl show -p ProtectSystem` instead of trusting "active (running)".
+
+**Rule:** **never put an inline/trailing comment on a systemd directive line** — comments must be on their
+own line starting with `#`. And **verify hardening took effect** with `systemctl show -p <Directive>`
+(active ≠ configured-as-intended); a unit can run fine while half its `[Service]` settings were ignored.
+
+## L9 — Don't trust "active (running)"; verify the thing you actually changed, end-to-end
+
+**Pattern:** related to L8 — a deploy can report `active (running)` while a load-bearing property is silently
+off (ProtectSystem ignored; or a write path that the read-only sandbox would block). The green status said
+nothing about whether confinement worked **or** whether the monitor could still write its log under it.
+
+**Rule:** verify the **specific property you changed**, not a proxy. After enabling `ProtectSystem=strict`,
+confirm both that it's effective (`systemctl show`) **and** that the intended write still succeeds (the log
+file grew). "It started" is not "it does what I changed it to do."

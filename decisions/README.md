@@ -27,3 +27,4 @@ be expensive or confusing to silently reverse. Capture *why*, not just *what* â€
 | [0006](0006-deploy-on-digitalocean-consult-first.md) | Live loggers + bot deploy to a DigitalOcean droplet; consult owner before any deploy | Accepted |
 | [0007](0007-readonly-kalshi-key-least-privilege.md) | Use the read-only Kalshi key for the monitor; keep trade-capable keys out of the repo | Accepted |
 | [0008](0008-colisted-map-discovery-and-coverage-audit.md) | Co-listed map rebuilt by full discovery + coverage-audited (never static) | Accepted |
+| [0009](0009-event-date-partition-copy-keep-pull.md) | Persistence data: event-date partitioning + checksum-verified move-pull (+ liveness alert) | Accepted |

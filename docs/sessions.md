@@ -6,6 +6,33 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-09 — Deployed live + foolproof data pipeline + liveness alerting
+
+Took the read-only monitor from build-complete to **running 24/7 on a DigitalOcean droplet**, then made the
+data collection robust and self-monitoring.
+
+- **Hardened deploy** (gated [0006](../decisions/0006-deploy-on-digitalocean-consult-first.md), owner-greenlit).
+  Droplet `cross-arb-droplet` (`198.199.67.245`, 1 vCPU·1 GB·NYC1·Ubuntu 24.04 — the *measured* sizing:
+  `scripts/probe_monitor_footprint.py` showed ~7 MB heap **flat over 30 sim-days** after **idle-market
+  pruning**, vs ~216 MB unpruned). A dedicated unprivileged **`cross-arb`** user owns only `/opt/cross-arb`
+  (`0700`); the systemd unit runs as that user with `ProtectSystem=strict`, `--forever`, `Restart=always`.
+  `deploy/deploy.sh` ships **only the runtime cone** (4 bot modules + reqs + unit) via scp; secrets
+  out-of-band; ed25519 key `cross-arb_ed25519` + `~/.ssh/config` alias. RSS ~76 MB live.
+- **Monitor changes:** `--forever`; idle-market pruning (flat memory); **event-date partitioning**
+  (`transitions-<date>.jsonl` — a market lifecycle is never split at wall-clock midnight); `sessions.jsonl`
+  restart marker; `health.json` liveness beacon. Self-tests extended; all green.
+- **Foolproof pull** (`deploy/pull-data.ps1`, [0009](../decisions/0009-event-date-partition-copy-keep-pull.md)):
+  sha256-verified, idempotent mirror to `Kalshi/data/cross-arb/`; **verified-move** of finalized days
+  (gzip local → decompress-verify == remote sha256 → delete on droplet); live files copied, never deleted.
+- **Alerting:** `deploy/healthcheck.ps1` (every 30 min) checks service-active + beacon freshness → desktop
+  balloon + `ALERT.txt` + non-zero exit on failure; closes the "is it still collecting?" gap (catches a
+  hung-but-`active` process). Both jobs scheduled via `deploy/register-tasks.ps1` (`PullCrossArbData` daily,
+  `CrossArbHealthcheck` 30 min); both test-ran clean. **All paths verified end-to-end** (move deletes a
+  synthetic finalized file after verify; alert fires on forced-stale; healthy clears the alert).
+- **Captured:** decision [0009](../decisions/0009-event-date-partition-copy-keep-pull.md); lessons **L8**
+  (systemd has no inline comments — `ProtectSystem=strict  # …` was silently ignored, caught only in
+  verification) + **L9** (verify the property you changed, not "active").
+
 ## 2026-06-08 — Version control: git init + private GitHub remote
 
 Put the project under git (it had none) and pushed it. Early in the session: `git init -b main`, verified

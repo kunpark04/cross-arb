@@ -14,8 +14,10 @@ hold to settlement, collect the gap net of fees.
 **Phase: READ-ONLY.** No capital is deployed and no orders are placed. All market data on both venues
 is public (no auth needed for books). We are measuring whether a real, persistent, scalable edge
 exists before wiring up trading keys. The read-only **persistence monitor** (`bot/monitor.py`, todo #10)
-is **built + live-verified**; an extended data-collection run is the gated DigitalOcean deploy
-([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)).
+is **DEPLOYED + LIVE** since 2026-06-09 — running 24/7 on a DigitalOcean droplet as a confined `cross-arb`
+user ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)), collecting the event-date-partitioned
+persistence dataset pulled daily to `Kalshi/data/cross-arb/` ([0009](decisions/0009-event-date-partition-copy-keep-pull.md)).
+See [deploy/README.md](deploy/README.md).
 
 ## Core findings (as of 2026-06-08)
 
@@ -44,6 +46,7 @@ doc without linking it here leaves the index incomplete.
 | [research/README.md](research/README.md) | Index of the 9 research briefs (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
 | [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
+| [deploy/README.md](deploy/README.md) | Droplet deploy artifacts (systemd unit, provision/deploy/pull-logs scripts) + droplet sizing — GATED ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)) |
 
 ## Repo layout
 
@@ -58,7 +61,9 @@ cross-arb/
 ├─ tasks/              ← todo.md (plan) + lessons.md (corrections)
 ├─ research/           ← 9 settlement / legality / venue / edge briefs
 ├─ scripts/            ← Python probes + scanners (read-only); _data/ outputs are gitignored
-└─ bot/                ← ledger.py (PnL core) + monitor.py (dual-stream logger) + kalshi_book.py + colisted_map.py
+├─ bot/                ← ledger.py (PnL core) + monitor.py (dual-stream logger) + kalshi_book.py + colisted_map.py
+├─ deploy/             ← droplet deploy: systemd unit + provision/deploy/pull-logs scripts + runbook (GATED, 0006)
+└─ requirements.txt    ← pinned runtime deps for the monitor (websockets, cryptography)
 ```
 
 ## Working agreement (project-specific)
