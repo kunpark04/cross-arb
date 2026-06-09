@@ -23,6 +23,8 @@ even compatible?" down to "here's a measured live edge."
 | 9 | [live-edge-findings.md](live-edge-findings.md) | **First validated** cross-venue weather scan — fill depth + net edges |
 | 10 | [settlement-verification.md](settlement-verification.md) | **Live rules diff (2026-06-09, updated)** — both venues' weather markets grade off the *same* NWS CLI Daily + *same* station; boundary equality now **verified** on a low-tail AND a middle 2° bucket (and enforced in `colisted_map.py`); **timing resolved** (pmus FAQ specifies 8 AM / 11 AM-if-CLI≠METAR — primary-source; downward-correction asymmetry narrowed, not eliminated). Probe: `scripts/verify_settlement.py` |
 | 11 | [sports-settlement-verification.md](sports-settlement-verification.md) | **Live sports rules diff (2026-06-09)** — normal completed games agree, but the **void/abandonment/reschedule tail diverges** (esports abandonment → pmus "last fair price" vs Kalshi silent; tennis >2wk reschedule → pmus $0.50). Sports is settlement-clean only for games expected to complete. Probe: `scripts/verify_sports_settlement.py` |
+| 12 | [execution-feasibility-2026-06-09.md](execution-feasibility-2026-06-09.md) | **Read-only empirical tests** — latency (~86–261ms, network-bound), shadow leg-fill (hit-rate collapses with latency; sub-second regime now instrumented), settlement reconciliation (inconclusive + pmus finalization-lag/unreliable-interim finding), adverse-selection (instrumented). Probes: `latency_probe`/`shadow_fill`/`settle_recon`/`adverse_selection.py` |
+| — | [latency-playbook.md](latency-playbook.md) | Engineering playbook: 18 latency-reduction levers ranked by leverage (location+connections+concurrency dominate; Rust/C++ is Tier 4, deferred until edge proven) |
 
 ## The one-line takeaway
 

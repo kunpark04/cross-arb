@@ -57,6 +57,12 @@ read access, never to trade in this phase.
 - `analyze_persistence.py` — **analysis harness**: reconstructs cross-venue edge EPISODES (OPEN->CLOSE per market, restart-aware) from the pulled `../../data/cross-arb/transitions-*.jsonl[.gz]` + `sessions.jsonl`; reports edge magnitude / persistence (fill window) / capturable rate / scalability. `--selftest` ⭐
 - `capital_sim.py` — **capital / throughput model**: from the same data (incl. the monitor's `depth` field) models hold-to-settlement concurrency (Little's Law) -> required-capital <-> daily-return frontier, W-sensitivity, and the intraday arrival profile; answers "how much initial capital / how to maximize the day". `--selftest` ⭐
 
+**Execution feasibility (read-only empirical tests, 2026-06-09 — see [research/execution-feasibility-2026-06-09.md](../research/execution-feasibility-2026-06-09.md))**
+- `latency_probe.py` — read-path RTT to both venues (lower bound on order latency) + the serial-vs-concurrent two-leg floor. `--selftest`. Verdict: ~86–261ms, network-bound (compute/language is noise).
+- `shadow_fill.py` — shadow leg-fill simulator: replays the edge trajectory to measure fill-survival % / realized edge / naked-leg rate vs assumed entry latency L. `--selftest`. (sub-second regime needs the new ms-timestamp data.)
+- `settle_recon.py` — empirical invariant-#1 test: compares both venues' *settled* outcomes on co-listed markets. `--selftest`. (Surfaced: pmus `closed`≠finalized, ~2wk lag, unreliable interim data — re-run after `endDate`.)
+- `adverse_selection.py` — "why is the cheap side cheap?": attributes each edge close to cheap-rose (benign) vs dear-fell (toxic). `--selftest`. (Needs the monitor's new `px` field; accrues after redeploy.)
+
 ⭐ = the current canonical script for that job.
 
 ## `_data/` outputs (gitignored)

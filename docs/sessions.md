@@ -46,6 +46,14 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   gap)·loss`, MLB ~0.26c / other sports ~0.10c / weather 0, `--void-mult` knob) → modeled sports edge drops ~7%
   ($825→$767/day). Tagged every sports pair `void_clean=False` in `colisted_map`. Decision 0010 item 3b. The
   `p_gap`/`loss_frac` are estimates pending makeup-game data; latency + leg-fill EV (0010 items 2/3) still open.
+- **Read-only execution-feasibility tests built + run** ([research/execution-feasibility-2026-06-09.md](../research/execution-feasibility-2026-06-09.md),
+  + [latency-playbook.md](../research/latency-playbook.md)): `latency_probe.py` (RTT ~86–261ms, network-bound →
+  language is noise), `shadow_fill.py` (leg-fill hit-rate collapses with latency: 39% naked @1s, 67% @2s — but the
+  sub-second regime was below the old integer-second data resolution), `settle_recon.py` (invariant #1 empirically
+  inconclusive — **pmus `closed`≠finalized, ~2wk lag, interim outcomes unreliable/one verified wrong**),
+  `adverse_selection.py` (instrumented, accruing). Acted on the findings: `bot/monitor.py` now logs **ms
+  timestamps** (un-hides the sub-second fill regime) + per-venue `px` touches (enables adverse-selection) — both
+  take effect on the next gated deploy. Rust deferred (Tier 4; compute is irrelevant at this latency scale).
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 

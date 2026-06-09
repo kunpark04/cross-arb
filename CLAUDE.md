@@ -69,6 +69,15 @@ See [deploy/README.md](deploy/README.md).
   invariant-#2 guards in the live matcher (exact-date game binding, bucket boundary-equality, orientation
   price-guard), and the econ-legality correction. Open items tracked in [tasks/todo.md](tasks/todo.md);
   full findings in [tasks/reviewer-audit-2026-06-09.md](tasks/reviewer-audit-2026-06-09.md).
+- **Execution feasibility — read-only tests run (2026-06-09, [research/execution-feasibility-2026-06-09.md](research/execution-feasibility-2026-06-09.md)).**
+  **Latency MEASURED** (~86–261 ms RTT, network-bound → compute language is noise; Rust deferred — see
+  [research/latency-playbook.md](research/latency-playbook.md)). **Leg-fill is the gating risk**: shadow-fill shows
+  hit-rate collapses with latency (39% naked at 1 s, 67% at 2 s), but the sub-second regime where real fills live
+  was below the old integer-second data resolution — now fixed (`monitor.py` logs **ms timestamps** + per-venue
+  `px`), so it + adverse-selection become measurable after the next deploy. **Settlement identity empirically
+  OPEN**: `settle_recon.py` found pmus `closed`≠finalized (~2-week lag, unreliable interim outcomes — one verified
+  wrong), so invariant #1 stays rules-verified-only until pmus finalizes. **None of this needs capital — it needs
+  the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*, not yet a go.
 
 ## Managerial docs index
 
@@ -84,7 +93,7 @@ doc without linking it here leaves the index incomplete.
 | [docs/sessions.md](docs/sessions.md) | Session log / process changelog |
 | [decisions/README.md](decisions/README.md) | Decision-log convention + index of entries |
 | [decisions/template.md](decisions/template.md) | Skeleton for a new decision entry |
-| [research/README.md](research/README.md) | Index of the 11 research briefs (the evidence base) |
+| [research/README.md](research/README.md) | Index of the 12 research briefs + the latency playbook (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
 | [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
 | [deploy/README.md](deploy/README.md) | Droplet deploy artifacts (systemd unit, provision/deploy/pull-logs scripts) + droplet sizing — GATED ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)) |

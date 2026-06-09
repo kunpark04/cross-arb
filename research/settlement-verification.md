@@ -74,6 +74,13 @@ crossed-book rejection).
    `colisted_map.py` boundary-equality guard (`pm_bounds`/`kbounds`) now **enforces** this on every pair.
 3. **Bucket count/boundary drift** — the guard above refuses (and loudly flags) any future pair whose
    `(floor,cap)` numbers differ, so a venue changing its ladder can no longer silently mispair.
+4. **EMPIRICAL reconciliation — still open; pmus finalization lag discovered (2026-06-09,
+   `scripts/settle_recon.py`, [execution-feasibility brief](execution-feasibility-2026-06-09.md)).** Settlement
+   identity is rules-text-verified but **not yet empirically confirmed** by comparing both venues' actual graded
+   outcomes — because **pmus flips `closed:true` immediately but keeps a `endDate` ~2 weeks in the future and
+   serves an INTERIM `outcomePrices` that can be WRONG** (a verified ATP case had pmus's interim winner wrong,
+   Kalshi correct; a MIA weather day returned "Yes" for 4 disjoint buckets). So the public pmus settled value is
+   **unreliable until finalization** — re-run the recon after markets pass `endDate`.
 
 Re-run any time: `python scripts/verify_settlement.py [--city lax]` (weather) ·
 `python scripts/verify_sports_settlement.py [--league mlb]` (sports — see the sibling brief).
