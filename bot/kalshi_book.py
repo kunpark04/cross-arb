@@ -55,6 +55,11 @@ class KalshiBook:
         nb = max(self.no) if self.no else None
         return yb, (round(1.0 - nb, 4) if nb is not None else None)   # (best YES bid, best YES ask)
 
+    def offer_pairs(self):
+        """YES-ask ladder as [(ask_price, qty)] ascending (best/lowest ask first) — for depth walks.
+        YES ask = 1 - NO bid, so the highest NO bid is the lowest (best) YES ask."""
+        return [(round(1.0 - p, 6), q) for p, q in sorted(self.no.items(), reverse=True)]
+
 
 class SeqTracker:
     """Connection-level monotonic-seq guard. check(seq) is False on a gap (=> caller must resubscribe)."""

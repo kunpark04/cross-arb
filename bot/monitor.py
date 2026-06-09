@@ -60,6 +60,48 @@ def classify(prev, new, eps=0.002):
     return "WIDEN" if d > eps else "NARROW" if d < -eps else None
 
 
+# --- DEPTH: how much SIZE the arb supports, not just the touch edge. An arb = buy 1 unit of leg-A +
+#     1 unit of leg-B (YES on the cheap venue + NO on the dear venue; or back-A + back-B for a game).
+#     depth_curve walks BOTH legs' ask ladders in lockstep and reports cumulative fillable PAIRS while
+#     the marginal GROSS pair edge (1 - a_ask - b_ask) stays >= each threshold (gross; pick a threshold
+#     that absorbs fees). This is what answers "how big a clip / how much capital per arb". --------------
+DEPTH_THRESHOLDS = (0.02, 0.01, 0.0)
+
+def _pairs(levels):                                  # [{px:{value},qty}] -> [(price, qty)] (keeps order)
+    out = []
+    for l in (levels or []):
+        try: out.append((float(l["px"]["value"]), float(l["qty"])))
+        except (KeyError, ValueError, TypeError): pass
+    return out
+
+def _no_ask_pairs(bid_levels):                       # YES bids (desc px) -> NO-asks (asc px): 1 - yes_bid
+    return [(round(1.0 - p, 6), q) for p, q in _pairs(bid_levels)]
+
+def depth_curve(a_ladder, b_ladder, thresholds=DEPTH_THRESHOLDS):
+    """Cumulative fillable contract-PAIRS while the marginal gross pair edge stays >= each threshold.
+    a_ladder/b_ladder are [(ask_price, qty)] ascending by price (the asks you'd consume). Returns
+    {threshold: pairs}. Pure; two-pointer merge over both ask ladders."""
+    out = {t: 0.0 for t in thresholds}
+    lo, i, j = min(thresholds), 0, 0
+    a_rem = a_ladder[0][1] if a_ladder else 0.0
+    b_rem = b_ladder[0][1] if b_ladder else 0.0
+    while i < len(a_ladder) and j < len(b_ladder):
+        edge = 1.0 - a_ladder[i][0] - b_ladder[j][0]
+        if edge < lo: break
+        step = min(a_rem, b_rem)
+        if step <= 1e-9: break
+        for t in thresholds:
+            if edge >= t: out[t] += step
+        a_rem -= step; b_rem -= step
+        if a_rem <= 1e-9: i += 1; a_rem = a_ladder[i][1] if i < len(a_ladder) else 0.0
+        if b_rem <= 1e-9: j += 1; b_rem = b_ladder[j][1] if j < len(b_ladder) else 0.0
+    return out
+
+def _depth_dict(a_ladder, b_ladder):                 # labelled, JSON-safe (contracts at gross >= 2c/1c/0c)
+    d = depth_curve(a_ladder, b_ladder)
+    return {"c2": round(d[0.02]), "c1": round(d[0.01]), "c0": round(d[0.0])}
+
+
 class MarketTracker:
     """Holds the latest YES book per venue for ONE co-listed market and emits transitions.
     `evaluate()` classifies the current COMPLETE dual-venue state against the last complete state."""
@@ -71,11 +113,24 @@ class MarketTracker:
     def set_book(self, venue, bids, offers):
         self.books[venue] = (bids, offers)
 
+    def _depth(self):
+        """Fillable PAIRS for the binding direction: YES on the cheaper-ask venue, NO on the higher-bid
+        (cheaper-NO) venue. Returns {c2,c1,c0} (contracts at gross marginal edge >= 2c/1c/0c) or None."""
+        (pb, po), (kb, ko) = self.books["P"], self.books["K"]
+        pya, kya, pyb, kyb = best_px(po), best_px(ko), best_px(pb), best_px(kb)
+        if None in (pya, kya, pyb, kyb): return None
+        yes_off = po if pya <= kya else ko             # cheapest YES ask
+        no_bids = pb if pyb >= kyb else kb             # highest YES bid -> cheapest NO
+        return _depth_dict(_pairs(yes_off), _no_ask_pairs(no_bids))
+
     def evaluate(self):
         """Classify the current complete state vs the last; advance state; return (label, state)."""
         (pb, po), (kb, ko) = self.books["P"], self.books["K"]
         px = make_px(pb, po, kb, ko)
         new = edge_state(px) if px else None
+        if new and new["arb"]:
+            try: new["depth"] = self._depth()      # additive; never let depth crash the live collector
+            except Exception: new["depth"] = None
         label = classify(self.state, new)
         if new is not None:
             self.state = new
@@ -113,6 +168,8 @@ class GameTracker:
         self.pm = (None, None)          # polymarket (best YES bid, best YES ask)
         self.ka = self.kb = None        # Kalshi best YES ask on ticker_a / ticker_b
         self.state = None
+        self.pm_bids = self.pm_offers = None       # full ladders (for depth; additive — edge uses scalars)
+        self.ka_book = self.kb_book = None         # KalshiBook per team (for depth)
 
     def set_pm(self, bid, ask):
         self.pm = (bid, ask)
@@ -121,8 +178,29 @@ class GameTracker:
         if side == "A": self.ka = yes_ask
         else: self.kb = yes_ask
 
+    def feed_pm(self, bids, offers):       # full polymarket ladders for depth (optional)
+        self.pm_bids, self.pm_offers = bids, offers
+
+    def feed_kalshi(self, side, book):     # the KalshiBook for depth (optional)
+        if side == "A": self.ka_book = book
+        else: self.kb_book = book
+
+    def _depth(self):
+        """Fillable PAIRS (back-A + back-B) on the cheaper venue per side. Returns {c2,c1,c0} or None."""
+        if self.pm_bids is None or self.ka_book is None or self.kb_book is None: return None
+        pm_bid, pm_ask = best_px(self.pm_bids), best_px(self.pm_offers)
+        kA, kB = self.ka_book.best()[1], self.kb_book.best()[1]
+        if None in (pm_bid, pm_ask, kA, kB): return None
+        pm_backB = round(1 - pm_bid, 4)
+        a = _pairs(self.pm_offers) if pm_ask <= kA else self.ka_book.offer_pairs()       # back A cheaper
+        b = _no_ask_pairs(self.pm_bids) if pm_backB <= kB else self.kb_book.offer_pairs()  # back B cheaper
+        return _depth_dict(a, b)
+
     def evaluate(self):
         new = game_edge(self.pm[0], self.pm[1], self.ka, self.kb)
+        if new and new["arb"]:
+            try: new["depth"] = self._depth()      # additive; guarded so depth can't crash collection
+            except Exception: new["depth"] = None
         label = classify(self.state, new)
         if new is not None:
             self.state = new
@@ -187,6 +265,8 @@ class TransitionLogger:
     def write(self, market, label, state, t):
         rec = {"t": t, "market": market, "transition": label,
                "dir": state["dir"], "net_edge": round(state["net"], 4)}
+        d = state.get("depth")
+        if d: rec["depth"] = d                  # {c2,c1,c0} contracts fillable at gross >= 2c/1c/0c
         with open(os.path.join(self.dir, f"transitions-{event_partition(market)}.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
         return rec
@@ -299,6 +379,25 @@ def _selftest():
     shutil.rmtree(td, ignore_errors=True)
     print("OK - TransitionLogger: event-date partition keeps a lifecycle whole; misc fallback; sessions.jsonl")
 
+    # --- DEPTH: two-pointer fillable-pairs walk + both trackers' binding-direction logic ---
+    a = [(0.40, 10), (0.42, 20)]; b = [(0.50, 5), (0.55, 30)]
+    assert depth_curve(a, b, (0.04, 0.02, 0.0)) == {0.04: 10, 0.02: 30, 0.0: 30}     # .03-edge pair excluded at .04
+    # weather MarketTracker: YES cheap on P (.59/.60 offers), NO cheap on K (.68/.67 bids)
+    def lv(rows): return [{"px": {"value": f"{p}"}, "qty": f"{q}"} for p, q in rows]
+    wt = MarketTracker("dtest")
+    wt.set_book("P", lv([(0.57, 99)]), lv([(0.59, 10), (0.60, 40)]))
+    wt.set_book("K", lv([(0.68, 20), (0.67, 50)]), lv([(0.70, 99)]))
+    assert wt._depth() == {"c2": 50, "c1": 50, "c0": 50}, wt._depth()
+    # sports GameTracker: back A on P (.50 offers), back B on Kalshi-B (yes_ask .44 from a .56 NO bid)
+    g = GameTracker("gd", "KA", "KB")
+    g.set_pm(0.48, 0.50); g.set_kalshi("A", 0.55); g.set_kalshi("B", 0.44)
+    g.feed_pm(lv([(0.48, 10)]), lv([(0.50, 8)]))
+    ka = KalshiBook("KA"); ka.apply_snapshot({"no_dollars_fp": [["0.45", "30"]]})    # yes ask 1-.45=.55
+    kb = KalshiBook("KB"); kb.apply_snapshot({"no_dollars_fp": [["0.56", "30"]]})    # yes ask 1-.56=.44
+    g.feed_kalshi("A", ka); g.feed_kalshi("B", kb)
+    assert g._depth() == {"c2": 8, "c1": 8, "c0": 8}, g._depth()                     # min(pm 8, kB 30) = 8 pairs
+    print("OK - depth: fillable-pairs walk + weather/sports binding-direction + Kalshi offer_pairs")
+
 
 # ============================================================================================
 # LIVE LAYER  (both venue streams validated; weather=MarketTracker, sports=GameTracker; deploy gated)
@@ -386,9 +485,9 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
         for e in colisted["sports"]:              # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
             if e["slug"] in pm_targets: continue
             g = GameTracker(e["slug"], e["kalshi_a"], e["kalshi_b"])
-            def pm_fn(b, o, g=g, key=e["slug"]): g.set_pm(best_px(b), best_px(o)); emit(*g.evaluate(), key)
-            def ka_fn(book, g=g, key=e["slug"]): g.set_kalshi("A", book.best()[1]); emit(*g.evaluate(), key)
-            def kb_fn(book, g=g, key=e["slug"]): g.set_kalshi("B", book.best()[1]); emit(*g.evaluate(), key)
+            def pm_fn(b, o, g=g, key=e["slug"]): g.set_pm(best_px(b), best_px(o)); g.feed_pm(b, o); emit(*g.evaluate(), key)
+            def ka_fn(book, g=g, key=e["slug"]): g.set_kalshi("A", book.best()[1]); g.feed_kalshi("A", book); emit(*g.evaluate(), key)
+            def kb_fn(book, g=g, key=e["slug"]): g.set_kalshi("B", book.best()[1]); g.feed_kalshi("B", book); emit(*g.evaluate(), key)
             pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi_a"]] = ka_fn; k_targets[e["kalshi_b"]] = kb_fn
             slug_k[e["slug"]] = [e["kalshi_a"], e["kalshi_b"]]
             new_pm.append(e["slug"]); new_k += [e["kalshi_a"], e["kalshi_b"]]
