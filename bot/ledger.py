@@ -23,8 +23,10 @@ import math
 #      (summing per-contract ceils over-charges, e.g. 100@0.5 -> $2.00 vs the correct $1.75); polymarket
 #      fee is linear (no ceil), so per-order = n x per-contract. n=1 = the conservative per-unit fee that
 #      edge DETECTION (signal) uses; pass the real size where the order size is known (ledger booking).
-def kfee(p, n=1, taker=True):
+def kfee(p, n=1, taker=True, marginal=False):
     if not 0 < p < 1: return 0.0
+    if marginal:                                          # at-scale per-contract rate (NO ceil): the right
+        return (0.07 * p*(1-p)) * (1.0 if taker else 0.25)  # threshold for DETECTION (is it +EV at any size?)
     cents = math.ceil(0.07 * n * p*(1-p) * 100 - 1e-9)   # whole order up to next cent; eps guards float noise
     return (cents / 100.0) * (1.0 if taker else 0.25)
 def pfee(p, n=1, taker=True):
@@ -40,14 +42,15 @@ def signal(px):
     if px["p_yb"] > px["p_ya"] or px["k_yb"] > px["k_ya"]:        # strictly crossed (locked bid==ask is ok)
         return {"dir": "P", "yes_ask": px["p_ya"], "no_ask": round(1 - px["k_yb"], 4),
                 "net_edge": 0.0, "no_arb": True, "crossed": True}
+    # DETECTION uses the at-scale MARGINAL Kalshi fee (no ceil): the question is "is this +EV at SOME size?"
+    # — using the n=1 ceil fee over-charges ~0.25-0.9c and would drop a real arb that's only +EV at size.
+    # The exact per-order ceil fee is applied later at booking (Ledger.enter), where the size is known.
     opts = []
-    # YES@P + NO@K
-    ay, an = px["p_ya"], 1-px["k_yb"]
-    net = (1-(ay+an)) - pfee(ay) - kfee(an)
+    ay, an = px["p_ya"], 1-px["k_yb"]                     # YES@P + NO@K
+    net = (1-(ay+an)) - pfee(ay) - kfee(an, marginal=True)
     opts.append(("P", ay, an, round(net, 4)))
-    # YES@K + NO@P
-    ay, an = px["k_ya"], 1-px["p_yb"]
-    net = (1-(ay+an)) - kfee(ay) - pfee(an)
+    ay, an = px["k_ya"], 1-px["p_yb"]                     # YES@K + NO@P
+    net = (1-(ay+an)) - kfee(ay, marginal=True) - pfee(an)
     opts.append(("K", ay, an, round(net, 4)))
     best = max(opts, key=lambda o: o[3])
     return {"dir": best[0], "yes_ask": best[1], "no_ask": best[2], "net_edge": best[3]} if best[3] > 0 else \
@@ -215,6 +218,8 @@ def run():
     print("="*92)
     assert abs(kfee(0.5, 100) - 1.75) < 1e-9 and abs(100*kfee(0.5, 1) - 2.00) < 1e-9
     print(f"  C1: kfee(.5, n=100) = ${kfee(0.5,100):.2f}/order   vs   100x per-contract = ${100*kfee(0.5,1):.2f} (old over-charge)")
+    assert abs(kfee(0.5, marginal=True) - 0.0175) < 1e-9   # DETECTION = at-scale rate (no ceil) -> no over-filter
+    print(f"  C1b: detection marginal fee = {kfee(0.5,marginal=True)*100:.2f}c  (vs n=1 ceil {kfee(0.5,1)*100:.2f}c -> would drop sub-{(kfee(0.5,1)-kfee(0.5,marginal=True))*100:.2f}c arbs)")
     flat = {"p_yb":0.59,"p_ya":0.61,"k_yb":0.59,"k_ya":0.61}        # venues agree -> no positive edge
     try:
         Ledger("g").enter(flat, 100); raise AssertionError("enter should have refused a no-edge book")

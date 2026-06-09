@@ -112,8 +112,9 @@ floats to `175.00000000000003`, so `ceil` jumped to **176** → a spurious extra
 
 **Rule:** model exchange fees on the **whole order** (size known at booking), not per-contract-summed; and
 when `ceil`-ing money, subtract a tiny epsilon (`ceil(x - 1e-9)`) so float noise at a cent boundary doesn't
-manufacture a cent. Detection (`signal`, per-$1) may keep the conservative per-unit fee — but flag it as an
-upper bound, and use the real per-order fee anywhere you compute actual PnL.
+manufacture a cent. **Detection** (`signal`, per-$1) must use the **at-scale MARGINAL** fee (no ceil) — the
+n=1 ceil fee over-charges ~0.25–0.9c and would drop a real arb that's only +EV at size (see L15); reserve the
+exact per-order ceil fee for **booking** (`Ledger.enter`, where the size is known).
 
 ## L11 — An accounting/entry function must REFUSE a non-positive-edge book, not silently book it
 
@@ -156,3 +157,16 @@ assumption (settlement identity) was self-contradicted across our own briefs and
 **Rule:** a `research/`/`README` claim must be traceable to code that does what it says + data that supports
 the magnitude; otherwise mark it preliminary/unverified. Periodically run a **fresh-eyes adversarial review**
 scoped to *only* the thesis (no spoon-fed conclusions) — it found 4 real bugs and the #1 thesis gap in one pass.
+
+## L15 — Filter a trade ONLY when its actual edge is ≤ 0; thresholds are analysis knobs, not silent filters
+
+**Pattern:** hardening added guards that, read as trade filters, dropped genuinely positive arbs — detection
+charged the n=1 ceil fee (over-stated ~0.25–0.9c → marked real at-size arbs no-arb), and the capital/
+persistence tools *defaulted* to net ≥ 1c + a liquidity floor + a freshness gate, hiding positive sub-1c /
+thin-but-real arbs. The owner caught it: "don't filter trades for no reason unless the actual edge is ≤ 0."
+
+**Rule:** the only legitimate reason to drop a candidate trade is its **actual edge ≤ 0** (at the size you'd
+trade) or **unreliable data** (stale/crossed = effectively ≤ 0). Magnitude/liquidity cutoffs are **opt-in
+analysis lenses** that must always show the unfiltered baseline alongside — never silent defaults. A thin
+book is *small* size, not *no* trade (size down, don't skip). Detection uses the **marginal (at-scale)** fee
+so nothing +EV-at-size is dropped (L10); booking uses the exact per-order fee.

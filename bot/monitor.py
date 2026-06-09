@@ -164,9 +164,9 @@ def game_edge(pm_bid, pm_ask, kA_ask, kB_ask):
     if pm_bid > pm_ask:                                        # strictly-crossed pm book -> stale
         return None
     pm_backB = round(1 - pm_bid, 4)
-    opts = [
-        ("PK", round((1 - (pm_ask + kB_ask)) - pfee(pm_ask) - kfee(kB_ask), 4)),       # A@P + B@K
-        ("KP", round((1 - (kA_ask + pm_backB)) - kfee(kA_ask) - pfee(pm_backB), 4)),    # A@K + B@P
+    opts = [   # DETECTION uses the at-scale marginal Kalshi fee (no ceil) — capture any arb +EV at size
+        ("PK", round((1 - (pm_ask + kB_ask)) - pfee(pm_ask) - kfee(kB_ask, marginal=True), 4)),       # A@P + B@K
+        ("KP", round((1 - (kA_ask + pm_backB)) - kfee(kA_ask, marginal=True) - pfee(pm_backB), 4)),    # A@K + B@P
     ]
     best = max(opts, key=lambda o: o[1])
     return {"arb": best[1] > 0, "dir": best[0], "net": best[1]}

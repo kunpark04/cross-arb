@@ -63,7 +63,7 @@ def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None):
     for e in episodes:
         if not (e["open_net"] >= edge_min and e["duration"] >= window_min and e["open_c2"] >= max(1, liq_floor)):
             continue
-        if max_age is not None and e.get("open_age") is not None and e["open_age"] > max_age:
+        if max_age and e.get("open_age") is not None and e["open_age"] > max_age:   # max_age 0/None = no age filter
             continue
         out.append(e)
     return out
@@ -83,8 +83,9 @@ def simulate(cap, max_clip, haircut, offset_h, fixed_w=None):
 
 def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floor, max_age):
     out = []; P = out.append
-    cap_raw = capturable(episodes, edge_min, window_min)
-    cap = capturable(episodes, edge_min, window_min, liq_floor=liq_floor, max_age=max_age)
+    cap = capturable(episodes, edge_min, window_min, liq_floor=liq_floor, max_age=max_age)   # baseline = every +arb
+    robust = capturable(episodes, max(edge_min, 0.01), max(window_min, 30),                  # illustrative robust subset
+                        liq_floor=max(liq_floor, 10), max_age=(max_age or 10))
     if not episodes:
         return "no episodes — nothing to simulate."
     t0 = min(e["open_t"] for e in episodes); t1 = max(e["open_t"] for e in episodes)
@@ -92,13 +93,14 @@ def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floo
     per_day = lambda n: n / span_d
 
     P("=" * 80)
-    P(f"CAPITAL / THROUGHPUT MODEL   (span {span_d:.2f} d; capturable = net>= {edge_min*100:.1f}c & lasts>= {window_min:.0f}s & has depth)")
+    P(f"CAPITAL / THROUGHPUT MODEL   (span {span_d:.2f} d; baseline = EVERY positive-edge arb; thresholds are opt-in knobs)")
     if span_d < 1: P("  *** < 1 day of data: every per-day / capital figure is PRELIMINARY noise. Tool, not verdict. ***")
-    P(f"  capturable (net & duration)        : {len(cap_raw)}   ({per_day(len(cap_raw)):.1f}/day)")
-    P(f"  CLEAN-FILLABLE (+ c2>={liq_floor}, books fresh<={max_age}s) : {len(cap)}   ({per_day(len(cap)):.1f}/day)   "
-      f"[drops {len(cap_raw)-len(cap)} as stale/thin = likely phantom; the L2 distinction]")
+    P(f"  positive-edge arbs (net>0)         : {len(cap)}   ({per_day(len(cap)):.1f}/day)   "
+      f"[filters: net>={edge_min*100:.1f}c, lasts>={window_min:.0f}s, c2>={liq_floor}, age<={max_age or 'off'}s]")
+    P(f"    of those, ROBUST (>=1c, >=30s, c2>=10, fresh<=10s): {len(robust)}   "
+      f"[the other {len(cap)-len(robust)} are smaller/thinner/stale-ish but STILL +money - NOT filtered out]")
     if not cap:
-        return "\n".join(out) + "\n(no CLEAN-FILLABLE arbs at these thresholds yet — the persistent ones look stale/thin)"
+        return "\n".join(out) + "\n(no positive-edge arbs in the data yet)"
 
     sizes = [min(e["open_c2"], max_clip) for e in cap]
     P("")
@@ -178,13 +180,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="cross-arb capital / throughput model")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--data-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "data", "cross-arb"))
-    ap.add_argument("--edge-min", type=float, default=0.01)
-    ap.add_argument("--window-min", type=float, default=30)
+    ap.add_argument("--edge-min", type=float, default=0.0, help="min net edge fraction (default 0 = every positive arb)")
+    ap.add_argument("--window-min", type=float, default=0, help="min episode duration s (default 0 = any)")
     ap.add_argument("--max-clip", type=int, default=1000, help="max contracts per arb (depth-capped below this)")
     ap.add_argument("--haircut", type=float, default=0.0, help="latency/slippage haircut on net edge (fraction)")
     ap.add_argument("--settle-offset-h", type=float, default=28.0, help="settlement = event-date 00:00 UTC + this")
-    ap.add_argument("--liq-floor", type=int, default=10, help="min open depth c2 (contracts) for clean-fillable")
-    ap.add_argument("--max-age", type=float, default=10.0, help="max book staleness (s) at open for clean-fillable")
+    ap.add_argument("--liq-floor", type=int, default=1, help="min open depth c2 (default 1 = no liquidity filter)")
+    ap.add_argument("--max-age", type=float, default=0.0, help="max book staleness s at open (default 0 = no age filter)")
     a = ap.parse_args()
     if a.selftest:
         _selftest(); sys.exit(0)

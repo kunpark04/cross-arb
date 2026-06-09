@@ -260,8 +260,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="cross-arb persistence analysis")
     ap.add_argument("--selftest", action="store_true", help="run the offline synthetic verification")
     ap.add_argument("--data-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "data", "cross-arb"))
-    ap.add_argument("--edge-min", type=float, default=0.01, help="min net_edge (fraction) to count capturable (default 0.01 = 1c)")
-    ap.add_argument("--window-min", type=float, default=30, help="min episode duration (s) to count capturable (default 30)")
+    ap.add_argument("--edge-min", type=float, default=0.0, help="min net_edge fraction for 'capturable' (default 0 = every positive arb)")
+    ap.add_argument("--window-min", type=float, default=0, help="min episode duration s for 'capturable' (default 0 = any)")
     args = ap.parse_args()
 
     if args.selftest:
