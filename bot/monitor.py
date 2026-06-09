@@ -5,7 +5,8 @@ and logs edge STATE-TRANSITIONS (open / close / flip / widen / narrow) to JSONL 
 that drives the ledger's layer-vs-rotate rule (bot/ledger.py, decision 0004). It does NOT place orders.
 
   python bot/monitor.py              # runs the OFFLINE self-test of the transition core (no network)
-  python bot/monitor.py --live       # GATED: opens live streams (needs creds + the co-listed map)
+  python bot/monitor.py --live 75    # GATED: bounded live run ~75s (needs creds + the co-listed map)
+  python bot/monitor.py --forever    # GATED: unbounded live run for systemd supervision (droplet deploy)
 
 DEPLOYMENT: intended to run as a long-lived logger on a DigitalOcean droplet. Per the owner's
 2026-06-08 instruction, DO NOT deploy this anywhere without consulting them first (decision 0006).
@@ -18,7 +19,7 @@ polymarket.us WS protocol — VERIFIED 2026-06-08 via scripts/probe_pmus_ws_auth
 Kalshi WS (orderbook_delta) is the second stream — RSA-PSS auth + snapshot/delta merge VALIDATED
 (bot/kalshi_book.py); both streams feed the same MarketTracker. See research/kalshi-venue-audit.md.
 """
-import os, sys, json, time
+import os, sys, re, json, time
 sys.path.insert(0, os.path.dirname(__file__))
 from ledger import signal, pfee, kfee  # cross-venue edge + fee models (single source of truth)
 from kalshi_book import KalshiBook, SeqTracker, kalshi_ws_headers  # Kalshi snapshot/delta merge
@@ -160,17 +161,49 @@ class FlipDebouncer:
             t, _, st = self.pending.pop(key); self.last_arb_dir.pop(key, None)
             out.append(("CLOSE", st, key))
         return out
+    def forget(self, key):                     # drop a settled market's debounce state (called on prune)
+        self.pending.pop(key, None)
+        self.last_arb_dir.pop(key, None)
+
+
+def event_partition(market):
+    """Partition key = the event date embedded in the market slug (YYYY-MM-DD): e.g.
+    'aec-mlb-sea-bal-2026-06-10' -> '2026-06-10', 'tc-temp-laxhigh-2026-06-09-...' -> '2026-06-09'.
+    Partitioning by the EVENT date (not the wall-clock day) keeps a market's whole edge lifecycle in
+    ONE file even when it straddles UTC midnight — so nothing is ever cut off. No date -> 'misc'."""
+    m = re.search(r"\d{4}-\d{2}-\d{2}", str(market))
+    return m.group(0) if m else "misc"
 
 
 class TransitionLogger:
-    """Append-only JSONL sink. One line per logged edge transition."""
-    def __init__(self, path):
-        self.path = path
+    """Append-only JSONL sink, PARTITIONED BY EVENT-DATE: one file per event date
+    (transitions-<YYYY-MM-DD>.jsonl) so a market's full lifecycle is never split at wall-clock midnight.
+    sessions.jsonl records each monitor boot (session_start) so restart-aware analysis won't mistake a
+    post-restart re-OPEN for a genuine new edge. The droplet copy is the append-only SOURCE OF TRUTH;
+    pull-data.ps1 mirrors it read-only (copy-keep, checksum-verified) and never mutates these files."""
+    def __init__(self, data_dir):
+        self.dir = data_dir
+        os.makedirs(data_dir, exist_ok=True)    # _data/ is gitignored => may not exist on a fresh host
     def write(self, market, label, state, t):
         rec = {"t": t, "market": market, "transition": label,
                "dir": state["dir"], "net_edge": round(state["net"], 4)}
-        with open(self.path, "a") as f:
+        with open(os.path.join(self.dir, f"transitions-{event_partition(market)}.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
+        return rec
+    def session_start(self, info):
+        """Append a session_start marker (one per monitor boot) to sessions.jsonl."""
+        rec = {"t": int(time.time()), "event": "session_start", **info}
+        with open(os.path.join(self.dir, "sessions.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return rec
+    def health(self, info):
+        """Atomically overwrite health.json — a liveness beacon (timestamp + counts) the off-box
+        healthcheck reads to catch a dead/hung monitor (a hung-but-'active' process stops freshening it)."""
+        rec = {"t": int(time.time()), **info}
+        tmp = os.path.join(self.dir, "health.json.tmp")
+        with open(tmp, "w") as f:
+            f.write(json.dumps(rec))
+        os.replace(tmp, os.path.join(self.dir, "health.json"))   # atomic: a reader never sees a partial file
         return rec
 
 
@@ -231,6 +264,41 @@ def _selftest():
     assert d3.flush(0.5) == [] and d3.flush(2.0) == [("CLOSE", Ac, "m")]   # real close flushes post-window
     print("OK - FlipDebouncer: FLIP coalesce, flicker suppress, CLOSE flush")
 
+    # --- idle-market pruning: 2-miss debounce, then symmetric teardown frees every reference ---
+    absent = {}
+    assert prune_decision({"a", "b", "c"}, {"a"}, absent) == set()        # round 1: b,c missing once -> hold
+    assert absent == {"a": 0, "b": 1, "c": 1}
+    assert prune_decision({"a", "b", "c"}, {"a"}, absent) == {"b", "c"}   # round 2: missing twice -> prune
+    prune_decision({"a", "b"}, {"a", "b"}, absent)                        # b reappears -> miss count resets
+    assert absent["b"] == 0
+    # teardown removes the pmus closure + BOTH Kalshi tickers/books + slug map row + debouncer state
+    pmt = {"g1": lambda *a: None}; kt = {"KA": 1, "KB": 2}; bks = {"KA": object(), "KB": object()}
+    sk = {"g1": ["KA", "KB"]}; ab = {"g1": 2}; d = FlipDebouncer(1.0)
+    d.feed("OPEN", {"arb": True, "dir": "PK", "net": 0.03}, "g1", 0.0)    # seed debouncer state for g1
+    teardown("g1", pmt, kt, bks, sk, d, ab)
+    assert pmt == {} and kt == {} and bks == {} and sk == {} and ab == {}
+    assert "g1" not in d.last_arb_dir and "g1" not in d.pending
+    print("OK - prune: 2-miss debounce + symmetric teardown (closures, books, map, debounce) all freed")
+
+    # --- TransitionLogger: event-date partitioning (a lifecycle stays in ONE file) + sessions.jsonl ---
+    import tempfile, glob, shutil
+    td = tempfile.mkdtemp()
+    lg = TransitionLogger(td)
+    lg.write("aec-mlb-sea-bal-2026-06-10", "OPEN",  {"dir": "PK", "net": 0.03}, 1)
+    lg.write("tc-temp-laxhigh-2026-06-09-gte73", "OPEN", {"dir": "K", "net": 0.02}, 2)
+    lg.write("aec-mlb-sea-bal-2026-06-10", "CLOSE", {"dir": "PK", "net": -0.01}, 9)  # SAME file as its OPEN
+    lg.write("freeform-no-date", "OPEN", {"dir": "P", "net": 0.01}, 3)
+    lg.session_start({"weather": 1, "sports": 1})
+    lg.health({"weather": 1, "sports": 1})
+    assert json.load(open(os.path.join(td, "health.json")))["t"] > 0   # liveness beacon written atomically
+    names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(td, "*.jsonl")))
+    assert names == ["sessions.jsonl", "transitions-2026-06-09.jsonl",
+                     "transitions-2026-06-10.jsonl", "transitions-misc.jsonl"], names
+    body = open(os.path.join(td, "transitions-2026-06-10.jsonl")).read().strip().split("\n")
+    assert len(body) == 2, body          # OPEN + CLOSE of one market land together (no midnight split)
+    shutil.rmtree(td, ignore_errors=True)
+    print("OK - TransitionLogger: event-date partition keeps a lifecycle whole; misc fallback; sessions.jsonl")
+
 
 # ============================================================================================
 # LIVE LAYER  (both venue streams validated; weather=MarketTracker, sports=GameTracker; deploy gated)
@@ -253,6 +321,38 @@ def _pmus_auth_headers():
     sig = base64.b64encode(priv.sign(f"{ts}GET{PMUS_WS_PATH}".encode())).decode()
     return {"X-PM-Access-Key": env["PMUS_ACCESS_KEY"], "X-PM-Timestamp": ts, "X-PM-Signature": sig}
 
+
+# --- idle-market pruning: keep the working set = the LIVE co-listed universe, so a long run's memory
+#     stays FLAT instead of growing as markets settle (decision 0003's event-driven discovery is the
+#     source of truth for "still live"). Both pure; offline-tested in _selftest. -----------------------
+PRUNE_THRESHOLD = 2          # free a market after it's missing from discovery this many heartbeats (debounce)
+
+def prune_decision(tracked, current, absent, threshold=PRUNE_THRESHOLD):
+    """Which tracked pmus slugs to free. Settlement removes a market from discovery, so a slug absent
+    from `current` for `threshold` consecutive heartbeats is settled. The debounce stops a transient
+    discovery blip (API hiccup / pagination) from dropping a still-live market (it re-appears → reset).
+    Mutates `absent` (slug -> consecutive-miss count) and returns the set of slugs to tear down."""
+    to_prune = set()
+    for slug in tracked:
+        if slug in current:
+            absent[slug] = 0
+        else:
+            absent[slug] = absent.get(slug, 0) + 1
+            if absent[slug] >= threshold:
+                to_prune.add(slug)
+    return to_prune
+
+def teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent):
+    """Symmetrically remove EVERY reference to a settled market so it can be GC'd: the pmus closure, the
+    1-or-2 Kalshi closures + their KalshiBooks, the slug↔ticker map row, and the debouncer state."""
+    pm_targets.pop(slug, None)
+    for tk in slug_k.pop(slug, []):
+        k_targets.pop(tk, None)
+        books.pop(tk, None)
+    deb.forget(slug)
+    absent.pop(slug, None)
+
+
 async def run_live(logger, refresh_sec=300, debounce=1.0):
     """Open both venue WS streams, route each book delta to the right tracker, log transitions. Self-
     discovers the co-listed universe (bot/colisted_map.py): WEATHER via the 1:1 MarketTracker, SPORTS via
@@ -262,6 +362,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     from colisted_map import build_colisted_map
     shard_size = 100
     pm_targets, k_targets, conns = {}, {}, {}     # slug->fn(bids,offers) ; ticker->fn(book) ; "pm"/"k"->ws
+    books = {}                                    # Kalshi ticker -> KalshiBook (shared so prune can free it)
+    slug_k, absent = {}, {}                        # slug->[Kalshi tickers] for teardown ; slug->missed-heartbeats
     deb = FlipDebouncer(debounce)
 
     def _write(label, state, key):
@@ -279,6 +381,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             def pm_fn(b, o, trk=trk, key=e["slug"]): trk.set_book("P", b, o); emit(*trk.evaluate(), key)
             def k_fn(book, trk=trk, key=e["slug"]): trk.set_book("K", book.yes_bid_ladder(), book.yes_offer_ladder()); emit(*trk.evaluate(), key)
             pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi"]] = k_fn
+            slug_k[e["slug"]] = [e["kalshi"]]
             new_pm.append(e["slug"]); new_k.append(e["kalshi"])
         for e in colisted["sports"]:              # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
             if e["slug"] in pm_targets: continue
@@ -287,6 +390,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             def ka_fn(book, g=g, key=e["slug"]): g.set_kalshi("A", book.best()[1]); emit(*g.evaluate(), key)
             def kb_fn(book, g=g, key=e["slug"]): g.set_kalshi("B", book.best()[1]); emit(*g.evaluate(), key)
             pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi_a"]] = ka_fn; k_targets[e["kalshi_b"]] = kb_fn
+            slug_k[e["slug"]] = [e["kalshi_a"], e["kalshi_b"]]
             new_pm.append(e["slug"]); new_k += [e["kalshi_a"], e["kalshi_b"]]
         return new_pm, new_k
 
@@ -297,6 +401,10 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     register(colisted)
     print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports "
           f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
+    logger.session_start({"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
+                          "pmus": len(pm_targets), "kalshi": len(k_targets)})   # restart marker
+    logger.health({"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
+                   "pmus": len(pm_targets), "kalshi": len(k_targets)})           # liveness beacon (startup)
 
     async def pmus_stream():
         async with websockets.connect(PMUS_WS, additional_headers=_pmus_auth_headers()) as ws:
@@ -321,7 +429,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                 await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
                     "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}}))
             await subscribe(list(k_targets))
-            books, st = {}, SeqTracker()
+            st = SeqTracker()                          # books is shared (run_live scope) so prune can free it
             async for raw in ws:
                 o = json.loads(raw)
                 if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> resync all
@@ -354,7 +462,18 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                 await conns["k"].send(json.dumps({"id": 2, "cmd": "subscribe",
                     "params": {"channels": ["orderbook_delta"], "market_tickers": new_k}}))
             if new_pm:
-                print(f"[discovery] +{len(new_pm)} new markets subscribed (settled ones idle out)")
+                print(f"[discovery] +{len(new_pm)} new markets subscribed")
+            # FREE settled markets: anything gone from discovery for PRUNE_THRESHOLD heartbeats. Keeps the
+            # working set = the live universe, so memory stays flat over a multi-week run (no leak).
+            current = {e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
+            stale = prune_decision(set(pm_targets), current, absent)
+            for slug in stale:
+                teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent)
+            if stale:
+                print(f"[prune] freed {len(stale)} settled markets; now tracking "
+                      f"{len(pm_targets)} pmus / {len(k_targets)} Kalshi ({len(books)} live books)")
+            logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
+                           "pmus": len(pm_targets), "kalshi": len(k_targets)})   # refresh liveness beacon
 
     async def flusher():            # emit debounced CLOSEs whose flip-window elapsed
         while True:
@@ -366,16 +485,24 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
 
 
 if __name__ == "__main__":
-    if "--live" in sys.argv:
+    if "--forever" in sys.argv or "--live" in sys.argv:
         import asyncio
         nums = [int(a) for a in sys.argv[1:] if a.isdigit()]
-        secs = nums[0] if nums else 60
-        refresh = nums[1] if len(nums) > 1 else 300        # optional 2nd arg: re-discovery interval (sec)
-        out = os.path.join(os.path.dirname(__file__), "..", "scripts", "_data", "transitions.jsonl")
-        print(f"LIVE read-only dual-stream ~{secs}s (refresh {refresh}s) -> {out}  (no orders; deploy gated, 0006)")
-        try:
-            asyncio.run(asyncio.wait_for(run_live(TransitionLogger(out), refresh_sec=refresh), timeout=secs))
-        except (asyncio.TimeoutError, KeyboardInterrupt):
-            print(f"stopped after ~{secs}s")
+        out = os.path.join(os.path.dirname(__file__), "..", "scripts", "_data")  # dir; partitioned by event-date
+        if "--forever" in sys.argv:                         # systemd-supervised continuous run (droplet)
+            refresh = nums[0] if nums else 300              # optional arg: re-discovery interval (sec)
+            print(f"LIVE read-only dual-stream FOREVER (refresh {refresh}s) -> {out}/transitions-<date>.jsonl  (no orders; deploy gated, 0006)")
+            try:
+                asyncio.run(run_live(TransitionLogger(out), refresh_sec=refresh))
+            except KeyboardInterrupt:
+                print("stopped (signal)")                   # systemd SIGTERM; each line is durable (open/append/close)
+        else:                                               # bounded local run: --live [secs] [refresh]
+            secs = nums[0] if nums else 60
+            refresh = nums[1] if len(nums) > 1 else 300     # optional 2nd arg: re-discovery interval (sec)
+            print(f"LIVE read-only dual-stream ~{secs}s (refresh {refresh}s) -> {out}/transitions-<date>.jsonl  (no orders; deploy gated, 0006)")
+            try:
+                asyncio.run(asyncio.wait_for(run_live(TransitionLogger(out), refresh_sec=refresh), timeout=secs))
+            except (asyncio.TimeoutError, KeyboardInterrupt):
+                print(f"stopped after ~{secs}s")
     else:
         _selftest()

@@ -1,0 +1,40 @@
+[Unit]
+Description=cross-arb read-only persistence monitor (dual-stream cross-venue edge logger)
+Documentation=https://github.com/kunpark04/cross-arb
+# decision 0006: deploy is GATED — this unit only runs after explicit owner sign-off.
+After=network-online.target
+Wants=network-online.target
+# if it dies >20x in 5min it's a real fault (bad creds/endpoint), not a blip — stop hammering.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+# dedicated unprivileged user; owns ONLY /opt/cross-arb (mode 0700). Created by provision.sh.
+User=cross-arb
+Group=cross-arb
+WorkingDirectory=/opt/cross-arb
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/cross-arb/.venv/bin/python -u bot/monitor.py --forever 300
+Restart=always
+RestartSec=5
+
+# --- read-only hardening: this box must NEVER be able to do more than log. ---
+# (systemd has NO inline comments — directive + trailing '# ...' silently breaks the value.)
+NoNewPrivileges=true
+# whole filesystem read-only EXCEPT the one JSONL sink granted by ReadWritePaths
+ProtectSystem=strict
+ReadWritePaths=/opt/cross-arb/scripts/_data
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cross-arb-monitor
+
+[Install]
+WantedBy=multi-user.target

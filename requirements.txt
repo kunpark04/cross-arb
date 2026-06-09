@@ -1,0 +1,8 @@
+# cross-arb — runtime deps for the read-only persistence monitor (bot/monitor.py).
+# Market DATA on both venues is public; these libs are for the authed WS handshakes + signing only.
+# Pinned to the versions the monitor was live-verified against (2026-06-08). Python 3.11+ (dev: 3.13).
+websockets==16.0      # async client used by run_live() (additional_headers= kwarg => needs >=12)
+cryptography==46.0.5  # Ed25519 (polymarket.us) + RSA-PSS (Kalshi) handshake signing
+
+# Optional — only for the standalone sync probe `python bot/kalshi_book.py --live` (not the monitor):
+# websocket-client==1.8.0
