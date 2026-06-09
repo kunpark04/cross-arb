@@ -27,18 +27,23 @@ See [deploy/README.md](deploy/README.md).
   so the spread is event-driven. **Only crypto is genuinely US-blocked** (absent from polymarket.us). So the
   US-legal overlap is **econ + weather + sports** (+ politics). *(Corrected 2026-06-09 reviewer audit C7 — the
   earlier "CPI/FOMC US-blocked, overlap = weather+sports" was refuted by the project's own live catalog pull.)*
-- **Settlement identity for weather: source + station VERIFIED, bucket boundaries spot-checked (low-tail only)**
+- **Settlement identity for weather: source + station + bucket boundaries VERIFIED**
   (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped cities grade off the **same** NWS Climatological
-  Report (Daily), at the **same station** (incl. NYC = Central Park). Bucket boundaries match on the **sampled
-  low-tail** buckets only — middle 2°F buckets (where the modal high lands) and inclusive/exclusive-edge +
-  rounding alignment are **NOT yet programmatically compared** (`colisted_map.py` now FLAGS+refuses any
-  boundary-mismatched pair). This refutes the old NWS-vs-Wunderground
-  source-divergence fear (`miami-temp-arb.html`). Settlement *timing* researched + live-object-read (2026-06-09):
-  both grade off the **same morning CLI**; one narrow residual risk — a *downward* morning CLI correction.
-  Kalshi's side is now **primary-source confirmed** (rules say *"final value"*, a live MIA market expires
-  10 AM EDT — it waits past 8 AM); pmus's *"locks at 8 AM"* is **still third-party** (its FAQ *and* live market
-  object carry no timing language). The **revision rate** is now logged live (`monitor.py` `cli_stream` →
-  `cli.jsonl` → `scripts/cli_revisions.py`). See [research/settlement-verification.md](research/settlement-verification.md).
+  Report (Daily), at the **same station** (incl. NYC = Central Park). Bucket boundaries verified on a low-tail
+  AND a **middle 2° bucket** (SFO `66-67°` ↔ pmus `gte66lt67f`, both inclusive `[66,67]`, same source/station);
+  `colisted_map.py` now **enforces** boundary-number equality (`pm_bounds`/`kbounds`) and refuses+flags any
+  mismatch. Refutes the old NWS-vs-Wunderground fear (`miami-temp-arb.html`). **Settlement timing RESOLVED**:
+  both sides now **primary-source confirmed** — Kalshi waits past 8 AM for the *final* (MIA expiry 10 AM EDT),
+  and the pmus weather **FAQ** specifies **8 AM**, delaying to **11 AM only for a CLI-vs-METAR inconsistency**
+  (not a downward CLI correction). So the one residual is a *downward* 8–11 AM CLI correction on a boundary day
+  (asymmetry **narrowed**, not eliminated); its **rate** is logged live (`monitor.py` `cli_stream` → `cli.jsonl`
+  → `scripts/cli_revisions.py`). See [research/settlement-verification.md](research/settlement-verification.md).
+- **Settlement identity for SPORTS: clean only for games that COMPLETE normally** (new 2026-06-09,
+  `scripts/verify_sports_settlement.py`): both venues agree on a normal winner, but the **void/abandonment/
+  reschedule tail diverges** (esports abandonment → pmus *"last fair market price"* vs Kalshi silent; tennis
+  reschedule >2 wks → pmus $0.50) → a contested game can lose **both legs**. Unmitigated beyond the live
+  `game_edge` price-sanity guard; per-league void rules (esp. MLB suspended-game) still to read.
+  See [research/sports-settlement-verification.md](research/sports-settlement-verification.md).
 - **Edge-location and scale-capacity are DIFFERENT axes.** *Edge* (the gap) lives in **inefficient corners**
   (thin, intermittent — line lag, settlement quirks); *capacity* (deployable size before you walk the book
   past the edge) lives in **depth**, and the efficient deep books (tennis/UFC/ITF) are ~$0 cross-venue
@@ -76,7 +81,7 @@ doc without linking it here leaves the index incomplete.
 | [docs/sessions.md](docs/sessions.md) | Session log / process changelog |
 | [decisions/README.md](decisions/README.md) | Decision-log convention + index of entries |
 | [decisions/template.md](decisions/template.md) | Skeleton for a new decision entry |
-| [research/README.md](research/README.md) | Index of the 10 research briefs (the evidence base) |
+| [research/README.md](research/README.md) | Index of the 11 research briefs (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
 | [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
 | [deploy/README.md](deploy/README.md) | Droplet deploy artifacts (systemd unit, provision/deploy/pull-logs scripts) + droplet sizing — GATED ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)) |

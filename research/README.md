@@ -21,7 +21,8 @@ even compatible?" down to "here's a measured live edge."
 | 7 | [settlement-map.md](settlement-map.md) | Decision-grade settlement-identity × US-legality map per family *(partly superseded by #6)* |
 | 8 | [backtest-feasibility-and-prior-art.md](backtest-feasibility-and-prior-art.md) | Historical-data availability + backtest design + prior art |
 | 9 | [live-edge-findings.md](live-edge-findings.md) | **First validated** cross-venue weather scan — fill depth + net edges |
-| 10 | [settlement-verification.md](settlement-verification.md) | **Live rules diff (2026-06-09)** — both venues' weather markets grade off the *same* NWS CLI Daily + *same* station (low-tail boundary spot-checked; middle buckets + inequality/rounding alignment still open; timing still open); resolves the source/station settlement-identity risk. Probe: `scripts/verify_settlement.py` |
+| 10 | [settlement-verification.md](settlement-verification.md) | **Live rules diff (2026-06-09, updated)** — both venues' weather markets grade off the *same* NWS CLI Daily + *same* station; boundary equality now **verified** on a low-tail AND a middle 2° bucket (and enforced in `colisted_map.py`); **timing resolved** (pmus FAQ specifies 8 AM / 11 AM-if-CLI≠METAR — primary-source; downward-correction asymmetry narrowed, not eliminated). Probe: `scripts/verify_settlement.py` |
+| 11 | [sports-settlement-verification.md](sports-settlement-verification.md) | **Live sports rules diff (2026-06-09)** — normal completed games agree, but the **void/abandonment/reschedule tail diverges** (esports abandonment → pmus "last fair price" vs Kalshi silent; tennis >2wk reschedule → pmus $0.50). Sports is settlement-clean only for games expected to complete. Probe: `scripts/verify_sports_settlement.py` |
 
 ## The one-line takeaway
 

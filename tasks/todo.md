@@ -31,9 +31,17 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
 - [x] **WARN/INFO sweep** — `smatch` ≤1-char prefix guard + `colisted_map._selftest`; `weather_arb_scan` date
       de-hardcoded (5 cities); pull-data TOCTOU re-hash; security/deploy egress hardening + RO-key warning +
       `.env.example`; settlement-VERIFIED / `age` / brief-count wording.
-- [ ] **Residual (owner / next session):** run `verify_sports_settlement.py` per league; resolve the pmus
-      weather-FAQ timing contradiction (WebFetch the live FAQ); verify middle-bucket inclusive/exclusive edge on
-      a live 2°F bucket; latency/leg-fill EV terms in the cost model (still 0010).
+- [x] **Settlement residuals closed (2026-06-09, same session):**
+      - [x] **Weather-FAQ timing contradiction RESOLVED** (WebFetch) — pmus FAQ *does* specify 8 AM / 11 AM-if-
+            CLI≠METAR (catalog brief was right; verification brief corrected). Asymmetry narrowed, not eliminated.
+      - [x] **Middle 2° bucket boundary VERIFIED** — SFO `66-67°` ↔ pmus `gte66lt67f` both `[66,67]`, same
+            source/station; enforced by the `colisted_map.py` guard.
+      - [x] **Sports settlement verifier RUN** → finding: clean for completed games, **void/abandonment tail
+            diverges** (esports → pmus "last fair price" vs Kalshi silent; tennis >2wk reschedule → $0.50).
+            New brief [research/sports-settlement-verification.md](../research/sports-settlement-verification.md).
+- [ ] **Still open (owner / next session):** per-league sports void read (esp. **MLB suspended-game** —
+      `verify_sports_settlement.py --league mlb`); model the asymmetric-void EV term + latency/leg-fill EV in the
+      cost model (still 0010); resolve the downward-CLI-correction *rate* as `cli.jsonl` accrues over weeks.
 
 ## Done (discovery → matcher → scanner → monitor)
 - [x] **1–5. Sports matcher** — Kalshi game structure discovered; robust `(league, date, abbrev)` join

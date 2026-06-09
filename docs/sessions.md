@@ -31,6 +31,13 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   egress-hardening + read-only-key warning (`bot/kalshi_book.py`) + `.env.example`.
 - **Lesson [L17](../tasks/lessons.md):** a guard on an unverified external convention (bucket inclusivity) must
   be reverified on LIVE data + raw source — two offline-green iterations were silently wrong (caught only live).
+- **Settlement residuals closed (same session, read-only):** (a) **weather-FAQ timing contradiction RESOLVED**
+  by re-reading the live FAQ — pmus *does* specify 8 AM / 11 AM-if-CLI≠METAR (the catalog brief was right);
+  asymmetry narrows, not eliminated. (b) **Middle 2° bucket boundary VERIFIED** (SFO 66-67° ↔ pmus gte66lt67f,
+  both `[66,67]`, same source/station). (c) **Sports settlement verifier RUN** → new finding + brief
+  [research/sports-settlement-verification.md](../research/sports-settlement-verification.md): clean for
+  completed games, but the **void/abandonment/reschedule tail diverges** (esports → pmus "last fair price" vs
+  Kalshi silent). Updated CLAUDE.md + settlement-verification.md + research/README accordingly.
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 
