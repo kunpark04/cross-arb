@@ -52,9 +52,14 @@ This file is the live plan; the step-by-step history is in [sessions](../docs/se
       per-transition staleness (`age`) + clean-fillable filter (L2); **verified settlement identity**
       (`scripts/verify_settlement.py` → same NWS CLI Daily + station + boundary, 5 cities;
       [research/settlement-verification.md](../research/settlement-verification.md)).
+- [ ] **All-in edge filter + cost model** ([0010](../decisions/0010-all-in-edge-filtering-and-cost-model.md)) —
+      today we filter only the QUOTED taker-fee-net edge (fees + spread in; **slippage / latency / leg-fill
+      risk OUT**). Build the all-in filter: size-aware slippage (from `depth`, + net-marginal depth curve),
+      a measured **latency** haircut (order-ack study), and a **leg-fill-failure** EV term
+      (`P(both)·quoted − P(one)·naked-loss`). Also: `make_px` per-direction (one-sided books).
 - [ ] **Open items from the review** — settlement **timing/revision** (pmus rulebook) + middle-bucket
-      boundaries; **leg-fill-failure** model + **cost-of-carry** in `capital_sim`; order-ack **latency**
-      study; live **mid-divergence** guard (L1 in the monitor); WS snapshot-vs-delta confirmation.
+      boundaries; **cost-of-carry** in `capital_sim`; live **mid-divergence** guard (L1 in the monitor);
+      WS snapshot-vs-delta confirmation.
 - [ ] **Size the bankroll + intraday strategy** — as data accumulates, re-run the harness + simulator to
       set the initial capital (peak concurrent), per-arb clip (depth-capped), and intraday allocation
       (verify/refute the evening-cluster hypothesis). Per the owner this is sizing/tuning, **not** a hard
