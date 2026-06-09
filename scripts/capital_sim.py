@@ -15,7 +15,9 @@ Model + assumptions (all knobs):
   • size/arb   = min(open depth c2 [contracts net-ish], --max-clip).  c2 = fillable while GROSS marginal
                  edge >= 2c (~net-positive after fees) — a conservative net-deployable proxy.
   • capital/arb= size x (1 - open_net) ~ ~$0.97/pair (you pay ~(1-edge) per $1 payout).
-  • profit/arb = size x max(0, open_net - --haircut).  Locked at entry, outcome-independent at settlement.
+  • profit/arb = size x max(0, BOOK-AVG edge - --haircut), where book-avg ~ (open_net + 2c-boundary)/2 (the
+                 edge DECAYS down the depth; touch edge is captured only on the touch pair). Counted ONCE per
+                 market (re-detections of the same market = one held position, not N concurrent ones - review C8).
   • hold       = open_t -> settlement proxy (event-date in the slug + --settle-offset-h). Uncertain, so a
                  W-SENSITIVITY sweep shows how capital scales with the assumed hold.
   • BASE CASE models ONE clip per capturable open; intra-episode LAYERING (add on WIDEN) is reported as
@@ -68,13 +70,30 @@ def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None):
         out.append(e)
     return out
 
-def simulate(cap, max_clip, haircut, offset_h, fixed_w=None):
-    """-> (intervals, peak_capital, avg_capital, daily_profit_unscaled_sum)."""
-    intervals, profit = [], 0.0
+DEPTH_BOUNDARY_NET = 0.005   # net edge of the DEEPEST fillable pair (~2c gross threshold minus ~1.5c fees); the
+                             # book-average realized edge across c2 contracts is ~(open_net + this)/2, not open_net.
+
+def one_per_market(cap):
+    """Collapse re-detections of the SAME market into ONE held position. A market that OPENs->CLOSEs->re-OPENs
+    is NOT N concurrent arbs -- under the hold-to-settlement base case you ENTER at the first open and hold, so
+    the re-opens are the same position flickering, not new entries. Summing each re-detection's capital/profit
+    as if simultaneous overstates both ~6-7x (review C8). Representative = the FIRST (earliest-open) episode -
+    the conservative base case (its own entry edge + depth), profit counted ONCE."""
+    rep = {}
     for e in cap:
+        m = e["market"]
+        if m not in rep or e["open_t"] < rep[m]["open_t"]: rep[m] = e
+    return list(rep.values())
+
+def simulate(cap, max_clip, haircut, offset_h, fixed_w=None):
+    """-> (intervals, peak_capital, avg_capital, daily_profit_sum). One interval PER MARKET (not per episode),
+    and profit is the BOOK-AVERAGE edge across the filled depth (trapezoid touch..2c-boundary), not touch x depth."""
+    intervals, profit = [], 0.0
+    for e in one_per_market(cap):                       # C8: de-double-count same-market re-detections
         size = min(e["open_c2"], max_clip)
         capital = size * max(0.1, 1.0 - e["open_net"])
-        profit += size * max(0.0, e["open_net"] - haircut)
+        avg_edge = max(DEPTH_BOUNDARY_NET, (e["open_net"] + DEPTH_BOUNDARY_NET) / 2.0)  # walk-the-book decay
+        profit += size * max(0.0, avg_edge - haircut)   # touch edge only on the touch pair; less as the book fills
         end = (e["open_t"] + fixed_w) if fixed_w else settle_t(e["market"], e["open_t"], offset_h)
         intervals.append((e["open_t"], end, capital))
     peak, avg = peak_and_avg(intervals)
@@ -143,9 +162,10 @@ def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floo
     for e in cap: by_cat[e["cat"]] = by_cat.get(e["cat"], 0) + 1
     P(f"  by category: " + "  ".join(f"{c}={n}" for c, n in sorted(by_cat.items())))
     P("")
-    P("CAVEATS: depth c2 is GROSS>=2c (~net-positive, refine with a fee model); settlement is a slug-date")
-    P("proxy (hence the W-sweep); base case is one clip/arb (layering would add capital + profit); and at")
-    P(f"{span_d:.2f}d this is preliminary. Re-run as data grows.")
+    P("CAVEATS: one position PER MARKET (re-detections collapsed, review C8); profit is the book-AVERAGE edge")
+    P("across the filled depth (trapezoid touch..2c-boundary), NOT touch x depth; c2 is DISPLAYED depth (gross")
+    P(">=2c), an upper bound on takeable size (never pinged); settlement is a slug-date proxy (hence the W-sweep);")
+    P(f"latency + leg-fill risk are NOT modelled (--haircut defaults 0). At {span_d:.2f}d this is preliminary.")
     P("=" * 80)
     return "\n".join(out)
 
@@ -162,9 +182,18 @@ def _selftest():
     ep = [{"market": "aec-mlb-x-y-2026-06-10", "cat": "sports", "open_t": 0, "duration": 100,
            "open_net": 0.02, "open_c2": 800, "peak_c2": 1200}]
     cap = capturable(ep, 0.01, 30); assert len(cap) == 1
-    _, peak, _, profit = simulate(cap, 500, 0.0, 28)                   # size capped 500
-    assert abs(profit - 500 * 0.02) < 1e-9                             # $10
-    assert abs(peak - 500 * (1 - 0.02)) < 1e-6                         # $490 locked
+    ints, peak, _, profit = simulate(cap, 500, 0.0, 28)               # size capped 500
+    avg_edge = (0.02 + DEPTH_BOUNDARY_NET) / 2.0                      # book-average (trapezoid), NOT touch x depth
+    assert abs(profit - 500 * avg_edge) < 1e-9                        # $6.25 (not the old $10 touch x depth)
+    assert profit < 500 * 0.02, "walk-the-book decay must reduce profit below touch x depth"
+    assert abs(peak - 500 * (1 - 0.02)) < 1e-6                        # $490 locked
+    # C8: 3 re-detections of the SAME market (overlapping, same settle) collapse to ONE position, not 3
+    re3 = [{**ep[0], "open_t": t, "open_net": n} for t, n in [(0, 0.02), (50, 0.05), (90, 0.03)]]
+    cap3 = capturable(re3, 0.01, 30); assert len(cap3) == 3
+    i3, pk3, _, pf3 = simulate(cap3, 500, 0.0, 28)
+    assert len(i3) == 1, "same-market re-detections must collapse to ONE interval (no 3x concurrent capital)"
+    assert abs(pk3 - 500 * (1 - 0.02)) < 1e-6, "peak capital is ONE position (first-entry rep), not 3 summed"
+    assert abs(pf3 - 500 * (0.02 + DEPTH_BOUNDARY_NET) / 2.0) < 1e-9  # FIRST entry (0.02) counted ONCE, book-averaged
     # filtered out when below thresholds
     assert capturable(ep, 0.05, 30) == [] and capturable([{**ep[0], "duration": 5}], 0.01, 30) == []
     # clean-fillable gates: thin depth and stale books are dropped (L2)

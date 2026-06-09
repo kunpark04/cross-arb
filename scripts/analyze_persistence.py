@@ -18,7 +18,7 @@ duration. READ-ONLY. Run `--selftest` for the synthetic verification; no args an
   python scripts/analyze_persistence.py --selftest
   python scripts/analyze_persistence.py [--data-dir PATH] [--edge-min 0.01] [--window-min 30]
 """
-import os, sys, gzip, json, glob, argparse
+import os, sys, re, gzip, json, glob, argparse
 
 WEATHER_PFX, SPORTS_PFX = "tc-", "aec-"
 def category(slug):
@@ -34,10 +34,16 @@ def _open_any(path):
     return gzip.open(path, "rt", encoding="utf-8") if path.endswith(".gz") else open(path, encoding="utf-8")
 
 def load(data_dir):
-    """Return (transitions sorted by t, sorted session_start timestamps)."""
+    """Return (transitions sorted by t, sorted session_start timestamps). AT-MOST-ONE file per event-date: a
+    raw transitions-<date>.jsonl wins over a same-date .gz, so a finalized day later recreated on the droplet
+    and re-pulled next to its old .gz is NOT double-read (review data-pipeline WARN)."""
     trans, sessions = [], []
-    for path in sorted(glob.glob(os.path.join(data_dir, "transitions-*.jsonl")) +
-                       glob.glob(os.path.join(data_dir, "transitions-*.jsonl.gz"))):
+    chosen = {}                                          # event-date token -> path (raw overrides .gz)
+    for path in glob.glob(os.path.join(data_dir, "transitions-*.jsonl.gz")) + \
+                glob.glob(os.path.join(data_dir, "transitions-*.jsonl")):   # raw second -> wins the key
+        m = re.search(r"transitions-(.+?)\.jsonl(?:\.gz)?$", os.path.basename(path))
+        chosen[m.group(1) if m else path] = path
+    for path in sorted(chosen.values()):
         with _open_any(path) as f:
             for line in f:
                 line = line.strip()
@@ -181,13 +187,16 @@ def summarize(records, sessions, episodes, edge_min, window_min):
         n = sum(1 for d in durs if d >= w)
         P(f"  lasts >= {w:>4d}s : {n:4d}/{len(durs)}  ({100.0*n/len(durs):.0f}%)")
 
-    cap = [e for e in episodes if e["open_net"] >= edge_min and e["duration"] >= window_min]
+    # CAPTURABLE must be FILLABLE: drop restart-censored (truncated durations) AND require measured depth
+    # (open_c2 >= 1) so zero-/unmeasured-depth flickers don't inflate the headline (review WARN; matches capital_sim).
+    cap = [e for e in measured if e["open_net"] >= edge_min and e["duration"] >= window_min and e["open_c2"] >= 1]
     cap_cents_day = per_day(sum(e["open_net"] for e in cap)) * 100.0
+    floor_tag = "" if window_min > 0 else "  *** NO FILL-WINDOW FLOOR (window=0): counts un-fillable flickers ***"
     P("")
-    P(f"CAPTURABLE  (open_net >= {_c(edge_min):.1f}c AND lasts >= {window_min}s)")
+    P(f"CAPTURABLE  (open_net >= {_c(edge_min):.1f}c AND lasts >= {window_min}s AND measured depth c2>=1; excl. restart-censored)")
     P(f"  episodes        : {len(cap)}   ({per_day(len(cap)):.1f}/day)")
     P(f"  by category     : " + "  ".join(f"{c}={sum(1 for e in cap if e['cat']==c)}" for c in sorted(by_cat)))
-    P(f"  scalability      : ~{cap_cents_day:.1f}c/day of capturable edge per $1 sized  (x your stake = $/day)")
+    P(f"  scalability      : ~{cap_cents_day:.1f}c/day of capturable edge per $1 sized  (x your stake = $/day){floor_tag}")
 
     P("")
     P("SENSITIVITY  capturable/day  (rows=min edge c, cols=min window s)")
