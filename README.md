@@ -18,12 +18,19 @@ fuzzy text), and (c) confirming the edge is large and persistent enough to be wo
 
 ## What we found (2026-06-08)
 
-- **The clean stuff is blocked.** Markets that settle on identical government prints (CPI, FOMC,
-  GDP, crypto) only list on *international* Polymarket, which is geoblocked for US persons. The
-  US-legal overlap of Kalshi × polymarket.us is **weather + sports**.
+- **Econ is live and US-legal — only crypto is blocked.** Macro econ (CPI, U-3, GDP, NFP, Fed) **is
+  listed and US-legal on polymarket.us** — a same-day live pull found **36 live macro markets**, each
+  grading on the same BLS/BEA/Fed print Kalshi uses. That makes econ the *structurally cleanest* subset
+  (identical government number, deterministic), though **episodic** (it only trades around scheduled
+  releases). The US-legal overlap is therefore **econ + weather + sports** (politics too); **only crypto**
+  is genuinely US-blocked (international-only). (Corrects an earlier "econ is international-only" claim.)
 - **Edge is in inefficient corners.** Deep, liquid books (tennis / UFC / ITF) are already arbitraged
-  to ~$0 cross-venue. The live edge sits in **MLB** (~$23 right now, from the newer venue's line
-  lagging) and **weather** (~$20/day gross, intermittent — appears mid-day, settles by EOD).
+  to ~$0 cross-venue. The live edge appears in **MLB** (~$23 in one snapshot, from the newer venue's
+  line lagging) and **weather** (~$20/day gross, intermittent — appears mid-day, settles by EOD).
+  **These magnitudes are PRELIMINARY and unproven:** each is drawn from a thin sample (the MLB figure
+  from ~15 min of one market; the weather figure summed over a single ~8h window) computed under a
+  fee model since found wrong, and is not yet corrected for book-walk depth decay. Treat them as
+  order-of-magnitude placeholders until the live monitor + `scripts/capital_sim.py` accumulate.
 - **The seed idea shrank but survived.** `miami-temp-arb.html` showed a fat ~24¢ Miami weather edge —
   but that came from Kalshi (NWS) vs *international* Polymarket (Weather Underground), two different
   thermometers. On the US-legal venue both grade on NWS, so the gap is ~5¢: real, clean, and small.

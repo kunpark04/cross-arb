@@ -21,11 +21,13 @@ even compatible?" down to "here's a measured live edge."
 | 7 | [settlement-map.md](settlement-map.md) | Decision-grade settlement-identity × US-legality map per family *(partly superseded by #6)* |
 | 8 | [backtest-feasibility-and-prior-art.md](backtest-feasibility-and-prior-art.md) | Historical-data availability + backtest design + prior art |
 | 9 | [live-edge-findings.md](live-edge-findings.md) | **First validated** cross-venue weather scan — fill depth + net edges |
-| 10 | [settlement-verification.md](settlement-verification.md) | **Live rules diff (2026-06-09)** — both venues' weather markets grade off the *same* NWS CLI Daily + *same* station + matching boundaries (timing still open); resolves the settlement-identity risk. Probe: `scripts/verify_settlement.py` |
+| 10 | [settlement-verification.md](settlement-verification.md) | **Live rules diff (2026-06-09)** — both venues' weather markets grade off the *same* NWS CLI Daily + *same* station (low-tail boundary spot-checked; middle buckets + inequality/rounding alignment still open; timing still open); resolves the source/station settlement-identity risk. Probe: `scripts/verify_settlement.py` |
 
 ## The one-line takeaway
 
-US-legal overlap = **weather + sports only**; both grade on the *same* deterministic source as Kalshi,
-which makes them settlement-clean but also collapses the fat spread. The clean-settlement econ/crypto
-families exist only on US-blocked international Polymarket. Full reasoning in `settlement-map.md`
-(updated by `us-legal-overlap-audit.md`).
+US-legal overlap = **econ + weather + sports** (politics too); all grade on the *same* deterministic
+source as Kalshi, which makes them settlement-clean. **Econ** (CPI/U-3/GDP/NFP/Fed) **is live and
+US-legal on polymarket.us** — a live pull found 36 macro markets settling on the same BLS/BEA/Fed
+prints Kalshi uses — and is the structurally cleanest subset, though episodic. **Only crypto** is
+genuinely US-blocked (international-only). (Corrects an earlier "econ is international-only" claim;
+crypto IS correctly blocked.) Full reasoning in `us-legal-overlap-audit.md`.

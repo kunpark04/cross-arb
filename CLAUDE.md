@@ -21,11 +21,18 @@ See [deploy/README.md](deploy/README.md).
 
 ## Core findings (as of 2026-06-09)
 
-- The clean-settlement universe (CPI/FOMC/crypto) is **US-blocked** — it only lists on *international*
-  Polymarket, which a US person can't legally trade. The US-legal overlap is **weather + sports**.
-- **Settlement identity for weather is VERIFIED** (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped
-  cities grade off the **same** NWS Climatological Report (Daily), at the **same station** (incl. NYC =
-  Central Park), with **matching** sampled bucket boundaries — refuting the old NWS-vs-Wunderground
+- **Econ (CPI/FOMC/GDP/NFP/U-3) IS live and US-legal on polymarket.us** — 36 live macro markets, each settling
+  on the *same* government print Kalshi uses (BLS/BEA/Fed); per [research/us-legal-overlap-audit.md](research/us-legal-overlap-audit.md)
+  this is the *structurally cleanest* (identical-deterministic-number) subset, though episodic/consensus-priced
+  so the spread is event-driven. **Only crypto is genuinely US-blocked** (absent from polymarket.us). So the
+  US-legal overlap is **econ + weather + sports** (+ politics). *(Corrected 2026-06-09 reviewer audit C7 — the
+  earlier "CPI/FOMC US-blocked, overlap = weather+sports" was refuted by the project's own live catalog pull.)*
+- **Settlement identity for weather: source + station VERIFIED, bucket boundaries spot-checked (low-tail only)**
+  (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped cities grade off the **same** NWS Climatological
+  Report (Daily), at the **same station** (incl. NYC = Central Park). Bucket boundaries match on the **sampled
+  low-tail** buckets only — middle 2°F buckets (where the modal high lands) and inclusive/exclusive-edge +
+  rounding alignment are **NOT yet programmatically compared** (`colisted_map.py` now FLAGS+refuses any
+  boundary-mismatched pair). This refutes the old NWS-vs-Wunderground
   source-divergence fear (`miami-temp-arb.html`). Settlement *timing* researched + live-object-read (2026-06-09):
   both grade off the **same morning CLI**; one narrow residual risk — a *downward* morning CLI correction.
   Kalshi's side is now **primary-source confirmed** (rules say *"final value"*, a live MIA market expires
@@ -36,16 +43,24 @@ See [deploy/README.md](deploy/README.md).
   (thin, intermittent — line lag, settlement quirks); *capacity* (deployable size before you walk the book
   past the edge) lives in **depth**, and the efficient deep books (tennis/UFC/ITF) are ~$0 cross-venue
   precisely *because* they're arbitraged. The scalable money is their **intersection** — a deep book
-  *transiently* dislocated: **MLB new-venue line-lag** shows edge **and** thousands of contracts of depth
-  (`lad-pit` c2≈4800), while **weather** is real edge but thin. So scaling = **breadth of depth-AND-edge
-  events** sized to each book's depth, not bigger clips in one corner ([tasks/lessons.md](tasks/lessons.md) L16).
-  **Magnitudes are PRELIMINARY:** an independent review (2026-06-09,
-  [tasks/independent-review-2026-06-09.md](tasks/independent-review-2026-06-09.md)) found the earlier
-  "$/day" prose unsupported by the thin data + a wrong fee model — treat edge size as unproven until the
-  live monitor + `scripts/capital_sim.py` accumulate. The bot decides what to trade.
-- **Hardened post-review:** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
-  `bot/monitor.py`) plus per-transition depth + staleness instrumentation, so a persistent-**fillable** edge
-  is distinguished from a persistent-**stale-phantom** one. Open items tracked in [tasks/todo.md](tasks/todo.md).
+  *transiently* dislocated: the **one observed instance** of depth-and-edge co-occurring is **MLB new-venue
+  line-lag** (`lad-pit`, n=1: c2 grew ~4.8k→16k on a fresh pre-game book over one 8h overnight window) — a
+  **hypothesis to confirm across more games, not yet a class property** (the 06-10 MLB markets did *not*
+  replicate it). So scaling = **breadth of depth-AND-edge events** sized to each book's depth, not bigger
+  clips in one corner ([tasks/lessons.md](tasks/lessons.md) L16).
+  **Magnitudes are PRELIMINARY** and come from a **single ~8h morning window** (no afternoon/evening coverage;
+  all "/day" figures are a ×3 extrapolation). Two adversarial reviews
+  ([independent-review](tasks/independent-review-2026-06-09.md), [reviewer-audit](tasks/reviewer-audit-2026-06-09.md))
+  found the earlier "$/day" prose unsupported and a capital double-count (~6–7× — now fixed in `capital_sim.py`:
+  corrected peak ≈ $13.6k / ~6%/day, still preliminary). Treat edge size as unproven until the live monitor +
+  `scripts/capital_sim.py` accumulate. The bot decides what to trade.
+- **Hardened post-review (two passes):** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
+  `bot/monitor.py`) plus per-transition depth + staleness instrumentation. `age` is a coarse staleness hint
+  (a resting-but-tradeable quote and a wedged stream both accrue large `age`); **depth** does the real
+  fillability work. Second audit (2026-06-09) added: WS reconnect (no more silent half-dead collector),
+  invariant-#2 guards in the live matcher (exact-date game binding, bucket boundary-equality, orientation
+  price-guard), and the econ-legality correction. Open items tracked in [tasks/todo.md](tasks/todo.md);
+  full findings in [tasks/reviewer-audit-2026-06-09.md](tasks/reviewer-audit-2026-06-09.md).
 
 ## Managerial docs index
 
@@ -57,10 +72,11 @@ doc without linking it here leaves the index incomplete.
 | [README.md](README.md) | Human-facing project overview, thesis, how to run |
 | [tasks/todo.md](tasks/todo.md) | Live plan + checklist; the current work item lives here |
 | [tasks/lessons.md](tasks/lessons.md) | Mistakes made → rules to not repeat them (self-improvement loop) |
+| [tasks/independent-review-2026-06-09.md](tasks/independent-review-2026-06-09.md) · [tasks/reviewer-audit-2026-06-09.md](tasks/reviewer-audit-2026-06-09.md) | The two adversarial reviews + their fix logs |
 | [docs/sessions.md](docs/sessions.md) | Session log / process changelog |
 | [decisions/README.md](decisions/README.md) | Decision-log convention + index of entries |
 | [decisions/template.md](decisions/template.md) | Skeleton for a new decision entry |
-| [research/README.md](research/README.md) | Index of the 9 research briefs (the evidence base) |
+| [research/README.md](research/README.md) | Index of the 10 research briefs (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
 | [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
 | [deploy/README.md](deploy/README.md) | Droplet deploy artifacts (systemd unit, provision/deploy/pull-logs scripts) + droplet sizing — GATED ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)) |

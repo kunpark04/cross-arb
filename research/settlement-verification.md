@@ -52,6 +52,16 @@ crossed-book rejection).
      **upper bound** on the loss rate (counts any intra-day downward move, not just 8–10 AM boundary-straddling
      ones). Live on the droplet since 2026-06-09; day-1 read = 0 revisions / 5 station-days (accrues over weeks).
 
+   **Open contradiction (flag, do not resolve here).** Two briefs disagree on whether the **pmus weather FAQ
+   specifies settlement timing**. This brief (above, §1(a)) says *"the FAQ is silent and the live object is
+   silent."* But [`polymarketus-catalog-settlement.md`](polymarketus-catalog-settlement.md) (§Weather
+   settlement — verbatim detail) quotes the pmus weather FAQ **verbatim**: *"Settlement occurs at 8:00 AM ET
+   … may be delayed to 11:00 AM ET for review."* The two cannot both be right. **Do not resolve it here** — it
+   must be settled by **re-reading the live FAQ** at <https://docs.polymarket.us/faqs/weather-faqs>. The
+   residual-risk conclusion **depends on which is correct**: if the FAQ *does* specify 8/11 AM, the asymmetry
+   **narrows** because pmus *also* delays for review — though note its 11 AM trigger is **METAR-inconsistency**,
+   not a downward CLI correction, so it does not symmetrically guard the downward-correction case.
+
    **Primary refs:** [Kalshi `NHIGH` terms](https://kalshi-public-docs.s3.amazonaws.com/contract_terms/NHIGH.pdf)
    (live `KXHIGH*`) · [polymarket.us weather FAQ](https://docs.polymarket.us/faqs/weather-faqs).
 2. **Middle buckets** — the probe sampled low-tail buckets today; re-run when 2°-wide middle buckets are

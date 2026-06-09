@@ -30,9 +30,22 @@ source, same station, same bucket boundaries).
 
 ## Consequences
 
-- The tradable universe collapses to **weather + sports** (the US-legal overlap). Edges are smaller
-  and cleaner; the fat divergence engine is gone by construction.
+- The tradable universe is the US-legal overlap: **econ + politics + weather + sports** (see the
+  2026-06-08 update below — the earlier "collapses to weather + sports" framing was wrong). Edges are
+  smaller and cleaner than the fat divergence engine, which is gone by construction.
 - Creates the project's **invariant #1 (settlement identity)** that the matcher, scanner, and ledger
   all assume. `bot/ledger.py`'s additive/outcome-independent guarantees depend on it.
 - **Revisit if:** polymarket.us adds politics/econ/crypto with Kalshi-identical settlement (would
   reopen the clean families to US persons) — tracked in `research/settlement-map.md` due-diligence list.
+
+## Update 2026-06-08 (live data)
+
+The "Revisit if" trigger above is **already satisfied** for econ + politics. Live
+`gateway.polymarket.us/v1` pulls found **econ (CPI / U-3 / GDP / NFP / Fed, 36 live macro markets)**
+and **politics** ARE listed and US-legal on polymarket.us, each econ market grading on the same
+BLS/BEA/Fed print Kalshi uses (see `research/us-legal-overlap-audit.md`). So the Context/Consequences
+claim that the universe "collapses to weather + sports" is **incorrect**: the US-legal universe is
+**econ + politics + weather + sports**, with **crypto the only still-US-blocked family** (international-
+only). The decision itself stands unchanged — invariant #1 (require an *identical* settlement source on
+both venues) is exactly what makes the now-confirmed econ overlap clean; only the scope of which
+families clear that bar has widened.
