@@ -31,13 +31,14 @@ read access, never to trade in this phase.
 - `match_kalshi.py` — match Kalshi series ↔ polymarket.us families w/ fees + settlement sources
 - `settlement_timing.py` — measure settlement hold duration + capital lockup per family
 - `kalshi_calendar.py` — forward calendar per matched series; soonest settle dates
-- `verify_settlement.py` — **settlement-identity check**: pulls BOTH venues' live rules per co-listed weather city, diffs source/station/boundary/timing + flags mismatches (resolves the #1 thesis risk) ⭐
+- `verify_settlement.py` — **settlement-identity check (weather)**: pulls BOTH venues' live rules per co-listed weather city, diffs source/station/boundary/timing + flags mismatches (resolves the #1 thesis risk) ⭐
+- `verify_sports_settlement.py` — **settlement-identity check (sports, review C5)**: per league, diffs the named result SOURCE + the void/postponement/forfeit handling on both venues (a contested game can settle the two legs opposite). `--league`
 - `cli_revisions.py` — **settlement residual-risk gauge**: from the monitor's `_data/cli.jsonl`, reports the NWS CLI daily-max **revision rate** (and the **downward** rate + drop magnitude — the settlement-relevant direction) per station-day; upper-bounds the "downward 8–10 AM correction splits the venues" loss rate. `--selftest`
 
 **Weather**
-- `nyc_align_check.py` — resolve the NYC 74–75 bucket alignment between venues
+- `nyc_align_check.py` — resolve the NYC 74–75 bucket alignment between venues (the boundary-equality logic now in `colisted_map.py`)
 - `weather_spread_snapshot.py` — live cross-venue weather spread snapshot + fee-netted lock
-- `weather_arb_scan.py` — clean, depth-aware weather arb scan with fillable size ⭐
+- `weather_arb_scan.py` — depth-aware weather scan; date now defaults to TODAY + covers 5 cities, but reads a **cached** pmus snapshot — for the live 5-city universe use `scan_all.py` (the canonical scan)
 
 **Sports**
 - `kalshi_sports_discover.py` — discover how Kalshi structures sports game-winner markets

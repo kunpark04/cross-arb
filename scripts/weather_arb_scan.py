@@ -1,6 +1,10 @@
 """Clean depth-aware cross-venue weather arb scan (Kalshi x polymarket.us), bucket-aligned,
-fee-netted, with fillable size at top-of-book. Uses PUBLIC books on both venues (no auth). Read-only."""
-import json, os, re, urllib.request, urllib.error, time, math
+fee-netted, with fillable size at top-of-book. Uses PUBLIC books on both venues (no auth). Read-only.
+
+NOTE: the Kalshi side is LIVE; the polymarket.us side reads a CACHED snapshot (_data/pmus_open_markets.json)
+so it is only as fresh as that file. The date (DK/DP) now defaults to TODAY (override the constants for a
+past day). For the live 5-city universe with a fresh pmus pull, use scripts/scan_all.py (the canonical scan)."""
+import json, os, re, urllib.request, urllib.error, time, math, datetime as _dt
 
 UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 def get(url, tries=4):
@@ -21,8 +25,10 @@ def fl(v):
     try: return float(v)
     except Exception: return 0.0
 
-CITIES = {"MIAMI": ("KXHIGHMIA", "miahigh"), "CHICAGO": ("KXHIGHCHI", "mdwhigh")}
-DK, DP = "26JUN08", "2026-06-08"
+CITIES = {"MIAMI": ("KXHIGHMIA", "miahigh"), "CHICAGO": ("KXHIGHCHI", "mdwhigh"),
+          "NYC": ("KXHIGHNY", "nychigh"), "LA": ("KXHIGHLAX", "laxhigh"), "SF": ("KXHIGHTSFO", "sfohigh")}
+_t = _dt.date.today()                                       # default to TODAY (Kalshi ticker token = YYMMMDD)
+DK, DP = _t.strftime("%y%b%d").upper(), _t.isoformat()      # e.g. 26JUN09 / 2026-06-09 (edit for a past day)
 pm_all = json.load(open(os.path.join(os.path.dirname(__file__), "_data", "pmus_open_markets.json")))
 
 def pm_topbook(slug):
