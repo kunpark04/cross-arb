@@ -55,8 +55,18 @@ def peak_and_avg(intervals):
     span = evs[-1][0] - evs[0][0]
     return peak, (area / span if span > 0 else 0.0)
 
-def capturable(episodes, edge_min, window_min):
-    return [e for e in episodes if e["open_net"] >= edge_min and e["duration"] >= window_min and e["open_c2"] >= 1]
+def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None):
+    """Capturable = big enough (open_net), persistent enough (duration), AND fillable: deep enough
+    (open_c2 >= liq_floor) and not on a stale quote (max book age at open <= max_age). The liq + age
+    gates are what separate a real fillable arb from a persistent-but-stale phantom (review finding L2)."""
+    out = []
+    for e in episodes:
+        if not (e["open_net"] >= edge_min and e["duration"] >= window_min and e["open_c2"] >= max(1, liq_floor)):
+            continue
+        if max_age is not None and e.get("open_age") is not None and e["open_age"] > max_age:
+            continue
+        out.append(e)
+    return out
 
 def simulate(cap, max_clip, haircut, offset_h, fixed_w=None):
     """-> (intervals, peak_capital, avg_capital, daily_profit_unscaled_sum)."""
@@ -71,9 +81,10 @@ def simulate(cap, max_clip, haircut, offset_h, fixed_w=None):
     return intervals, peak, avg, profit
 
 
-def report(episodes, edge_min, window_min, max_clip, haircut, offset_h):
+def report(episodes, edge_min, window_min, max_clip, haircut, offset_h, liq_floor, max_age):
     out = []; P = out.append
-    cap = capturable(episodes, edge_min, window_min)
+    cap_raw = capturable(episodes, edge_min, window_min)
+    cap = capturable(episodes, edge_min, window_min, liq_floor=liq_floor, max_age=max_age)
     if not episodes:
         return "no episodes — nothing to simulate."
     t0 = min(e["open_t"] for e in episodes); t1 = max(e["open_t"] for e in episodes)
@@ -83,9 +94,11 @@ def report(episodes, edge_min, window_min, max_clip, haircut, offset_h):
     P("=" * 80)
     P(f"CAPITAL / THROUGHPUT MODEL   (span {span_d:.2f} d; capturable = net>= {edge_min*100:.1f}c & lasts>= {window_min:.0f}s & has depth)")
     if span_d < 1: P("  *** < 1 day of data: every per-day / capital figure is PRELIMINARY noise. Tool, not verdict. ***")
-    P(f"  capturable arbs : {len(cap)}   ({per_day(len(cap)):.1f}/day)")
+    P(f"  capturable (net & duration)        : {len(cap_raw)}   ({per_day(len(cap_raw)):.1f}/day)")
+    P(f"  CLEAN-FILLABLE (+ c2>={liq_floor}, books fresh<={max_age}s) : {len(cap)}   ({per_day(len(cap)):.1f}/day)   "
+      f"[drops {len(cap_raw)-len(cap)} as stale/thin = likely phantom; the L2 distinction]")
     if not cap:
-        return "\n".join(out) + "\n(no capturable arbs at these thresholds yet)"
+        return "\n".join(out) + "\n(no CLEAN-FILLABLE arbs at these thresholds yet — the persistent ones look stale/thin)"
 
     sizes = [min(e["open_c2"], max_clip) for e in cap]
     P("")
@@ -152,7 +165,12 @@ def _selftest():
     assert abs(peak - 500 * (1 - 0.02)) < 1e-6                         # $490 locked
     # filtered out when below thresholds
     assert capturable(ep, 0.05, 30) == [] and capturable([{**ep[0], "duration": 5}], 0.01, 30) == []
-    print("  OK - peak/avg overlap, settlement proxy, size cap, profit/capital, threshold filter")
+    # clean-fillable gates: thin depth and stale books are dropped (L2)
+    assert capturable(ep, 0.01, 30, liq_floor=1000) == []                  # c2 800 < 1000 -> thin
+    stale = [{**ep[0], "open_age": 99}]
+    assert capturable(stale, 0.01, 30, max_age=10) == []                   # 99s stale -> phantom
+    assert len(capturable(stale, 0.01, 30, max_age=None)) == 1             # age filter off -> kept
+    print("  OK - peak/avg overlap, settlement proxy, size cap, profit/capital, threshold + liq/stale filters")
     print("self-test passed.")
 
 
@@ -165,6 +183,8 @@ if __name__ == "__main__":
     ap.add_argument("--max-clip", type=int, default=1000, help="max contracts per arb (depth-capped below this)")
     ap.add_argument("--haircut", type=float, default=0.0, help="latency/slippage haircut on net edge (fraction)")
     ap.add_argument("--settle-offset-h", type=float, default=28.0, help="settlement = event-date 00:00 UTC + this")
+    ap.add_argument("--liq-floor", type=int, default=10, help="min open depth c2 (contracts) for clean-fillable")
+    ap.add_argument("--max-age", type=float, default=10.0, help="max book staleness (s) at open for clean-fillable")
     a = ap.parse_args()
     if a.selftest:
         _selftest(); sys.exit(0)
@@ -174,4 +194,5 @@ if __name__ == "__main__":
         print(f"no data at {data_dir} — run `pwsh deploy/pull-data.ps1` first, or `--selftest`."); sys.exit(0)
     recs, sessions = load(data_dir)
     print(f"loaded {len(recs)} transitions + {len(sessions)} restarts from {data_dir}\n")
-    print(report(build_episodes(recs, sessions), a.edge_min, a.window_min, a.max_clip, a.haircut, a.settle_offset_h))
+    print(report(build_episodes(recs, sessions), a.edge_min, a.window_min, a.max_clip, a.haircut,
+                 a.settle_offset_h, a.liq_floor, a.max_age))

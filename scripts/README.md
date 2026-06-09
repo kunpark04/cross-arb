@@ -31,6 +31,7 @@ read access, never to trade in this phase.
 - `match_kalshi.py` — match Kalshi series ↔ polymarket.us families w/ fees + settlement sources
 - `settlement_timing.py` — measure settlement hold duration + capital lockup per family
 - `kalshi_calendar.py` — forward calendar per matched series; soonest settle dates
+- `verify_settlement.py` — **settlement-identity check**: pulls BOTH venues' live rules per co-listed weather city, diffs source/station/boundary/timing + flags mismatches (resolves the #1 thesis risk) ⭐
 
 **Weather**
 - `nyc_align_check.py` — resolve the NYC 74–75 bucket alignment between venues

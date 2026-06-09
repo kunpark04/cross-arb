@@ -50,7 +50,7 @@ def load(data_dir):
                 line = line.strip()
                 if line:
                     r = json.loads(line)
-                    if r.get("event") == "session_start":
+                    if r.get("event") in ("session_start", "kalshi_resync"):   # both force-close episodes
                         sessions.append(int(r["t"]))
     trans.sort(key=lambda r: r["t"])
     return trans, sorted(sessions)
@@ -92,9 +92,11 @@ def build_episodes(records, sessions):
             if m in open_ep:                                       # OPEN while open = restart re-detect / dup -> continuation
                 continue
             dc2 = (rec.get("depth") or {}).get("c2", 0)        # fillable contracts at gross >= 2c (net-ish)
+            ag = rec.get("age") or {}
+            open_age = max(ag.get("p", 0), ag.get("k", 0)) if ag else None   # worst book staleness at open (s)
             open_ep[m] = {"market": m, "cat": category(m), "dir": rec["dir"], "open_t": t,
                           "open_net": net, "peak_net": net, "open_c2": dc2, "peak_c2": dc2,
-                          "n_widen": 0, "n_narrow": 0, "n_flip": 0,
+                          "open_age": open_age, "n_widen": 0, "n_narrow": 0, "n_flip": 0,
                           "_acc": 0.0, "_seg_t": t, "_last_net": net}
         elif m in open_ep:
             if lab == "CLOSE":
@@ -213,14 +215,15 @@ def summarize(records, sessions, episodes, edge_min, window_min):
 # ============================================================================================
 def _selftest():
     print("persistence-analysis self-test")
-    def tr(t, m, lab, net, d="PK", c2=None):
+    def tr(t, m, lab, net, d="PK", c2=None, age=None):
         r = {"t": t, "market": m, "transition": lab, "dir": d, "net_edge": net}
         if c2 is not None: r["depth"] = {"c2": c2, "c1": c2, "c0": c2}
+        if age is not None: r["age"] = {"p": age[0], "k": age[1]}
         return r
     A = "aec-mlb-x-y-2026-06-10"; B = "tc-temp-laxhigh-2026-06-10-gte73"; C = "aec-mlb-p-q-2026-06-10"; D = "aec-nba-i-j-2026-06-10"
     recs = [
         tr(0, B, "OPEN", 0.02), tr(6, B, "OPEN", 0.02), tr(12, B, "CLOSE", -0.01),                              # B: restart at t4 cuts the 1st
-        tr(20, A, "OPEN", 0.03, c2=300), tr(25, A, "WIDEN", 0.05, c2=500), tr(28, A, "NARROW", 0.02), tr(30, A, "CLOSE", -0.01),  # clean dur10
+        tr(20, A, "OPEN", 0.03, c2=300, age=(2, 40)), tr(25, A, "WIDEN", 0.05, c2=500), tr(28, A, "NARROW", 0.02), tr(30, A, "CLOSE", -0.01),  # clean dur10
         tr(35, C, "OPEN", 0.04),                                                                                # C: never closes -> eod at last_t=45
         tr(40, D, "OPEN", 0.02), tr(43, D, "OPEN", 0.09), tr(45, D, "CLOSE", -0.01),                            # D: dup OPEN (no restart) -> one episode
     ]
@@ -231,7 +234,7 @@ def _selftest():
     a = eps[A]
     assert a["censored"] == "none" and a["duration"] == 10 and a["open_net"] == 0.03 and a["peak_net"] == 0.05, a
     assert a["n_widen"] == 1 and a["n_narrow"] == 1
-    assert a["open_c2"] == 300 and a["peak_c2"] == 500, a       # depth captured at open + peak over episode
+    assert a["open_c2"] == 300 and a["peak_c2"] == 500 and a["open_age"] == 40, a   # depth + staleness at open
     # time-weighted avg: .03*5 + .05*3 + .02*2 = .15+.15+.04 = .34 over 10 -> .034
     assert abs(a["twa_net"] - 0.034) < 1e-9, a["twa_net"]
     assert len(allB) == 2
