@@ -1,7 +1,12 @@
 # 0012 — Clip-stage allocation = edge-floor + deploy-to-full cap (not FIFO); capturable() drops restart-censored phantoms
 
 - **Date:** 2026-06-10
-- **Status:** Accepted (allocation *direction* preliminary / method-demo; the `capturable()` phantom fix is firm)
+- **Status:** Accepted (allocation *direction* preliminary / method-demo; the `capturable()` phantom fix is firm).
+  **Magnitudes corrected by [0013](0013-econ-grid-step-twin-and-measurement-integrity.md)**: the OOS
+  rows below included ONE econ position that turned out to be a settlement-identity phantom (the
+  off-by-one `≥T`↔`>T` pairing). Econ-quarantined + close-lag-corrected reruns give **+9% (5% cap) /
+  +58% (10%) / +141% (20%) vs FIFO** — not +64%/+153%/+269%. Direction (floor earns, cap diversifies,
+  FIFO loses) unchanged.
 - **Deciders:** owner + Claude
 
 ## Context

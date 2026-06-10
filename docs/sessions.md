@@ -6,6 +6,40 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-10 (UTC, later) — Full adversarial review #3 → ALL findings fixed; econ pairing + measurement integrity corrected
+
+Owner asked for a full no-shortcuts review, then "fix everything + clean the docs + full test."
+Review verified code against live venue APIs and the pulled archive; every finding fixed same-session
+([0013](../decisions/0013-econ-grid-step-twin-and-measurement-integrity.md), [econ brief](../research/econ-settlement-identity-2026-06-10.md), lessons [L21]/[L22], full fix table in [todo](../tasks/todo.md)).
+
+- **CRITICAL #1 — the econ mapping was off by one bucket** (pmus `≥T` inclusive vs Kalshi "Above T"
+  STRICT, verified in both venues' rules text): the celebrated "first econ edge" (12.2¢ U-3, depth 423)
+  was the **market-priced P(print==T)** — proven live (pmus ≥4.4 mid 0.275 ≈ twin T4.3 mid 0.33, 17¢
+  from old partner T4.4 mid 0.105). Fixed via grid-step twin join (`econ_twin`): 24 pairs → **14
+  identical** + 13 honest skips; remapped pairs show no phantom edges; pre-remap econ records
+  quarantined at the shared loader. **Allocation OOS headline corrected: +64%/+269% → +9%/+141%.**
+- **CRITICAL #2 — every CLOSE was stamped at debouncer FLUSH time** (+1.0–1.5s on every episode
+  duration; no clean episode could ever log <1s, structurally defeating the sub-second leg-fill plan).
+  Fixed (detection-time stamps; pre-fix data lag-corrected −1.25s). **Corrected shadow-fill: leg-fail
+  55.5% @1s / 62.7% @2s** (published 39%/67%); ~27% of capturable ≥1¢ edges die ~instantly.
+- **Monitor robustness**: `ws_reconnect` censoring markers (both venues); supervised heartbeat;
+  degraded-discovery prune skip; **single-subscription Kalshi invariant** (cycle on seq gap / new
+  tickers — second-subscribe semantics were never probed); doubleheader + duplicate-ticker guards;
+  one-sided-book orientation guard; maker-fee rounding per venue-audit §2.1; `scan_all` now imports the
+  bot's matchers + marginal fees (private copies had drifted); bounds-dict weather join; econ Dec/Jan
+  year fix; `cod` (KXCODGAME) mapped; analysis cohort consistency + FLIP=leg-fail + both-venue ages +
+  `open_flat`; `cli_stream` restart-dedup; `session_start` build hash.
+- **Full test**: new `scripts/selftest_all.py` — **17/17 offline self-tests green**; live discovery +
+  remapped-pair price sanity verified against both venues; full backtest pipeline re-run on the
+  corrected data (capital/account/alloc/clip/shadow/velocity/adverse/cli).
+- **Owner then greenlit both gated steps, done same session**: (1) bounded `--live 75` smoke test ran
+  clean (351 pmus / 658 Kalshi, 14 remapped econ pairs, detection-time ms stamps; the one fat record —
+  13¢ U-3 dir P — inspected and confirmed a real wide-book dislocation on a now-identical bucket, not a
+  phantom); (2) **0013 build deployed to the droplet** (sha byte-identical `bfa9e2fccf15`;
+  `session_start` self-identifies with `build`+argv; tracking 30/307/14). Epochs set:
+  `ECON_REMAP_DEPLOY_TS = DEBOUNCE_STAMP_FIXED_TS = 1781082189` — **the multi-week accumulation clock
+  restarts here on the corrected schema** (third restart: int-second build → ms+px build → 0013 build).
+
 ## 2026-06-10 (UTC) — GATED redeploy: droplet brought to current HEAD (ms+px+ECON now live)
 
 Found the live droplet was running a **pre-`dabc106` monitor** — diagnosed not by inference but by checksum:

@@ -266,3 +266,40 @@ prove they agree (a grep for the field name in the function would have caught it
 `censored`). **Instrumentation ≠ gating**: a logged field (`age`, `depth`, `px`) changes nothing until code acts on it;
 don't assume a recorded dimension is an enforced one. And reconfirms [L18]: a too-good number (19¢ on an obscure ITF match)
 is the asterisk — interrogate the raw record (age, depth-ladder shape, censor reason) before believing it.
+
+## L21 — "Same threshold number" is not "same bucket": verify the INEQUALITY semantics per family, against primary rules text
+
+**Pattern:** the econ matcher joined pmus `≥ 4.4` to Kalshi `T4.4` because the threshold *numbers* matched, and
+0011 waved the `≥`-vs-`>` difference off as "a narrow residual, akin to the weather downward-correction." It is
+not a tail: pmus "at least T" is inclusive, Kalshi "Above T" is **strict** (`strike_type: greater`, verified in
+rules text), and on a 0.1-quantized print `> T ≡ ≥ T+0.1` — so the pair is **off by one bucket** and diverges on
+a print landing exactly on T, the **modal region** for an at-the-money threshold. The market priced it: the
+"12.2¢ persistent U-3 edge with 423 contracts of depth" the monitor proudly logged was P(print==4.4), a
+both-legs-loss lottery sold as a lock; pmus `≥4.4`'s mid sat next to Kalshi `T4.3` (the true twin), 17¢ from its
+assigned partner. The bitter part: the weather matcher already encoded this exact convention correctly
+(`kbounds`: floor-tail = `[floor+1, ∞)` on the integer grid) — the knowledge existed in-repo and didn't transfer.
+
+**Rule:** for ANY threshold market pair, verify three things separately, per family, against **primary rules
+text** (never by analogy to another family): (1) the threshold **number**, (2) the **inequality** (inclusive vs
+strict — `strike_type`, "at least" vs "above"), (3) the print **grid** (one decimal? thousands?). The identical
+twin of an inclusive `≥T` against a strict-`>` venue is `floor = T − grid_step`. A residual whose probability is
+the *modal outcome* is not a residual — quantify the divergence-outcome's probability (the market itself prices
+it: adjacent-strike gaps) before calling anything "narrow." And when a *brand-new category's very first data
+point is the fattest edge on the board* ([L18]'s tell), suspect the mapping before the market.
+
+## L22 — A smoothing layer in front of a logger biases every downstream measurement; stamp DETECTION time, not emission time
+
+**Pattern:** `FlipDebouncer` held every CLOSE ~1.0–1.5 s (flip-coalesce window + flusher tick) and `_write`
+stamped `time.time()` **at flush** — so every clean episode's duration was silently inflated by ~1.0–1.5 s. That
+single emission-time stamp (a) made the shadow-fill leg-fail rate at 1 s read 39% when the lag-corrected value is
+**55.5%** (optimistic in exactly the regime the decision turns on), (b) hid that ~27% of capturable ≥1¢ edges die
+essentially instantly, and (c) made the *planned* sub-second measurement structurally impossible — with a 1 s
+hold in front of the logger, **no clean episode could ever log a duration under ~1 s**, so the ms-timestamp
+upgrade shipped to answer the sub-second question could never have answered it.
+
+**Rule:** any debounce/coalesce/smoothing layer between detection and a measurement log must carry the
+**detection timestamp** through to the record (smooth the *event stream*, never the *clock*). Before trusting a
+duration-derived metric, trace the timestamp's origin end-to-end (who calls `time.time()`, when?) — and check the
+floor: if a pipeline stage holds events for X seconds, no logged interval below X is real, and any analysis
+claiming resolution finer than X is measuring the pipeline, not the market. When retro-correcting, subtract the
+lag at the shared loader (one place), clamped so corrected times can't cross other events.

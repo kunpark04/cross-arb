@@ -38,6 +38,28 @@ lives — is **below the data's resolution** (the flat 100% at L≤0.5s is an ar
 important number — your real leg-fill rate at ~150 ms — is still unmeasured.** Fix applied: `bot/monitor.py` now logs
 **millisecond** transition timestamps, so a re-pull after the next deploy makes the sub-second curve measurable.
 
+> ## ⚠ CORRECTION (2026-06-10 full review, [0013](../decisions/0013-econ-grid-step-twin-and-measurement-integrity.md))
+>
+> The table above is **optimistically biased beyond the stated caveat**: the monitor's FlipDebouncer
+> stamped every flushed CLOSE at **flush time** (+1.0–1.5 s after the edge died), inflating every episode
+> duration — so "survived L=1 s" really meant "true duration ≳ 0 s". This also means **no logged clean
+> episode could ever show a duration < ~1 s**, structurally defeating the planned sub-second read on the
+> ms-era data until the fix (CLOSEs now carry detection time; pre-fix data is lag-corrected −1.25 s in
+> `analyze_persistence.build_episodes`). FLIPped episodes also counted as survival though the original
+> legs are the wrong direction post-flip (now leg-fail). **Corrected table** (0.86 d archive, 418
+> capturable ≥1¢ episodes, lag-corrected + FLIP=fail):
+>
+> | L | fill-survival | median realized edge | leg-fail (naked) |
+> |--:|--:|--:|--:|
+> | 0 | 72.5% | 1.97c | **27.5%** |
+> | 1 s | 44.5% | 1.91c | **55.5%** |
+> | 2 s | 37.3% | 2.01c | **62.7%** |
+> | 10 s | 20.8% | 1.66c | 79.2% |
+>
+> ~27% of capturable ≥1¢ episodes die essentially **instantly** (their entire pre-correction "duration"
+> was the flush lag). The L=0.25/0.5 rows still equal L=0 — int-second-era resolution; the sub-second
+> curve becomes measurable only with post-redeploy ms data **collected by the fixed debouncer**.
+
 ## 3. Settlement reconciliation — INCONCLUSIVE + a new pmus finding (`scripts/settle_recon.py`)
 
 Empirical test of invariant #1 (do both venues grade a co-listed market identically?). **It is not yet answerable**,

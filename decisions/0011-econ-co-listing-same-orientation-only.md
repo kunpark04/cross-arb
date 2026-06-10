@@ -1,7 +1,13 @@
 # 0011 — ECON co-listing: map CPI/U-3/NFP/GDP/Fed, but only SAME-orientation pairs
 
 - **Date:** 2026-06-09
-- **Status:** Accepted
+- **Status:** Accepted; **pairing rule superseded by [0013](0013-econ-grid-step-twin-and-measurement-integrity.md)**
+  — the `(family, period, threshold)` join below pairs pmus `≥T` (inclusive) with Kalshi "Above T"
+  (STRICT >), which is **off by one print-grid bucket**; the consequence note calling the exact-T print
+  "narrow… akin to the weather downward-correction" was **wrong** (for an ATM threshold it is the modal
+  region — the observed 12.2¢ U-3 "edge" was the market-priced P(print==T), a phantom). 0013 joins on
+  the identical twin `floor = T − step` instead. The orientation/structure decisions (skip `≤`-tails +
+  point buckets; Fed label↔label; MarketTracker wiring) stand.
 - **Deciders:** owner + Claude
 
 ## Context

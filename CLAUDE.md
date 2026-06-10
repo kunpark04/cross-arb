@@ -25,13 +25,18 @@ See [deploy/README.md](deploy/README.md).
   on the *same* government print Kalshi uses (BLS/BEA/Fed); per [research/us-legal-overlap-audit.md](research/us-legal-overlap-audit.md)
   this is the *structurally cleanest* (identical-deterministic-number) subset, though episodic/consensus-priced
   so the spread is event-driven. **Only crypto is genuinely US-blocked** (absent from polymarket.us). So the
-  US-legal overlap is **econ + weather + sports** (+ politics). *(Corrected 2026-06-09 reviewer audit C7 — the
-  earlier "CPI/FOMC US-blocked, overlap = weather+sports" was refuted by the project's own live catalog pull.)*
-  Econ is now **MAPPED + tracked** (`bot/colisted_map.py` `ECON`, 2026-06-09): **24 clean co-listed pairs**
-  (U-3 9, GDP 6, Fed 5, NFP 3, CPI 1) on same family/period/threshold + same govt source, settlement identity
-  verified (`scripts/verify_econ_settlement.py`); only SAME-orientation `≥`-threshold + Fed-categorical pairs
-  mapped (pmus `≤`-tails = opposite orientation, and "exactly X%" point-buckets, are skipped+flagged). So the
-  monitor/analyses now cover **the full US-legal universe** (weather + sports + econ), not a subset.
+  US-legal overlap is **econ + weather + sports** (+ politics). *(Corrected 2026-06-09 reviewer audit C7.)*
+  **Econ pairing CORRECTED 2026-06-10 ([0013](decisions/0013-econ-grid-step-twin-and-measurement-integrity.md),
+  [research/econ-settlement-identity-2026-06-10.md](research/econ-settlement-identity-2026-06-10.md)):** the
+  original join paired pmus `≥T` (inclusive, "at least") with Kalshi "Above T" (**strict**, `strike_type:
+  greater`) — **off by one print-grid bucket**; an exact-on-T print settles the venues oppositely, and that
+  outcome is the *modal region* for an ATM threshold, so the pair's cross-venue gap is the market-priced
+  P(print==T) — the observed persistent **12.2¢ U-3 "edge" was this phantom**, not an arb. The matcher now joins
+  on the settlement-identical twin `floor = T − grid_step` (0.1 for U-3/CPI/GDP, 1000 for NFP; Fed categorical
+  unchanged): live result **14 identical pairs** (+13 honest no-twin skips, was 24 false-ish pairs); remapped
+  pairs verified live = no phantom edges. Pre-remap threshold-econ records are **quarantined** in
+  `analyze_persistence.load()`. So the monitor/analyses cover the full US-legal universe (weather + sports +
+  econ-identical), with econ data restarting clean at the next gated redeploy.
 - **Settlement identity for weather: source + station + bucket boundaries VERIFIED**
   (`scripts/verify_settlement.py`, 2026-06-09): all 5 mapped cities grade off the **same** NWS Climatological
   Report (Daily), at the **same station** (incl. NYC = Central Park). Bucket boundaries verified on a low-tail
@@ -67,19 +72,27 @@ See [deploy/README.md](deploy/README.md).
   found the earlier "$/day" prose unsupported and a capital double-count (~6–7× — now fixed in `capital_sim.py`:
   corrected peak ≈ $13.6k / ~6%/day, still preliminary). Treat edge size as unproven until the live monitor +
   `scripts/capital_sim.py` accumulate. The bot decides what to trade.
-- **Hardened post-review (two passes):** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
+- **Hardened post-review (three passes):** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
   `bot/monitor.py`) plus per-transition depth + staleness instrumentation. `age` is a coarse staleness hint
   (a resting-but-tradeable quote and a wedged stream both accrue large `age`); **depth** does the real
   fillability work. Second audit (2026-06-09) added: WS reconnect (no more silent half-dead collector),
   invariant-#2 guards in the live matcher (exact-date game binding, bucket boundary-equality, orientation
-  price-guard), and the econ-legality correction. Open items tracked in [tasks/todo.md](tasks/todo.md);
-  full findings in [tasks/reviewer-audit-2026-06-09.md](tasks/reviewer-audit-2026-06-09.md).
+  price-guard), and the econ-legality correction. **Third full review (2026-06-10, [0013](decisions/0013-econ-grid-step-twin-and-measurement-integrity.md))
+  fixed measurement integrity end-to-end:** debounced CLOSEs now stamped at **detection** time (the old
+  flush-time stamps inflated every duration ~1.0–1.5s — corrected shadow-fill leg-fail @1s: 39%→**55.5%**, and
+  the sub-second regime was structurally unmeasurable); `ws_reconnect` markers per venue (reconnect-rebuild
+  phantoms now censorable, like restarts/resyncs); supervised heartbeat + **degraded-discovery prune skip** (an
+  API outage can't masquerade as mass settlement); **single-subscription Kalshi invariant** (seq gap / new
+  tickers cycle the connection — a second subscribe's semantics were never probed); doubleheader/duplicate-ticker
+  binding guards; maker-fee rounding per the venue audit; `scan_all` now imports the bot's matchers + marginal
+  fees (its private copies had drifted, incl. an L15 violation). Open items in [tasks/todo.md](tasks/todo.md).
 - **Execution feasibility — read-only tests run (2026-06-09, [research/execution-feasibility-2026-06-09.md](research/execution-feasibility-2026-06-09.md)).**
   **Latency MEASURED** (~86–261 ms RTT, network-bound → compute language is noise; Rust deferred — see
   [research/latency-playbook.md](research/latency-playbook.md)). **Leg-fill is the gating risk**: shadow-fill shows
-  hit-rate collapses with latency (39% naked at 1 s, 67% at 2 s), but the sub-second regime where real fills live
-  was below the old integer-second data resolution — now fixed (`monitor.py` logs **ms timestamps** + per-venue
-  `px`), so it + adverse-selection become measurable after the next deploy. **Settlement identity empirically
+  hit-rate collapses with latency — **corrected per [0013](decisions/0013-econ-grid-step-twin-and-measurement-integrity.md): 55.5% naked at 1 s, 62.7% at 2 s, and ~27% of
+  capturable ≥1¢ edges die ~instantly** (the published 39%/67% carried the debouncer's flush-stamp lag).
+  The sub-second regime where real fills live needs post-0013 ms data: the old build couldn't log a clean
+  duration under ~1 s *by construction* (CLOSEs now stamp detection time; `px` enables adverse-selection). **Settlement identity empirically
   OPEN**: `settle_recon.py` found pmus `closed`≠finalized (~2-week lag, unreliable interim outcomes — one verified
   wrong), so invariant #1 stays rules-verified-only until pmus finalizes. **None of this needs capital — it needs
   the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*, not yet a go.
@@ -92,18 +105,19 @@ See [deploy/README.md](deploy/README.md).
   frozen) and econ (weeks-mo, outcome known only at the far release) are capital-locked** — the sports early-exit
   "rescue" is refuted. So weather = clean+fast+thin; sports = deep but capital-slow + void tail; econ = cleanest
   but slowest. **No category wins {clean settlement, fast capital, real depth}; weather comes closest on capital.**
-- **Clip-stage allocation — tested OOS + a phantom fixed (2026-06-10, [0012](decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md), [research/allocation-policy-2026-06-10.md](research/allocation-policy-2026-06-10.md)).**
+- **Clip-stage allocation — tested OOS + two phantoms fixed (2026-06-10, [0012](decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md) corrected by [0013](decisions/0013-econ-grid-step-twin-and-measurement-integrity.md), [research/allocation-policy-2026-06-10.md](research/allocation-policy-2026-06-10.md)).**
   `account_sim`'s FIFO-by-arrival is the worst rule when the bankroll binds (one deep clip eats the whole $500 →
-  funds 1/219). The owner's "wait 1 s + sort the batch" captures only **3.6%** of the FIFO→optimal gap (competing
-  arbs span *days*, not seconds) and *adds* a ~39%-naked-leg latency tax. The lever is a **global 2¢ edge floor**
-  (skip thin arbs) **+ a per-pair cap sized to fully deploy without over-concentrating** (~10–20%): **~+64% to
-  +269% over FIFO out-of-sample** on a held-out half it was never tuned on (11 diversified pairs). **Clip-cap
-  ALONE is risk-control, not PnL** (−3% OOS — it just diversifies into thin arbs). Ordering stays **second-order
-  to capital velocity** (only ~19 arbs clear 2¢ in 0.81 d; $500 funds ~10 then locks). **Magnitudes PRELIMINARY**
-  (0.81 d / one cluster / paper-gross — method demo, not validated). The eye-popping in-sample numbers are oracle
-  artifacts ([L19]); a **book-init phantom** (a 37.7¢ ITF-tennis "arb" captured 1.5 s post-resubscribe, flat
-  `c2==c1==c0`, `censored=restart`) was 75% of the old in-sample headline until `capital_sim.capturable()` was
-  fixed to drop restart-censored — instrumentation ≠ gating ([L20]).
+  funds 1/217). The owner's "wait 1 s + sort the batch" captures only **~4%** of the FIFO→optimal gap (competing
+  arbs span *days*, not seconds) and *adds* a ~55%-naked-leg-at-1s latency tax. The lever is a **global 2¢ edge
+  floor** (skip thin arbs) **+ a per-pair cap sized to fully deploy without over-concentrating** (~10–20%):
+  **~+9% to +141% over FIFO out-of-sample** (corrected — the published +64–269% contained an econ
+  settlement-phantom worth ~20% of design PnL; 10 diversified weather+sports pairs). **Clip-cap ALONE is
+  risk-control, not PnL** (−14% OOS corrected — it just diversifies into thin arbs). Ordering stays
+  **second-order to capital velocity** ($500 funds ~10 then locks). **Magnitudes PRELIMINARY** (<1 d / one
+  cluster / paper-gross — method demo, not validated). The eye-popping in-sample numbers are oracle artifacts
+  ([L19]); a **book-init phantom** (37.7¢ ITF-tennis, `censored=restart`) was 75% of the old in-sample headline
+  until `capturable()` dropped restart-censored ([L20]), and the **econ off-by-one phantom** (12.2¢ "U-3 edge" =
+  market-priced P(print==T), [L21]) sat in the OOS tables until 0013 quarantined pre-remap econ records.
 
 ## Managerial docs index
 

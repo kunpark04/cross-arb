@@ -67,13 +67,65 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       old in-sample headline** — `capital_sim.capturable()` now drops restart-censored ([L20]); candidates
       226→219, in-sample +7127%→+1744%, **OOS unchanged**. New `alloc_policy_experiment.py` +
       `clip_threshold_test.py`. **Method demo on 0.81 d** — re-run on the multi-week data.
-- [ ] **Phantom hardening (deferred — needs a monitor-schema change):** log **both** venue book-ages (the `k=0`
-      fresh-subscribe tell is currently lost — `build_episodes` keeps only `max(p,k)`) + a **flat-depth**
-      (`c2==c1==c0`) flag, so a fresh-book phantom *without* a restart marker can also be filtered. ([L20])
+## Full review 2026-06-10 — ALL FIXES LANDED ([0013](../decisions/0013-econ-grid-step-twin-and-measurement-integrity.md), [econ brief](../research/econ-settlement-identity-2026-06-10.md), lessons [L21]/[L22])
+
+Third adversarial pass (full code+data+docs, live-API verification). **17/17 self-tests green; full
+backtest pipeline re-run on the corrected pipeline.**
+
+- [x] **CRITICAL — econ pairing off by one bucket**: pmus `≥T` (inclusive) was joined to Kalshi "Above T"
+      (STRICT, `strike_type: greater` — verified live). The persistent **12.2¢ U-3 "edge" was the
+      market-priced P(print==T)** (proven: pmus ≥4.4 mid 0.275 vs twin T4.3 mid 0.33 vs old partner T4.4
+      mid 0.105). Fixed: `econ_twin` joins `floor = T − grid_step` (24 pairs → **14 identical** + 13 honest
+      skips; remapped pairs verified live = no phantom edges); pre-remap econ records **quarantined** in
+      `load()`; **headline correction: allocation OOS +64%/+269% → +9%/+141%** (econ-free, 10 pairs).
+- [x] **CRITICAL — debouncer stamped CLOSEs at flush time** (+1.0–1.5s on EVERY duration; sub-second regime
+      structurally unmeasurable). Fixed: detection-time stamps; pre-fix data lag-corrected −1.25s in
+      `build_episodes` (clamped). **Corrected shadow-fill: leg-fail 55.5% @1s / 62.7% @2s** (was 39%/67%);
+      ~27% of capturable ≥1¢ episodes die ~instantly.
+- [x] **HIGH — WS reconnects now write `ws_reconnect` markers** (both venues, both drop+clean paths);
+      `load()` censors them like restarts/resyncs (reconnect-rebuild phantoms were invisible).
+- [x] **HIGH — heartbeat supervised** (was: one send-race exception killed discovery/prune/beacon forever);
+      **degraded discovery (fetch_errors) skips pruning** (an API outage looked like mass settlement →
+      uncensored re-OPEN phantoms); `get()` retries transient errors.
+- [x] **HIGH — single-subscription Kalshi invariant**: seq gap / new tickers CYCLE the connection (the old
+      in-place second `subscribe` + gap-resubscribe ran on never-probed semantics — silent no-data or a
+      seq-counter storm).
+- [x] **MEDIUM sweep**: weather pairing = bounds-dict join (offset listings no longer zero out a date);
+      econ Dec/Jan year-boundary fix; doubleheader guard (`pick_game` used-set) + duplicate-ticker
+      registration guard; `game_edge` ±40¢ orientation guard now covers one-sided pm books;
+      `analyze_persistence` headline stats restricted to measured episodes; `shadow_fill` counts FLIP-
+      before-fill as leg-fail; `scan_all` imports the bot's matchers + MARGINAL detection fees (private
+      copies had drifted, an [L15] violation) + same host; `exit_liquidity` TRADEABLE requires bids;
+      `adverse_selection` uses the shared loader + censor-aware pairing; `cod` league mapped (KXCODGAME,
+      live-verified).
+- [x] **Phantom hardening (no monitor-schema change needed)**: `build_episodes` keeps BOTH venue ages
+      (`open_age_p/k`) + an `open_flat` (c2==c1==c0) flag; `capturable(drop_flat=True)` opt-in lens ([L15]).
+- [x] **LOW sweep**: maker fee = `ceil(0.0175·N·P(1−P))` per venue-audit §2.1 (was 0.25× the ceiled taker);
+      ledger S4 print; `pm_catalog` cap warning; `cli_stream` seeds dedup state from cli.jsonl (no more
+      8× restart re-logs); `session_start` logs `build` hash + argv (deploy-vs-crash forensics);
+      `selftest_all.py` one-command test gate; doc drift (bot/README fees per-ORDER, etc.).
+- [x] **GATED REDEPLOY DONE (2026-06-10 09:03 UTC, owner-greenlit, [0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)):** droplet on the 0013
+      build — sha **byte-identical** to local (`bfa9e2fccf15` monitor / `4bc9c241…` colisted_map),
+      `session_start` now self-identifies (`build` + argv), tracking **30 weather + 307 sports + 14 econ**
+      (remapped twins; old build's last session said 24). First new-schema records verified on-disk
+      (detection-time ms stamps + px + depth). `ECON_REMAP_DEPLOY_TS = DEBOUNCE_STAMP_FIXED_TS =
+      1781082189` set in `analyze_persistence.py`; pre-epoch econ stays quarantined, post-epoch is clean.
+      **The multi-week accumulation clock restarts here on the corrected schema.**
+- [x] **Live-WS smoke test DONE (2026-06-10, owner-greenlit):** bounded `--live 75` ran clean — 351 pmus /
+      658 Kalshi subscribed, remapped econ pairs priced, OPEN/CLOSE/WIDEN/NARROW logged at detection-time
+      ms precision, CLI dedup-seeding worked, clean shutdown. (A logged 13¢ U-3 dir-P record was inspected:
+      a REAL wide-book dislocation — pmus 0.47/0.69 vs Kalshi 0.84/0.87 on the now-identical ≥4.2 bucket —
+      with flat-ladder + age instrumentation attached for fillability analysis; not a settlement phantom.)
+- [ ] **Probe Kalshi multi-subscription semantics** (extend `probe_kalshi_ws.py`: 2nd subscribe on the same
+      channel; `update_subscription` add_markets; seq behavior with 2 sids) → would replace cycle-on-add
+      with a no-gap add.
+- [ ] **Re-pin both venues' fee schedules from primary sources** (Kalshi fee PDF 429'd, pmus fees page is
+      JS-only this session); coefficients currently pinned to the venue audits ([kalshi-venue-audit](../research/kalshi-venue-audit.md) §2.1,
+      [us-legal-overlap-audit](../research/us-legal-overlap-audit.md)). Also check per-series `fee_multiplier`.
 - [ ] **Now: let it run ≥ weeks + re-pull**, then re-run on the new-schema data: `shadow_fill`
-      (now sub-second-resolvable → the REAL leg-fill rate at ~150ms), `adverse_selection` (toxic-close share
-      from `px`), `settle_recon` (after pmus markets pass `endDate`), `analyze_persistence`/`capital_sim`
-      (multi-day edge), and a first **ECON** persistence/depth read (brand-new category in the dataset).
+      (sub-second leg-fill at ~150ms — measurable only on post-0013 data), `adverse_selection` (toxic-close
+      share from `px`), `settle_recon` (after pmus markets pass `endDate`), `analyze_persistence`/`capital_sim`
+      (multi-day edge), and a first **ECON** persistence/depth read on the 14 identical pairs.
 - [ ] **Still needs the trade layer or in-season data:** (a) the **bot unwind rule** (close MLB before Kalshi's
       2-day window; reads `void_clean`); (b) latency-haircut from a real order-ack study + leg-fill EV (0010 items
       2/3); (c) `p_gap`/`loss_frac` refinement; (d) NBA/NHL settlement read in season; (e) CLI-revision rate.
@@ -91,7 +143,7 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       polymarket.us WS (Ed25519) + Kalshi `orderbook_delta` WS (RSA-PSS; `kalshi_book.py` snapshot/delta
       merge), self-discovering + coverage-audited map (`colisted_map.py`, [0008](../decisions/0008-colisted-map-discovery-and-coverage-audit.md)),
       weather `MarketTracker` + sports `GameTracker`, FLIP debounce, dynamic re-subscribe. Logs
-      OPEN/CLOSE/FLIP/WIDEN/NARROW → `_data/transitions.jsonl`.
+      OPEN/CLOSE/FLIP/WIDEN/NARROW → `_data/transitions-<event-date>.jsonl` (event-date partitioned, 0009).
 - [x] **Accounting core** (`bot/ledger.py`) — self-verifying PnL; layer-by-default rotate rule
       ([0004](../decisions/0004-ledger-layer-by-default.md)).
 
@@ -148,14 +200,15 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       allocation, per-market layer/rotate, leg-risk fill management. Exits the read-only phase.
 
 ## Coverage (all US-legal series)
-- [x] **ECON mapped (2026-06-09)** — `colisted_map.ECON` covers CPI/U-3/NFP/GDP/Fed (24 clean same-orientation
-      pairs); settlement identity via `scripts/verify_econ_settlement.py`. Monitor + analyses now cover the full
-      US-legal universe (weather + sports + econ), not a subset.
+- [x] **ECON mapped (2026-06-09; pairing corrected 2026-06-10, 0013)** — `colisted_map.ECON` covers
+      CPI/U-3/NFP/GDP/Fed via the grid-step twin join (`≥T` ↔ `>T−step`): **14 settlement-identical pairs**
+      (+13 no-twin skips; the original 24 equal-number pairs included off-by-one phantoms). Settlement
+      identity via `scripts/verify_econ_settlement.py`. Monitor + analyses cover the full US-legal universe.
 - [ ] **Politics** (103 pmus markets, US-legal, long-dated) — not yet mapped; needs a per-race rule audit +
       accepts months-long capital lockup. Lower priority. `colisted_map` audit flags it.
-- `colisted_map.py`'s audit flags unmapped polymarket.us categories every run: currently `twc` (influencer
-  soccer, 1 mkt, no Kalshi co-listing) + `cod` (esports, evaluate). Add real co-listed ones to `WX`/`LEAGUES`/
-  `ECON` (in `colisted_map.py` **and** `scan_all.py`).
+- `colisted_map.py`'s audit flags unmapped polymarket.us categories every run. `cod` (KXCODGAME) was
+  flagged, verified co-listed, and **mapped 2026-06-10**; `twc` (influencer soccer) has no Kalshi
+  co-listing. `scan_all.py` now imports `LEAGUES`/`WX`/`ECON` from `colisted_map` — one config to extend.
 
 ## Key finding (2026-06-08)
 Edge lives in INEFFICIENT corners, not deep books. Tennis/UFC/ITF (deepest liquidity) = $0 cross-venue

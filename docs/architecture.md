@@ -137,23 +137,26 @@ different PnL at different clips.
 
 `account_sim.py` deploys the bankroll **strictly FIFO by arrival** (`sorted(key=open_t)`). Measured on the
 real data (`scripts/alloc_policy_experiment.py`, 0.86 d), that is the **worst** rule when the bankroll binds:
-at $500 the first arb to cross is a deep sports clip that eats **~$500**, so FIFO funds **1 of 219**
+at $500 the first arb to cross is a deep sports clip that eats **~$500**, so FIFO funds **1 of 217**
 candidates (after restart-censored phantoms are filtered — [L20]). Because capital is **locked to settlement** (no early-exit), the arbs competing for that bankroll
 are spread across **days**, not seconds — so the intuitive fix of "wait 1 s and sort that batch largest-first"
-(`batch1s`) reorders almost nothing: it captures only **3.6%** of the FIFO→optimal gap and ties FIFO at $2 k,
-while *adding* an entry-latency tax (`shadow_fill`: ~39% naked-leg at 1 s). The lever that works is a **global
-edge threshold** (reservation price τ: skip thin arbs, keep powder for fat ones), evaluated at arrival with
-**zero added fill latency** — allocation priority is a *bankroll-policy* decision over days, never an execution delay.
+(`batch1s`) reorders almost nothing: it captures only **~4%** of the FIFO→optimal gap and ties FIFO at $2 k,
+while *adding* an entry-latency tax (`shadow_fill`, lag-corrected per [0013]: ~55% naked-leg at 1 s). The lever
+that works is a **global edge threshold** (reservation price τ: skip thin arbs, keep powder for fat ones),
+evaluated at arrival with **zero added fill latency** — allocation priority is a *bankroll-policy* decision
+over days, never an execution delay.
 
-**Tested out-of-sample** (`scripts/clip_threshold_test.py`, audited): the trustworthy claim is a **non-oracle
-fixed rule — a hard ~2¢ edge floor (never lower) + a per-pair cap sized so the bankroll fully deploys without
-over-concentrating (~10–20% here) — which beats FIFO by ~+64% to +269%** on a held-out late window it was never
-tuned on (11 diversified positions, top-1 ≤22%). The big in-sample numbers (**+1744%**, and a fitted **+462%**
-OOS) are **oracle / single-observation artifacts**, not validation — the +462% is 93% *one* econ contract, and
-re-cutting the split inflates it arbitrarily via the shrinking FIFO denominator; do not quote them as results.
-Three things the test surfaced: (1) the **clip cap alone is risk-control, not PnL** (−3% OOS — capping in FIFO
-order just diversifies into *thin* arbs; its job is bounding per-pair exposure against a settlement-void /
-leg-fail, while the *threshold* does the return work; a 5% cap under-deploys to ~42%, ~20% fully deploys);
+**Tested out-of-sample** (`scripts/clip_threshold_test.py`, audited; **magnitudes corrected by [0013]** — the
+published rows contained an econ settlement-phantom): the trustworthy claim is a **non-oracle fixed rule — a
+hard ~2¢ edge floor (never lower) + a per-pair cap sized so the bankroll fully deploys without
+over-concentrating (~10–20% here) — which beats FIFO by ~+9% (5% cap) to +141% (20% cap)** on a held-out late
+window it was never tuned on (10 diversified weather+sports positions, econ-quarantined). The big in-sample
+numbers (**+1744%**, and a fitted **+462%** OOS) are **oracle / single-observation artifacts**, not validation —
+the +462% was 93% *one* econ contract that turned out to be the off-by-one settlement phantom; do not quote
+them as results.
+Three things the test surfaced: (1) the **clip cap alone is risk-control, not PnL** (−14% OOS corrected —
+capping in FIFO order just diversifies into *thin* arbs; its job is bounding per-pair exposure against a
+settlement-void / leg-fail, while the *threshold* does the return work; a 5% cap under-deploys, ~20% fully deploys);
 (2) under a ≥0.5¢ friction haircut FIFO collapses to **$0** (its lone funded arb is sub-edge and the haircut
 zeroes it) while the thresholded design stays positive — a one-position degeneracy at $500, but it shows why an
 edge floor above the friction cost is load-bearing; (3) a **book-initialization phantom** (a 37.7¢ ITF-tennis

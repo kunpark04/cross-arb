@@ -24,6 +24,11 @@ fuzzy text), and (c) confirming the edge is large and persistent enough to be wo
   (identical government number, deterministic), though **episodic** (it only trades around scheduled
   releases). The US-legal overlap is therefore **econ + weather + sports** (politics too); **only crypto**
   is genuinely US-blocked (international-only). (Corrects an earlier "econ is international-only" claim.)
+  **Caveat (2026-06-10):** "same print" ≠ "same market" — pmus thresholds are **inclusive** (`≥T`, "at
+  least") while Kalshi's are **strict** ("Above T"), so the settlement-identical pair is pmus `≥T` ↔
+  Kalshi `>T−step` on the print grid; pairing equal threshold numbers manufactures a phantom "edge" equal
+  to the market-priced P(print==T). **14 identical econ pairs** survive the corrected join
+  ([research/econ-settlement-identity-2026-06-10.md](research/econ-settlement-identity-2026-06-10.md)).
 - **Edge is in inefficient corners.** Deep, liquid books (tennis / UFC / ITF) are already arbitraged
   to ~$0 cross-venue. The live edge appears in **MLB** (~$23 in one snapshot, from the newer venue's
   line lagging) and **weather** (~$20/day gross, intermittent — appears mid-day, settles by EOD).

@@ -5,6 +5,29 @@
 **Audit:** `tasks/_agent_bus/20260610-0522/stats-ml-logic-reviewer.md` (numbers reproduced, OOS split checked for leakage)
 **Data:** `Kalshi/data/cross-arb/` mirror, **0.81 d** of candidate-arb arrivals (one event cluster) — PRELIMINARY.
 
+> ## ⚠ CORRECTION (2026-06-10 full review, [0013](../decisions/0013-econ-grid-step-twin-and-measurement-integrity.md))
+>
+> The OOS tables below contain **one econ position (`urc-…-atl4pt4`) that was a settlement-identity
+> phantom** — the pre-0013 matcher paired pmus `≥4.4` with Kalshi `>4.4` (off by one print-grid bucket),
+> so its "12.2¢ edge" was the market-priced P(print==4.4), not an arb
+> ([econ-settlement-identity brief](econ-settlement-identity-2026-06-10.md)). The stats audit verified
+> arithmetic + split hygiene but not the settlement identity of the inputs. Econ-quarantined +
+> close-lag-corrected reruns (same scripts, fixed pipeline):
+>
+> | policy (test half, $500) | PnL | vs FIFO | published (wrong) |
+> |---|---|---|---|
+> | FIFO | $6.21 (funds 9) | — | $5.15 |
+> | **FIXED 2¢ + 5% cap (26)** | $6.78 · 10 pairs · top-1 19% | **+9%** | +64% |
+> | FIXED 2¢ + 10% cap (51) | $9.79 · 10 pairs · top-1 21% | **+58%** | +153% |
+> | **FIXED 2¢ + 20% cap (102)** | $14.97 · 10 pairs · top-1 27% | **+141%** | +269% |
+> | FIXED 2¢ + 40% cap (204) | $17.06 · 8 pairs · top-1 48% | +175% (re-concentrates) | +232% |
+>
+> The phantom was ~20% of design PnL in the published rows *and* depressed the FIFO denominator.
+> **Findings 1–3 and 5–7 stand directionally** (FIFO loses when the bankroll binds; the lever is the
+> edge floor; batch-sort is the wrong instrument; clip-cap-alone earns nothing: −14% corrected). The
+> **deployable claim is now ~+9% to +141%**, on 10 diversified weather+sports pairs, still a
+> <1-day method demo. Tables below are kept as published for the audit trail — read them with this block.
+
 ## Question
 
 The not-yet-built trade-selection ("clip") stage must allocate a fixed bankroll across arbs that arrive over
