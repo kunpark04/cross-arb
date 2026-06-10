@@ -60,15 +60,22 @@ def peak_and_avg(intervals):
     span = evs[-1][0] - evs[0][0]
     return peak, (area / span if span > 0 else 0.0)
 
-def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None):
+def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None, drop_restart=True):
     """Capturable = big enough (open_net), persistent enough (duration), AND fillable: deep enough
-    (open_c2 >= liq_floor) and not on a stale quote (max book age at open <= max_age). The liq + age
-    gates are what separate a real fillable arb from a persistent-but-stale phantom (review finding L2)."""
+    (open_c2 >= liq_floor), not on a stale quote (max book age at open <= max_age), and NOT
+    restart-censored. A restart-censored episode has a truncated/unreliable duration and is often a
+    book-initialization phantom — captured seconds after a resubscribe when one venue's book is still
+    half-built (e.g. a flat c2==c1==c0 ladder against a just-snapshotted side), so its "edge" is an
+    artifact, not a fillable arb. The liq + age + restart gates separate a real fillable arb from a
+    phantom (review finding L2, [L20]). drop_restart=True matches analyze_persistence's own CAPTURABLE
+    definition (which already excludes restart-censored); pass False only to deliberately include them."""
     out = []
     for e in episodes:
         if not (e["open_net"] >= edge_min and e["duration"] >= window_min and e["open_c2"] >= max(1, liq_floor)):
             continue
         if max_age and e.get("open_age") is not None and e["open_age"] > max_age:   # max_age 0/None = no age filter
+            continue
+        if drop_restart and e.get("censored") == "restart":   # restart-censored = book-init phantom (L20)
             continue
         out.append(e)
     return out
@@ -245,6 +252,10 @@ def _selftest():
     stale = [{**ep[0], "open_age": 99}]
     assert capturable(stale, 0.01, 30, max_age=10) == []                   # 99s stale -> phantom
     assert len(capturable(stale, 0.01, 30, max_age=None)) == 1             # age filter off -> kept
+    # L20: restart-censored episodes are book-init phantoms -> dropped by default (matches analyze_persistence)
+    restart_ep = [{**ep[0], "censored": "restart"}]
+    assert capturable(restart_ep, 0.01, 30) == []                          # restart-censored -> dropped
+    assert len(capturable(restart_ep, 0.01, 30, drop_restart=False)) == 1  # opt-in to include
     print("  OK - peak/avg overlap, settlement proxy, size cap, profit/capital, threshold + liq/stale filters")
     print("self-test passed.")
 

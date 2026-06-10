@@ -245,3 +245,24 @@ its value is risk-control, not return.
 lucky observation (bootstrap / re-cut the split / report top-1 position share). When a design bundles multiple
 levers, isolate each: a lever that doesn't move the held-out metric is not part of the edge (it may still be
 justified as risk-control — say which). On <1 day of data this is a **method demo, not validation**; label it so.
+
+## L20 — A quality gate must live at the shared chokepoint, not in one report's metric; instrumentation ≠ gating
+
+**Pattern:** the project *had* a "phantom filter" (review L2: `liq_floor` + `max_age` in `capital_sim.capturable()`),
+so it felt safe to assume phantoms were excluded. They weren't. A book-initialization phantom — a 37.7¢ ITF-tennis
+"arb" (`aec-itfm-fravaz-fedval`) captured **1.5 s after a fresh resubscribe** during a ~10-restarts-in-90-min storm,
+with a **flat `c2==c1==c0=690` ladder** and `censored="restart"` — flowed straight into every allocation analysis and
+became **75% of the in-sample headline** (in-sample FITTED $142 → $36 once removed). Three holes lined up: (1) the
+`max_age` gate was **off by default** (and `build_episodes` keeps only `max(p,k)` age, discarding the `k=0` fresh-subscribe
+tell); (2) there was **no flat-depth check**; and decisively (3) `analyze_persistence.summarize()` *already* excluded
+restart-censored from its CAPTURABLE metric (line 192), but the shared `capturable()` that `account_sim`/`alloc_policy`/
+`clip_threshold` actually call **never got that rule** — the same concept ("capturable") was defined two ways. Compounding
+it: the **live monitor is instrumentation-only** — it logs age/depth/px and gates only genuinely-crossed books, so *every*
+downstream consumer must apply the phantom filters; "the monitor/analysis already filters it" was an unverified assumption.
+
+**Rule:** put a quality/identity gate at the **single shared chokepoint** every consumer passes through (here: `capturable()`),
+never in just one report's metric — and when the same concept is defined in two places, **trace the actual call path** to
+prove they agree (a grep for the field name in the function would have caught it: `capturable()` had no reference to
+`censored`). **Instrumentation ≠ gating**: a logged field (`age`, `depth`, `px`) changes nothing until code acts on it;
+don't assume a recorded dimension is an enforced one. And reconfirms [L18]: a too-good number (19¢ on an obscure ITF match)
+is the asterisk — interrogate the raw record (age, depth-ladder shape, censor reason) before believing it.
