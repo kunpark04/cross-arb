@@ -5,11 +5,17 @@ redeploy, rather than wait for the far-future pmus finalization (endDate). This 
 even possible: for each market it reads the live order book and the market state, and classifies whether a
 RESOLVED-but-unfinalized market still has a book to sell into.
 
-MEASURED 2026-06-09 (resolved 06-08 ATP markets): once pmus sets closed=true (at the event's end), the order
-book is EMPTY/frozen -- 5/5 resolved markets had zero bids+offers while the one still closed=false had a full
-book. CONCLUSION: there is NO early-exit on pmus; a position is locked from resolution to endDate (~2 weeks for
-sports). The passive-hold lockup is the reality; capital_velocity.py's early-exit column is NOT achievable for
-sports/econ on pmus.
+MEASURED 2026-06-09 -- and it is STRUCTURAL / venue-timing-driven, opposite for sports vs weather:
+  * SPORTS (resolved 06-08): once pmus sets closed=true (AT the event's end), the book is EMPTY/frozen -- 10/10
+    resolved markets had zero bids+offers (the only one still closed=false had a full book). => NO early-exit;
+    capital is locked from resolution to endDate (~2 weeks).
+  * WEATHER (event-day evening ~8pm ET): the OPPOSITE -- pmus closes weather LATE (endDate ~2am ET, well after
+    the ~6pm high-lock), so there is an ~8h window where the outcome is known AND the book is live. The WINNING
+    bucket has a deep bid near $1 (MDW 88-89F: bid 0.99 depth 22,340 ; LAX 72-73F: bid 0.98 depth 3,273); losing
+    buckets sit at 0.01/no-bid. => weather DOES have a liquid early-exit (~1-2c discount) -- a bonus, since its
+    natural settlement is only ~1.2d anyway.
+CONCLUSION: weather is doubly capital-efficient (fast natural settle + an exit window); sports/econ are locked to
+their far endDate. capital_velocity.py's early-exit column is achievable ONLY for weather, not sports/econ.
 
   python scripts/exit_liquidity.py --selftest
   python scripts/exit_liquidity.py [--date 2026-06-08] [--max 10]   # probe tracked markets from a past (resolved) date

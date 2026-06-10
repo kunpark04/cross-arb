@@ -64,14 +64,17 @@ attributable; produces real numbers after the next deploy + re-pull.
 ## 5. Capital velocity / early-exit — MEASURED: no early-exit on pmus (`scripts/exit_liquidity.py`, `capital_velocity.py`)
 
 The capital case hinged on early-exit: once the outcome is known, sell the winning leg at ~$1 and redeploy rather
-than wait for the far-future pmus finalization (`endDate`). **Measured: it doesn't work.** pmus **freezes the order
-book at resolution** (`closed=true`) — **10/10 resolved 06-08 markets had empty books** (the one with a live book
-was still `closed=false`). So you cannot sell the winning leg; capital is locked from resolution to `endDate`.
-Combined with the `endDate` probe (weather ~1.2d, sports/econ ~15d):
-- **Weather** = capital-efficient (~1.2-day natural settlement; no early-exit needed). The standout.
-- **Sports** = ~**15-day** lock, **unavoidable** (book frozen, no early-out). Capital-inefficient — the early-exit
-  rescue is refuted.
-- **Econ** = weeks-to-months (outcome known only at the far-future release; no early-out either).
+than wait for the far-future pmus finalization (`endDate`). **Measured — and it's structural / venue-timing-driven, opposite for sports vs weather:**
+- **Sports:** pmus **freezes the book AT resolution** (`closed=true` at game-end) — **10/10 resolved 06-08
+  markets had empty books** (the one with a live book was still `closed=false`). So you cannot sell the winning
+  leg; capital is locked from resolution to `endDate` (~**15 days**). The early-exit rescue is **refuted** —
+  sports is capital-inefficient, deep but slow.
+- **Weather:** the OPPOSITE. pmus closes weather markets **late** (`endDate` ~2 AM ET, well after the ~6 PM
+  high-lock), so there's an **~8-hour evening window** where the outcome is known AND the book is live. Measured
+  the winning bucket at ~8 PM ET 06-09: **MDW 88-89°F bid 0.99 (depth 22,340), LAX 72-73°F bid 0.98 (depth
+  3,273)** — a deep bid near $1; losing buckets sit at 0.01/no-bid. So weather **has a liquid early-exit** (~1-2c
+  discount). Combined with its ~1.2-day natural settlement, **weather is doubly capital-efficient.** The standout.
+- **Econ:** weeks-to-months, no early-out (outcome known only at the far-future release).
 
 `capital_velocity.py` quantifies the consequence: velocity, not edge, separates the categories (per-turn RoC is
 ~equal; monthly RoC diverges by lockup). And early-exit only helps when **edge > exit-haircut** anyway — at the thin

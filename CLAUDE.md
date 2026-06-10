@@ -85,11 +85,13 @@ See [deploy/README.md](deploy/README.md).
   the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*, not yet a go.
 - **Capital velocity — MEASURED (2026-06-09, `scripts/exit_liquidity.py` + `capital_velocity.py`).** Velocity,
   not edge, separates the categories. pmus **freezes the order book at resolution** (10/10 resolved markets had
-  empty books) → **no early-exit** → capital is locked to the far-future `endDate`. With the `endDate` probe
-  (weather ~1.2d, sports/econ ~15d): **weather is the capital-efficiency standout** (fast natural settlement),
-  while **sports (~15d, book frozen) and econ (weeks-mo, outcome known only at the far-future release) are
-  capital-locked** — the early-exit "rescue" for sports is refuted. So weather = clean+fast+thin; sports = deep
-  but capital-slow + void tail; econ = cleanest but slowest. No category wins {clean, fast capital, deep}.
+  empty books at `closed=true`) → **no early-exit** → capital locked to the far-future `endDate` (~15d). Weather
+  is the OPPOSITE: it closes **late** (`endDate` ~2 AM ET, after the ~6 PM high-lock), so it HAS an ~8h evening
+  exit window — measured: the winning bucket bids ~0.98-0.99 with thousands of contracts of depth. So **weather
+  is doubly capital-efficient** (fast ~1.2d natural settlement + a liquid early-exit), while **sports (~15d, book
+  frozen) and econ (weeks-mo, outcome known only at the far release) are capital-locked** — the sports early-exit
+  "rescue" is refuted. So weather = clean+fast+thin; sports = deep but capital-slow + void tail; econ = cleanest
+  but slowest. **No category wins {clean settlement, fast capital, real depth}; weather comes closest on capital.**
 
 ## Managerial docs index
 
