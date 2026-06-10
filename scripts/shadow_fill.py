@@ -56,7 +56,8 @@ def build_trajectories(records, sessions, episodes):
         es.sort(key=lambda e: e["open_t"])
         for e in es:
             e["traj"] = [(e["open_t"], e["open_net"])]
-
+            e["flip_ts"] = []                    # FLIP times: after a flip the ORIGINAL legs are the wrong
+                                                 # direction — the post-flip net belongs to the OPPOSITE trade
     def _find(es, t):
         # the episode whose [open_t, close_t] contains t (half-open at the front for the OPEN already seeded)
         for e in es:
@@ -74,6 +75,8 @@ def build_trajectories(records, sessions, episodes):
         if e is None or r["t"] <= e["open_t"]:   # strictly-after-open continuations only
             continue
         e["traj"].append((r["t"], r["net_edge"]))
+        if r["transition"] == "FLIP":
+            e["flip_ts"].append(r["t"])
 
     for es in by_mkt.values():
         for e in es:
@@ -120,6 +123,12 @@ def shadow_fill(episodes, edge_min, latencies=LATENCIES):
             x = e["open_t"] + L
             # leg-fail: the episode CLOSEd at or before our legs would land
             if x >= e["close_t"]:
+                failed += 1
+                continue
+            # a FLIP at/before fill time is ALSO a leg-fail for the direction entered at OPEN: the
+            # episode's post-flip net is the OPPOSITE-direction trade's edge, not ours — our legs are
+            # now the wrong way around (counting it as survival overstated the hit-rate).
+            if any(ft <= x for ft in e.get("flip_ts", ())):
                 failed += 1
                 continue
             net = edge_at(e, x)
@@ -227,7 +236,7 @@ def _selftest():
     # adjust E1 close to t=1.5 by re-stamping (build_episodes uses the CLOSE record time):
     recs[2] = tr(1.5, E1, "CLOSE", -0.01)
     recs.sort(key=lambda r: r["t"])
-    eps = build_episodes(recs, sessions=[])
+    eps = build_episodes(recs, sessions=[], close_lag=0)   # exact-timing asserts -> lag correction off
     build_trajectories(recs, [], eps)
     by = {e["market"]: e for e in eps}
 
@@ -273,6 +282,20 @@ def _selftest():
         rr = {r["L"]: r for r in single}
         assert rr[L]["n_survived"] == 0 and rr[L]["fill_fail"] == 1.0, (L, rr[L])
     print("  OK - isolated t=1.5-close episode: survival 0, leg-fail 100% for all L in {2,5,10}")
+
+    # FLIP = leg-fail for the entered direction: E3 opens dir PK, FLIPs to KP at t=102 (still positive
+    # net), closes at t=110. At L<2 you fill pre-flip (survive); at L>=2 your PK legs are the WRONG way
+    # around — the +3c trajectory belongs to the KP trade — so it must count as leg-fail, not survival.
+    E3 = "aec-mlb-ee-ff-2026-06-10"
+    frecs = [tr(100, E3, "OPEN", 0.04, c2=100), {**tr(102, E3, "FLIP", 0.03, c2=100), "dir": "KP"},
+             tr(110, E3, "CLOSE", -0.01)]
+    feps = build_episodes(frecs, sessions=[], close_lag=0)
+    build_trajectories(frecs, [], feps)
+    frr = {r["L"]: r for r in shadow_fill(feps, edge_min=0.01)[0]}
+    assert frr[1]["n_survived"] == 1 and frr[1]["fill_fail"] == 0.0, frr[1]    # pre-flip fill: survives
+    assert frr[2]["n_survived"] == 0 and frr[2]["fill_fail"] == 1.0, frr[2]    # at the flip: leg-fail
+    assert frr[5]["n_survived"] == 0 and frr[5]["fill_fail"] == 1.0, frr[5]    # post-flip: leg-fail
+    print("  OK - FLIP before fill counts as leg-fail (post-flip net is the opposite trade's edge)")
 
     txt = render(rows, n, 0.01)
     assert "SHADOW-FILL" in txt and "leg-fail" in txt

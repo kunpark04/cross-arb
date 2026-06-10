@@ -22,11 +22,25 @@ import os, sys, re, gzip, json, glob, argparse
 
 WEATHER_PFX, SPORTS_PFX = "tc-", "aec-"
 ECON_PFX = ("cpic-", "gdpc-", "nfpc-", "urc-", "rdc-")   # CPI / GDP / NFP / U-3 / Fed (bot/colisted_map.ECON)
+ECON_THRESH_PFX = ("cpic-", "gdpc-", "nfpc-", "urc-")    # the >=T families (rdc-/Fed is categorical: clean)
 def category(slug):
     if slug.startswith(WEATHER_PFX): return "weather"
     if slug.startswith(SPORTS_PFX):  return "sports"
     if slug.startswith(ECON_PFX):    return "econ"
     return "other"
+
+# --- data-quality epochs (decision 0013). Each is the droplet-deploy epoch of a monitor fix —
+#     the 0013 build (bfa9e2fccf15) went live 2026-06-10 09:03 UTC; its session_start t is the epoch.
+#     Records BEFORE it came from the pre-fix monitor and get the corrections below; records after are clean.
+# Records from the pre-0013 monitor paired pmus ">=T" econ markets with Kalshi "Above T" (STRICT >) —
+# OFF BY ONE print-grid bucket. Their "edge" is the market-priced P(print==T), a settlement-identity
+# phantom (observed: a persistent 12-13c U-3 "arb"), NOT a cross-venue mispricing -> QUARANTINED.
+ECON_REMAP_DEPLOY_TS = 1781082189
+# The pre-0013 FlipDebouncer stamped every flushed CLOSE at FLUSH time (~+1.0..1.5s after the edge
+# died). Clean-CLOSE timestamps in that era are shifted back by the midpoint so durations aren't
+# systematically inflated (sub-second leg-fill analysis is the #1 execution-risk metric).
+DEBOUNCE_STAMP_FIXED_TS = 1781082189
+CLOSE_FLUSH_LAG = 1.25                                   # midpoint of the +[1.0, 1.5]s flush-stamp delay
 
 
 # ============================================================================================
@@ -36,10 +50,15 @@ def _open_any(path):
     return gzip.open(path, "rt", encoding="utf-8") if path.endswith(".gz") else open(path, encoding="utf-8")
 
 def load(data_dir):
-    """Return (transitions sorted by t, sorted session_start timestamps). AT-MOST-ONE file per event-date: a
+    """Return (transitions sorted by t, sorted censoring timestamps). AT-MOST-ONE file per event-date: a
     raw transitions-<date>.jsonl wins over a same-date .gz, so a finalized day later recreated on the droplet
-    and re-pulled next to its old .gz is NOT double-read (review data-pipeline WARN)."""
-    trans, sessions = [], []
+    and re-pulled next to its old .gz is NOT double-read (review data-pipeline WARN).
+    QUARANTINE (0013): threshold-econ records logged by the pre-remap monitor are DROPPED — their "edge"
+    is the off-by-one-bucket boundary mass P(print==T), not an arb; keeping them poisons every metric
+    (they were ~20% of the allocation-test headline). Fed (rdc-) categorical records are clean and kept.
+    Censoring events: session_start + kalshi_resync + ws_reconnect ALL force-close open episodes (a
+    reconnect rebuilds books, so outage-gap changes surface at reconnect time — the phantom class)."""
+    trans, sessions, quarantined = [], [], 0
     chosen = {}                                          # event-date token -> path (raw overrides .gz)
     for path in glob.glob(os.path.join(data_dir, "transitions-*.jsonl.gz")) + \
                 glob.glob(os.path.join(data_dir, "transitions-*.jsonl")):   # raw second -> wins the key
@@ -49,8 +68,17 @@ def load(data_dir):
         with _open_any(path) as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    trans.append(json.loads(line))
+                if not line:
+                    continue
+                r = json.loads(line)
+                if str(r.get("market", "")).startswith(ECON_THRESH_PFX) and \
+                        (ECON_REMAP_DEPLOY_TS is None or r["t"] < ECON_REMAP_DEPLOY_TS):
+                    quarantined += 1
+                    continue
+                trans.append(r)
+    if quarantined:
+        print(f"NOTE: quarantined {quarantined} pre-remap threshold-econ records "
+              f"(off-by-one >=T vs >T pairing — phantom edges; decision 0013)")
     spath = os.path.join(data_dir, "sessions.jsonl")
     if os.path.exists(spath):
         with open(spath, encoding="utf-8") as f:
@@ -58,7 +86,7 @@ def load(data_dir):
                 line = line.strip()
                 if line:
                     r = json.loads(line)
-                    if r.get("event") in ("session_start", "kalshi_resync"):   # both force-close episodes
+                    if r.get("event") in ("session_start", "kalshi_resync", "ws_reconnect"):  # all force-close
                         sessions.append(int(r["t"]))
     trans.sort(key=lambda r: r["t"])
     return trans, sorted(sessions)
@@ -67,12 +95,17 @@ def load(data_dir):
 # ============================================================================================
 # EPISODE RECONSTRUCTION  (pure; offline self-tested)
 # ============================================================================================
-def build_episodes(records, sessions):
+def build_episodes(records, sessions, close_lag=None):
     """Reconstruct per-market edge episodes. An episode spans OPEN..CLOSE; WIDEN/NARROW/FLIP are
-    continuations (the arb persisted). A session_start force-closes every open episode (state was lost
-    on restart -> restart-censored). Episodes still open at end-of-data are eod-censored. Returns a list
-    of dicts: {market, cat, dir, open_t, close_t, duration, censored, open_net, peak_net, twa_net,
-    n_widen, n_narrow, n_flip}."""
+    continuations (the arb persisted). A session_start/resync/reconnect force-closes every open episode
+    (state was lost -> restart-censored). Episodes still open at end-of-data are eod-censored. Returns a
+    list of dicts: {market, cat, dir, open_t, close_t, duration, censored, open_net, peak_net, twa_net,
+    open_c2, peak_c2, open_age, open_age_p, open_age_k, open_flat, n_widen, n_narrow, n_flip}.
+
+    close_lag: correction subtracted from CLOSE-record timestamps logged by the pre-0013 monitor (whose
+    debouncer stamped the FLUSH time, ~+1.0-1.5s after the edge died). None = auto: apply
+    CLOSE_FLUSH_LAG to records before DEBOUNCE_STAMP_FIXED_TS (all records while that is None).
+    Pass 0 to disable (tests asserting exact timing math)."""
     # merge transitions + sessions into one timeline; on a tie, process the session FIRST (order=0) so it
     # closes stale episodes before that restart's fresh OPENs land.
     events = [(t, 0, None) for t in sessions] + [(r["t"], 1, r) for r in records]
@@ -80,18 +113,24 @@ def build_episodes(records, sessions):
 
     open_ep, done = {}, []
 
-    def _close(market, tc, why):
+    def _lag(t):                                                   # pre-fix CLOSE stamps carry the flush delay
+        if close_lag == 0: return 0.0
+        if close_lag is not None: return close_lag
+        return CLOSE_FLUSH_LAG if (DEBOUNCE_STAMP_FIXED_TS is None or t < DEBOUNCE_STAMP_FIXED_TS) else 0.0
+
+    def _close(market, tc, why, lag_adj=False):
         ep = open_ep.pop(market)
         ep["_acc"] += ep["_last_net"] * (tc - ep["_seg_t"])        # final open segment
         dur = tc - ep["open_t"]
         ep["close_t"], ep["duration"], ep["censored"] = tc, dur, why
+        ep["lag_adj"] = lag_adj
         ep["twa_net"] = ep["_acc"] / dur if dur > 0 else ep["open_net"]
         for k in ("_acc", "_seg_t", "_last_net"):                  # drop scratch
             ep.pop(k, None)
         done.append(ep)
 
     for t, order, rec in events:
-        if order == 0:                                             # session_start: lose all open state
+        if order == 0:                                             # session_start/resync/reconnect: state lost
             for m in list(open_ep):
                 _close(m, t, "restart")
             continue
@@ -99,16 +138,26 @@ def build_episodes(records, sessions):
         if lab == "OPEN":
             if m in open_ep:                                       # OPEN while open = restart re-detect / dup -> continuation
                 continue
-            dc2 = (rec.get("depth") or {}).get("c2", 0)        # fillable contracts at gross >= 2c (net-ish)
+            d = rec.get("depth") or {}
+            dc2 = d.get("c2", 0)                               # fillable contracts at gross >= 2c (net-ish)
             ag = rec.get("age") or {}
-            open_age = max(ag.get("p", 0), ag.get("k", 0)) if ag else None   # worst book staleness at open (s)
             open_ep[m] = {"market": m, "cat": category(m), "dir": rec["dir"], "open_t": t,
                           "open_net": net, "peak_net": net, "open_c2": dc2, "peak_c2": dc2,
-                          "open_age": open_age, "n_widen": 0, "n_narrow": 0, "n_flip": 0,
+                          # staleness at open: keep BOTH venues (max alone discarded the k=0
+                          # fresh-subscribe tell — the book-init-phantom fingerprint, [L20]/0012)
+                          "open_age": max(ag.get("p", 0), ag.get("k", 0)) if ag else None,
+                          "open_age_p": ag.get("p") if ag else None,
+                          "open_age_k": ag.get("k") if ag else None,
+                          # flat ladder (c2==c1==c0 with depth) = one resting level, the other phantom tell
+                          "open_flat": bool(d) and d.get("c2", 0) == d.get("c1", -1) == d.get("c0", -2) and dc2 > 0,
+                          "n_widen": 0, "n_narrow": 0, "n_flip": 0,
                           "_acc": 0.0, "_seg_t": t, "_last_net": net}
         elif m in open_ep:
             if lab == "CLOSE":
-                _close(m, t, "none")
+                lag = _lag(t)
+                ep = open_ep[m]                                    # clamp: never before the last continuation
+                tc = max(t - lag, ep["_seg_t"], ep["open_t"]) if lag else t
+                _close(m, tc, "none", lag_adj=bool(lag))
             else:                                                  # WIDEN / NARROW / FLIP
                 ep = open_ep[m]
                 ep["_acc"] += ep["_last_net"] * (t - ep["_seg_t"]); ep["_seg_t"] = t
@@ -159,11 +208,16 @@ def summarize(records, sessions, episodes, edge_min, window_min):
     clean = [e for e in episodes if e["censored"] == "none"]
     eod   = [e for e in episodes if e["censored"] == "eod"]
     rstr  = [e for e in episodes if e["censored"] == "restart"]
-    # "measured" = duration is a real lower bound we trust for persistence (clean + eod)
+    # "measured" = duration is a real lower bound we trust for persistence (clean + eod). EVERY headline
+    # stat below uses this cohort — restart-censored episodes are book-init phantoms ([L20]) and must not
+    # sit in the magnitude/sensitivity numbers either (pre-fix they inflated max/p90 + the grid).
     measured = clean + eod
     P("")
     P("EPISODES (one OPEN->CLOSE per market)")
-    P(f"  total {len(episodes)}   clean {len(clean)}   eod-censored {len(eod)}   restart-censored {len(rstr)}")
+    P(f"  total {len(episodes)}   clean {len(clean)}   eod-censored {len(eod)}   restart-censored {len(rstr)} (excluded from all stats below)")
+    lagged = sum(1 for e in clean if e.get("lag_adj"))
+    if lagged:
+        P(f"  NOTE: {lagged} pre-0013 clean CLOSEs shifted -{CLOSE_FLUSH_LAG}s (debounce flush-stamp lag correction)")
     by_cat = {}
     for e in episodes: by_cat.setdefault(e["cat"], []).append(e)
     for cat, es in sorted(by_cat.items()):
@@ -173,10 +227,10 @@ def summarize(records, sessions, episodes, edge_min, window_min):
         P("\n(no clean/eod episodes yet -need OPENs that close without a restart in between)")
         return "\n".join(out)
 
-    opens = [e["open_net"] for e in episodes]
+    opens = [e["open_net"] for e in measured]
     durs  = [e["duration"] for e in measured]
     P("")
-    P("EDGE MAGNITUDE at OPEN  (c per $1 of payout; already net of fees)")
+    P("EDGE MAGNITUDE at OPEN  (c per $1 of payout; already net of fees; measured episodes)")
     P(f"  median {_c(_pct(opens,50)):.2f}c   p75 {_c(_pct(opens,75)):.2f}c   p90 {_c(_pct(opens,90)):.2f}c   max {_c(max(opens)):.2f}c")
     for thr in (0.005, 0.01, 0.02, 0.05):
         n = sum(1 for x in opens if x >= thr)
@@ -201,13 +255,13 @@ def summarize(records, sessions, episodes, edge_min, window_min):
     P(f"  scalability      : ~{cap_cents_day:.1f}c/day of capturable edge per $1 sized  (x your stake = $/day){floor_tag}")
 
     P("")
-    P("SENSITIVITY  capturable/day  (rows=min edge c, cols=min window s)")
+    P("SENSITIVITY  capturable/day  (rows=min edge c, cols=min window s; measured episodes)")
     windows = (5, 30, 60, 300)
     P("        " + "".join(f"{w:>8d}s" for w in windows))
     for em in (0.005, 0.01, 0.02):
         cells = []
         for w in windows:
-            n = sum(1 for e in episodes if e["open_net"] >= em and e["duration"] >= w)
+            n = sum(1 for e in measured if e["open_net"] >= em and e["duration"] >= w)
             cells.append(f"{per_day(n):>8.1f} ")
         P(f"  {_c(em):>4.1f}c " + "".join(cells))
 
@@ -241,13 +295,15 @@ def _selftest():
         tr(40, D, "OPEN", 0.02), tr(43, D, "OPEN", 0.09), tr(45, D, "CLOSE", -0.01),                            # D: dup OPEN (no restart) -> one episode
     ]
     sessions = [4]                                                                                              # restart hits only B (only open market at t4)
-    eps = {e["market"]: e for e in build_episodes(recs, sessions)}            # B's last (clean) wins the dict
-    allB = [e for e in build_episodes(recs, sessions) if e["market"] == B]    # B has two episodes
+    eps = {e["market"]: e for e in build_episodes(recs, sessions, close_lag=0)}            # B's last (clean) wins
+    allB = [e for e in build_episodes(recs, sessions, close_lag=0) if e["market"] == B]    # B has two episodes
 
     a = eps[A]
     assert a["censored"] == "none" and a["duration"] == 10 and a["open_net"] == 0.03 and a["peak_net"] == 0.05, a
     assert a["n_widen"] == 1 and a["n_narrow"] == 1
     assert a["open_c2"] == 300 and a["peak_c2"] == 500 and a["open_age"] == 40, a   # depth + staleness at open
+    assert a["open_age_p"] == 2 and a["open_age_k"] == 40, a   # BOTH venue ages kept (the k=0 phantom tell, 0012)
+    assert a["open_flat"] is True, a                           # tr() writes c2==c1==c0 -> flat-ladder flag set
     # time-weighted avg: .03*5 + .05*3 + .02*2 = .15+.15+.04 = .34 over 10 -> .034
     assert abs(a["twa_net"] - 0.034) < 1e-9, a["twa_net"]
     assert len(allB) == 2
@@ -259,10 +315,21 @@ def _selftest():
     assert c["censored"] == "eod" and c["open_t"] == 35 and c["duration"] == 10, c   # last_t = 45 (D's CLOSE)
     d = eps[D]
     assert d["censored"] == "none" and d["duration"] == 5 and d["peak_net"] == 0.02, d   # dup OPEN ignored (no peak bump)
-    print("  OK - episodes: clean / restart-cut / eod-censored / dup-OPEN-coalesced; twa + peak correct")
+    print("  OK - episodes: clean / restart-cut / eod-censored / dup-OPEN-coalesced; twa + peak + both-age + flat correct")
+
+    # debounce flush-stamp lag correction (0013): pre-fix CLOSE stamps carry +~1.25s; default policy
+    # shifts them back, clamped at the last continuation so segments never go negative.
+    lr = [tr(0, A, "OPEN", 0.03), tr(10, A, "CLOSE", -0.01)]
+    e_lag = build_episodes(lr, [])[0]
+    assert abs(e_lag["duration"] - (10 - 1.25)) < 1e-9 and e_lag["lag_adj"], e_lag       # 8.75, flagged
+    lr2 = [tr(0, A, "OPEN", 0.03), tr(9.9, A, "WIDEN", 0.05), tr(10, A, "CLOSE", -0.01)]
+    e_clamp = build_episodes(lr2, [])[0]
+    assert abs(e_clamp["duration"] - 9.9) < 1e-9, e_clamp            # clamped at the 9.9 WIDEN, not 8.75
+    assert build_episodes(lr, [], close_lag=0)[0]["duration"] == 10  # explicit 0 = correction off
+    print("  OK - pre-0013 CLOSE flush-lag corrected (default), clamped at last continuation, opt-out works")
 
     # summary runs end-to-end on the synthetic set
-    txt = summarize(sorted(recs, key=lambda r: r["t"]), sessions, build_episodes(recs, sessions), 0.01, 5)
+    txt = summarize(sorted(recs, key=lambda r: r["t"]), sessions, build_episodes(recs, sessions, close_lag=0), 0.01, 5)
     assert "CAPTURABLE" in txt and "PERSISTENCE" in txt
     print("  OK - summary renders")
     print("self-test passed.")

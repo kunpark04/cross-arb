@@ -49,12 +49,13 @@ def pm_market(slug):
 
 
 def classify(closed, bids, offs):
-    """-> ('FROZEN'|'TRADEABLE'|'OPEN-UNRESOLVED', can_early_exit:bool)."""
-    has_book = bool(bids or offs)
-    if closed and not has_book:
-        return "FROZEN", False                  # resolved + no book -> CANNOT sell the winner -> no early-exit
-    if closed and has_book:
-        return "TRADEABLE", True                # resolved + a book still up -> early-exit possible (rare)
+    """-> ('FROZEN'|'TRADEABLE'|'OPEN-UNRESOLVED', can_early_exit:bool). Early-exit = SELLING the winning
+    leg, which needs a BID — a closed market with only resting offers is just as frozen for our purpose
+    (pre-fix offers-only counted as TRADEABLE)."""
+    if closed and bids:
+        return "TRADEABLE", True                # resolved + a bid to sell into -> early-exit possible (rare)
+    if closed:
+        return "FROZEN", False                  # resolved, nothing to sell INTO -> capital locked to endDate
     return "OPEN-UNRESOLVED", False             # not yet closed -> outcome not final, book is pre-resolution
 
 
@@ -72,10 +73,11 @@ def archive_slugs(date):
 
 def _selftest():
     assert classify(True, [], []) == ("FROZEN", False)             # resolved, empty book -> no early-exit
-    assert classify(True, [(0.99, 100)], []) == ("TRADEABLE", True)  # resolved but book up -> can exit
+    assert classify(True, [(0.99, 100)], []) == ("TRADEABLE", True)  # resolved + a BID -> can exit
+    assert classify(True, [], [(0.99, 100)]) == ("FROZEN", False)  # offers-only: nothing to SELL into -> frozen
     assert classify(False, [(0.8, 10)], [(0.82, 10)])[0] == "OPEN-UNRESOLVED"
     assert classify(False, [], [])[1] is False
-    print("OK - exit_liquidity classify: FROZEN(no early-exit) / TRADEABLE / OPEN-UNRESOLVED")
+    print("OK - exit_liquidity classify: FROZEN(no early-exit; bids required) / TRADEABLE / OPEN-UNRESOLVED")
 
 
 if __name__ == "__main__":

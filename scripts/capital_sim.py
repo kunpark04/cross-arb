@@ -60,7 +60,8 @@ def peak_and_avg(intervals):
     span = evs[-1][0] - evs[0][0]
     return peak, (area / span if span > 0 else 0.0)
 
-def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None, drop_restart=True):
+def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None, drop_restart=True,
+               drop_flat=False):
     """Capturable = big enough (open_net), persistent enough (duration), AND fillable: deep enough
     (open_c2 >= liq_floor), not on a stale quote (max book age at open <= max_age), and NOT
     restart-censored. A restart-censored episode has a truncated/unreliable duration and is often a
@@ -68,7 +69,11 @@ def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None, drop_r
     half-built (e.g. a flat c2==c1==c0 ladder against a just-snapshotted side), so its "edge" is an
     artifact, not a fillable arb. The liq + age + restart gates separate a real fillable arb from a
     phantom (review finding L2, [L20]). drop_restart=True matches analyze_persistence's own CAPTURABLE
-    definition (which already excludes restart-censored); pass False only to deliberately include them."""
+    definition (which already excludes restart-censored); pass False only to deliberately include them.
+    drop_flat=True additionally drops flat-ladder opens (open_flat: c2==c1==c0 — one resting level, the
+    other fingerprint of the [L20] phantom). OPT-IN lens, default OFF per [L15]: a flat ladder can be a
+    legitimately small book, and with restart/reconnect/resync markers now all censored the unmarked
+    phantom path is largely closed — use this to stress a result's sensitivity, not as a silent filter."""
     out = []
     for e in episodes:
         if not (e["open_net"] >= edge_min and e["duration"] >= window_min and e["open_c2"] >= max(1, liq_floor)):
@@ -76,6 +81,8 @@ def capturable(episodes, edge_min, window_min, liq_floor=1, max_age=None, drop_r
         if max_age and e.get("open_age") is not None and e["open_age"] > max_age:   # max_age 0/None = no age filter
             continue
         if drop_restart and e.get("censored") == "restart":   # restart-censored = book-init phantom (L20)
+            continue
+        if drop_flat and e.get("open_flat"):                  # opt-in flat-ladder lens (L20 fingerprint)
             continue
         out.append(e)
     return out
@@ -256,7 +263,11 @@ def _selftest():
     restart_ep = [{**ep[0], "censored": "restart"}]
     assert capturable(restart_ep, 0.01, 30) == []                          # restart-censored -> dropped
     assert len(capturable(restart_ep, 0.01, 30, drop_restart=False)) == 1  # opt-in to include
-    print("  OK - peak/avg overlap, settlement proxy, size cap, profit/capital, threshold + liq/stale filters")
+    # flat-ladder lens (opt-in, default OFF per L15): c2==c1==c0 phantom fingerprint
+    flat_ep = [{**ep[0], "open_flat": True}]
+    assert len(capturable(flat_ep, 0.01, 30)) == 1                         # default: kept (lens off)
+    assert capturable(flat_ep, 0.01, 30, drop_flat=True) == []             # lens on: dropped
+    print("  OK - peak/avg overlap, settlement proxy, size cap, profit/capital, threshold + liq/stale/flat filters")
     print("self-test passed.")
 
 

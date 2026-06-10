@@ -22,23 +22,10 @@ attribution logic on synthetic episodes.
   python scripts/adverse_selection.py --selftest
   python scripts/adverse_selection.py [--data-dir PATH]
 """
-import os, sys, json, glob, gzip, argparse
-
-def _open_any(p):
-    return gzip.open(p, "rt", encoding="utf-8") if p.endswith(".gz") else open(p, encoding="utf-8")
-
-def load_transitions(data_dir):
-    recs = []
-    for p in sorted(glob.glob(os.path.join(data_dir, "transitions-*.jsonl")) +
-                    glob.glob(os.path.join(data_dir, "transitions-*.jsonl.gz"))):
-        with _open_any(p) as f:
-            for ln in f:
-                ln = ln.strip()
-                if ln:
-                    try: recs.append(json.loads(ln))
-                    except ValueError: pass
-    recs.sort(key=lambda r: r.get("t", 0))
-    return recs
+import os, sys, glob, argparse
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from analyze_persistence import load   # the ONE loader: raw-over-gz date dedup + econ quarantine +
+                                       # censoring timestamps (a private copy here drifted — review M9)
 
 
 def attribute(dir_, px_open, px_close):
@@ -61,21 +48,25 @@ def attribute(dir_, px_open, px_close):
     return tag, cheap_rise, dear_fall
 
 
-def episodes_with_px(recs):
-    """Pair OPEN->CLOSE per market, keeping the px at each end (weather only)."""
+def episodes_with_px(recs, sessions=()):
+    """Pair OPEN->CLOSE per market, keeping the px at each end. A pair spanning a censoring event
+    (restart/resync/reconnect) is DROPPED — its two ends were observed by different processes/books,
+    so the close attribution would be measuring the outage, not the market."""
     open_st, out = {}, []
+    sess = sorted(sessions)
     for r in recs:
         m, lab = r.get("market"), r.get("transition")
         if lab == "OPEN":
             open_st[m] = r
         elif lab == "CLOSE" and m in open_st:
             o = open_st.pop(m)
-            out.append((o, r))
+            if not any(o["t"] < s <= r["t"] for s in sess):
+                out.append((o, r))
     return out
 
 
-def analyze(recs):
-    pairs = episodes_with_px(recs)
+def analyze(recs, sessions=()):
+    pairs = episodes_with_px(recs, sessions)
     rows = [(o, c) for (o, c) in pairs if o.get("px") and c.get("px") and o.get("dir") in ("P", "K")]
     counts = {"cheap_rose": 0, "dear_fell": 0, "mixed": 0}
     cheap_moves, dear_moves = [], []
@@ -95,8 +86,8 @@ def _med(xs):
 
 
 def report(data_dir):
-    recs = load_transitions(data_dir)
-    a = analyze(recs)
+    recs, sessions = load(data_dir)
+    a = analyze(recs, sessions)
     L = ["=" * 68, "ADVERSE SELECTION  (which venue moved when the edge closed?)", "=" * 68]
     L.append(f"transitions read       : {len(recs)}")
     L.append(f"binary OPEN->CLOSE      : {a['binary_open_close_pairs']}  (weather + econ, dir P/K)")
@@ -140,7 +131,12 @@ def _selftest():
     ]
     a = analyze(recs)
     assert a["attributed"] == 2 and a["counts"]["dear_fell"] == 1 and a["counts"]["cheap_rose"] == 1, a
-    print("OK - adverse_selection: cheap_rose / dear_fell attribution + OPEN->CLOSE pairing")
+    # a pair spanning a censoring event (restart at t=3) is dropped: tc-x (1..5) spans it, tc-y (2..6) too;
+    # with the restart at t=5.5 only tc-y spans it and tc-x is kept.
+    assert analyze(recs, sessions=[3])["attributed"] == 0
+    a2 = analyze(recs, sessions=[5.5])
+    assert a2["attributed"] == 1 and a2["counts"]["dear_fell"] == 1, a2
+    print("OK - adverse_selection: cheap_rose / dear_fell attribution + censor-aware OPEN->CLOSE pairing")
 
 
 if __name__ == "__main__":
