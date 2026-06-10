@@ -44,6 +44,15 @@ absent. Owner greenlit the gated redeploy ([0006](../decisions/0006-deploy-on-di
 - **Added [docs/architecture.md](architecture.md)** — data-flow diagram (Mermaid + ASCII) venues → discovery →
   monitor → transitions → analysis/bot, with a stage-walkthrough table and the read-only→trade boundary where the
   clip / position-size lever sits. Indexed in CLAUDE.md (doc-hygiene rule).
+- **Tested the clip-stage allocation policy** (owner asked: is FIFO blind to bigger arbs?). `alloc_policy_experiment.py`
+  (4-agent workflow + verify): FIFO-by-arrival pins $499.97/$500 on whatever crosses first (funds 1/226); the
+  "wait 1 s + sort the batch" idea captures only **3.6%** of the FIFO→optimal gap and *adds* a ~39% naked-leg
+  latency tax — the lever is a **global edge threshold**, not a batch window. Then `clip_threshold_test.py` tested
+  **edge-floor + clip cap out-of-sample** (stats-ml audit: `tasks/_agent_bus/20260610-0522/`): trustworthy claim
+  is a **non-oracle fixed rule (skip <2¢, cap ~5%/pair) = +61% over FIFO OOS**; the +7127%/+462% are oracle /
+  single-obs artifacts (the +462% is 93% one econ contract). **Clip cap alone = risk-control, not PnL (−3% OOS)**;
+  FIFO → $0 under ≥0.5¢ friction. Method demo on 0.86 d. Also fixed `account_sim.py --selftest` (list-vs-int).
+  → [L19](../tasks/lessons.md) (in-sample sweep is an oracle; quote the OOS non-tuned number).
 
 ## 2026-06-09 — Second adversarial review (92-agent audit) + full fix landing
 

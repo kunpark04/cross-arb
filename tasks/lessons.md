@@ -227,3 +227,21 @@ happens to be easy to compute?"* Edge/depth/fill claims must be on the **tradeab
 settle-clean** subset — not the raw aggregate. And when a figure flatters the thesis, treat that as a prompt to
 re-derive it the hard way *before* repeating it: the favorable number is exactly the one most likely to be the
 wrong quantity. (The user named the tell: "the favorable numbers keep needing the asterisk.")
+
+## L19 — An in-sample parameter sweep is an ORACLE; quote the out-of-sample, non-tuned number as the result
+
+**Pattern:** the allocation-policy experiment chose τ=5.835¢ by sweeping τ over the *same* data it scored on,
+yielding "+7127% vs FIFO". That τ is fit to the data — an oracle ceiling, not a deployable constant. When the
+design (edge threshold + clip cap) was then tested out-of-sample (`clip_threshold_test.py`), the audited reality
+was far smaller and differently-shaped: a **fitted** policy's "+462% OOS" turned out to be **93% one econ
+contract** (re-cutting the train/test split inflated it to +801%/+1237% purely by shrinking the FIFO
+denominator), while the honest, trustworthy claim was a **non-oracle fixed rule** (skip <2¢, cap ~5%/pair) at
+**+61% OOS across 11 diversified positions**. The headline magnitude and the deployable magnitude differed by
+~100×, and a second lever I'd bundled in (the clip cap) turned out to contribute **nothing to PnL** (−3% OOS) —
+its value is risk-control, not return.
+
+**Rule:** never quote an in-sample swept-parameter magnitude as a result. The reportable number is the
+**out-of-sample** one produced by a rule that was **not tuned on the test data** — and check it isn't a single
+lucky observation (bootstrap / re-cut the split / report top-1 position share). When a design bundles multiple
+levers, isolate each: a lever that doesn't move the held-out metric is not part of the edge (it may still be
+justified as risk-control — say which). On <1 day of data this is a **method demo, not validation**; label it so.

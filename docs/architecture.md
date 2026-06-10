@@ -142,10 +142,20 @@ candidates. Because capital is **locked to settlement** (no early-exit), the arb
 are spread across **days**, not seconds — so the intuitive fix of "wait 1 s and sort that batch largest-first"
 (`batch1s`) reorders almost nothing: it captures only **3.6%** of the FIFO→optimal gap and ties FIFO at $2 k,
 while *adding* an entry-latency tax (`shadow_fill`: ~39% naked-leg at 1 s). The lever that works is a **global
-reservation price** (edge threshold τ: skip thin arbs, keep powder for fat ones) **plus a clip cap** so no
-single arb monopolizes the bankroll — it captured **+7127%** at $500 and tied the clairvoyant knapsack ceiling,
-at **zero added fill latency** (evaluate each arb at arrival, fire both legs immediately or skip). Allocation
-priority is a *bankroll-policy* decision over days; it must **not** be implemented as an execution delay.
-Caveat: τ here is swept **in-sample** (an oracle ceiling, not a deployable constant) and ordering is still
-**second-order to capital velocity** — no rule rescues throughput while one clip locks the bankroll for ~15 d.
-This is the design the (gated) clip stage should adopt over FIFO.
+edge threshold** (reservation price τ: skip thin arbs, keep powder for fat ones), evaluated at arrival with
+**zero added fill latency** — allocation priority is a *bankroll-policy* decision over days, never an execution delay.
+
+**Tested out-of-sample** (`scripts/clip_threshold_test.py`, audited): the trustworthy claim is a **non-oracle
+fixed rule — skip arbs under ~2¢, cap ~5% of bankroll per pair — which beats FIFO by ~+61%** on a held-out late
+window it was never tuned on (11 positions, diversified). The eye-popping in-sample numbers (**+7127%**, and a
+fitted **+462%** OOS) are **oracle / single-observation artifacts**, not validation — the +462% is 93% *one*
+econ contract, and re-cutting the split inflates it arbitrarily via the shrinking FIFO denominator; do not quote
+them as results. Two refinements the test surfaced: (1) the **clip cap alone is risk-control, not PnL** (−3% OOS
+— capping in FIFO order just diversifies into *thin* arbs; its job is bounding per-pair exposure against a
+settlement-void / leg-fail, while the *threshold* does the return work); (2) under a ≥0.5¢ friction haircut FIFO
+collapses to **$0** (its lone funded arb is sub-edge and the haircut zeroes it) while the thresholded design stays
+positive — a one-position degeneracy at $500, but it shows why an edge floor above the friction cost is load-bearing.
+Ordering remains **second-order to capital velocity** — no rule rescues throughput while one clip locks the bankroll
+for ~15 d. Net: the (gated) clip stage should adopt **edge-floor + per-pair cap** over FIFO, but the magnitude is a
+**method demo on 0.86 d / one event cluster** — real validation needs the weeks of multi-date data now accumulating
+(K-fold over disjoint windows, friction inside the OOS arm, per-position bootstrap CIs).
