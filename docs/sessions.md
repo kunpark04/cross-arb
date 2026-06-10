@@ -44,15 +44,23 @@ absent. Owner greenlit the gated redeploy ([0006](../decisions/0006-deploy-on-di
 - **Added [docs/architecture.md](architecture.md)** — data-flow diagram (Mermaid + ASCII) venues → discovery →
   monitor → transitions → analysis/bot, with a stage-walkthrough table and the read-only→trade boundary where the
   clip / position-size lever sits. Indexed in CLAUDE.md (doc-hygiene rule).
-- **Tested the clip-stage allocation policy** (owner asked: is FIFO blind to bigger arbs?). `alloc_policy_experiment.py`
-  (4-agent workflow + verify): FIFO-by-arrival pins $499.97/$500 on whatever crosses first (funds 1/226); the
-  "wait 1 s + sort the batch" idea captures only **3.6%** of the FIFO→optimal gap and *adds* a ~39% naked-leg
-  latency tax — the lever is a **global edge threshold**, not a batch window. Then `clip_threshold_test.py` tested
-  **edge-floor + clip cap out-of-sample** (stats-ml audit: `tasks/_agent_bus/20260610-0522/`): trustworthy claim
-  is a **non-oracle fixed rule (skip <2¢, cap ~5%/pair) = +61% over FIFO OOS**; the +7127%/+462% are oracle /
-  single-obs artifacts (the +462% is 93% one econ contract). **Clip cap alone = risk-control, not PnL (−3% OOS)**;
-  FIFO → $0 under ≥0.5¢ friction. Method demo on 0.86 d. Also fixed `account_sim.py --selftest` (list-vs-int).
-  → [L19](../tasks/lessons.md) (in-sample sweep is an oracle; quote the OOS non-tuned number).
+- **Tested the clip-stage allocation policy + fixed a phantom-inflated number** (owner asked: is FIFO blind to
+  bigger arbs?). Brief: [research/allocation-policy-2026-06-10.md](../research/allocation-policy-2026-06-10.md);
+  decision [0012](../decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md); audit
+  `tasks/_agent_bus/20260610-0522/`. `alloc_policy_experiment.py` (4-agent workflow + verify): FIFO-by-arrival
+  pins ~$500 on whatever crosses first (funds 1/219); the "wait 1 s + sort the batch" idea captures only **3.6%**
+  of the FIFO→optimal gap and *adds* a ~39% naked-leg latency tax — the lever is a **global edge floor**, not a
+  batch window. `clip_threshold_test.py` then tested **edge-floor + clip cap out-of-sample**: trustworthy claim is
+  a **non-oracle fixed rule (2¢ floor + a deploy-to-full cap ~10–20%/pair) = +64% to +269% over FIFO OOS** (11
+  diversified pairs); the +1744%(in-sample)/+462%(fitted) are oracle/single-obs artifacts (the +462% is 93% one
+  econ contract). **Clip-cap alone = risk-control, not PnL (−3% OOS)**; FIFO → $0 under ≥0.5¢ friction; ordering
+  stays 2nd-order to capital velocity (only ~19 arbs clear 2¢/0.81 d). **Phantom found + fixed:** the fattest
+  "arb" (37.7¢ ITF tennis, depth 690) was a book-init artifact (captured 1.5 s post-resubscribe in a restart
+  storm, flat `c2==c1==c0`, `censored=restart`) = **75% of the old in-sample headline**; `capital_sim.capturable()`
+  now drops restart-censored (it didn't, though `analyze_persistence` already did) → candidates 226→219, in-sample
+  +7127%→+1744%, OOS unchanged. Also fixed `account_sim.py --selftest` (list-vs-int). New scripts
+  `alloc_policy_experiment.py` + `clip_threshold_test.py`. → [L19] (in-sample sweep is an oracle), [L20] (gate at
+  the shared chokepoint; instrumentation ≠ gating).
 
 ## 2026-06-09 — Second adversarial review (92-agent audit) + full fix landing
 

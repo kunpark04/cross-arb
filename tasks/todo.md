@@ -59,6 +59,17 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       (`…082.402`), per-venue `px` touches, **ECON now tracked** (U-3 `urc-…-atl4pt4` OPEN net **0.1222**,
       depth c2=423 — first econ edge ever captured), event-date partitioned (`transitions-2026-07-02.jsonl`).
       The multi-week accumulation clock effectively **restarts now** on the correct schema.
+- [x] **Clip-stage allocation tested + phantom fix (2026-06-10, [0012](../decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md), [brief](../research/allocation-policy-2026-06-10.md)):**
+      FIFO-by-arrival loses to a **2¢ edge floor + a deploy-to-full per-pair cap** (~+64% to +269% over FIFO
+      out-of-sample, 11 diversified pairs); the "wait 1 s + sort" idea captures only 3.6% of the gap; clip-cap
+      alone is **risk-control, not PnL** (−3% OOS). Found + fixed a **book-init phantom** (37.7¢ ITF tennis,
+      depth 690, captured 1.5 s post-resubscribe in a restart storm, `censored=restart`) that was **75% of the
+      old in-sample headline** — `capital_sim.capturable()` now drops restart-censored ([L20]); candidates
+      226→219, in-sample +7127%→+1744%, **OOS unchanged**. New `alloc_policy_experiment.py` +
+      `clip_threshold_test.py`. **Method demo on 0.81 d** — re-run on the multi-week data.
+- [ ] **Phantom hardening (deferred — needs a monitor-schema change):** log **both** venue book-ages (the `k=0`
+      fresh-subscribe tell is currently lost — `build_episodes` keeps only `max(p,k)`) + a **flat-depth**
+      (`c2==c1==c0`) flag, so a fresh-book phantom *without* a restart marker can also be filtered. ([L20])
 - [ ] **Now: let it run ≥ weeks + re-pull**, then re-run on the new-schema data: `shadow_fill`
       (now sub-second-resolvable → the REAL leg-fill rate at ~150ms), `adverse_selection` (toxic-close share
       from `px`), `settle_recon` (after pmus markets pass `endDate`), `analyze_persistence`/`capital_sim`

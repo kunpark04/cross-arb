@@ -92,6 +92,18 @@ See [deploy/README.md](deploy/README.md).
   frozen) and econ (weeks-mo, outcome known only at the far release) are capital-locked** — the sports early-exit
   "rescue" is refuted. So weather = clean+fast+thin; sports = deep but capital-slow + void tail; econ = cleanest
   but slowest. **No category wins {clean settlement, fast capital, real depth}; weather comes closest on capital.**
+- **Clip-stage allocation — tested OOS + a phantom fixed (2026-06-10, [0012](decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md), [research/allocation-policy-2026-06-10.md](research/allocation-policy-2026-06-10.md)).**
+  `account_sim`'s FIFO-by-arrival is the worst rule when the bankroll binds (one deep clip eats the whole $500 →
+  funds 1/219). The owner's "wait 1 s + sort the batch" captures only **3.6%** of the FIFO→optimal gap (competing
+  arbs span *days*, not seconds) and *adds* a ~39%-naked-leg latency tax. The lever is a **global 2¢ edge floor**
+  (skip thin arbs) **+ a per-pair cap sized to fully deploy without over-concentrating** (~10–20%): **~+64% to
+  +269% over FIFO out-of-sample** on a held-out half it was never tuned on (11 diversified pairs). **Clip-cap
+  ALONE is risk-control, not PnL** (−3% OOS — it just diversifies into thin arbs). Ordering stays **second-order
+  to capital velocity** (only ~19 arbs clear 2¢ in 0.81 d; $500 funds ~10 then locks). **Magnitudes PRELIMINARY**
+  (0.81 d / one cluster / paper-gross — method demo, not validated). The eye-popping in-sample numbers are oracle
+  artifacts ([L19]); a **book-init phantom** (a 37.7¢ ITF-tennis "arb" captured 1.5 s post-resubscribe, flat
+  `c2==c1==c0`, `censored=restart`) was 75% of the old in-sample headline until `capital_sim.capturable()` was
+  fixed to drop restart-censored — instrumentation ≠ gating ([L20]).
 
 ## Managerial docs index
 

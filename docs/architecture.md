@@ -137,8 +137,8 @@ different PnL at different clips.
 
 `account_sim.py` deploys the bankroll **strictly FIFO by arrival** (`sorted(key=open_t)`). Measured on the
 real data (`scripts/alloc_policy_experiment.py`, 0.86 d), that is the **worst** rule when the bankroll binds:
-at $500 the first arb to cross is a deep sports clip that eats **$499.97**, so FIFO funds **1 of 226**
-candidates. Because capital is **locked to settlement** (no early-exit), the arbs competing for that bankroll
+at $500 the first arb to cross is a deep sports clip that eats **~$500**, so FIFO funds **1 of 219**
+candidates (after restart-censored phantoms are filtered — [L20]). Because capital is **locked to settlement** (no early-exit), the arbs competing for that bankroll
 are spread across **days**, not seconds — so the intuitive fix of "wait 1 s and sort that batch largest-first"
 (`batch1s`) reorders almost nothing: it captures only **3.6%** of the FIFO→optimal gap and ties FIFO at $2 k,
 while *adding* an entry-latency tax (`shadow_fill`: ~39% naked-leg at 1 s). The lever that works is a **global
@@ -146,16 +146,22 @@ edge threshold** (reservation price τ: skip thin arbs, keep powder for fat ones
 **zero added fill latency** — allocation priority is a *bankroll-policy* decision over days, never an execution delay.
 
 **Tested out-of-sample** (`scripts/clip_threshold_test.py`, audited): the trustworthy claim is a **non-oracle
-fixed rule — skip arbs under ~2¢, cap ~5% of bankroll per pair — which beats FIFO by ~+61%** on a held-out late
-window it was never tuned on (11 positions, diversified). The eye-popping in-sample numbers (**+7127%**, and a
-fitted **+462%** OOS) are **oracle / single-observation artifacts**, not validation — the +462% is 93% *one*
-econ contract, and re-cutting the split inflates it arbitrarily via the shrinking FIFO denominator; do not quote
-them as results. Two refinements the test surfaced: (1) the **clip cap alone is risk-control, not PnL** (−3% OOS
-— capping in FIFO order just diversifies into *thin* arbs; its job is bounding per-pair exposure against a
-settlement-void / leg-fail, while the *threshold* does the return work); (2) under a ≥0.5¢ friction haircut FIFO
-collapses to **$0** (its lone funded arb is sub-edge and the haircut zeroes it) while the thresholded design stays
-positive — a one-position degeneracy at $500, but it shows why an edge floor above the friction cost is load-bearing.
-Ordering remains **second-order to capital velocity** — no rule rescues throughput while one clip locks the bankroll
-for ~15 d. Net: the (gated) clip stage should adopt **edge-floor + per-pair cap** over FIFO, but the magnitude is a
-**method demo on 0.86 d / one event cluster** — real validation needs the weeks of multi-date data now accumulating
+fixed rule — a hard ~2¢ edge floor (never lower) + a per-pair cap sized so the bankroll fully deploys without
+over-concentrating (~10–20% here) — which beats FIFO by ~+64% to +269%** on a held-out late window it was never
+tuned on (11 diversified positions, top-1 ≤22%). The big in-sample numbers (**+1744%**, and a fitted **+462%**
+OOS) are **oracle / single-observation artifacts**, not validation — the +462% is 93% *one* econ contract, and
+re-cutting the split inflates it arbitrarily via the shrinking FIFO denominator; do not quote them as results.
+Three things the test surfaced: (1) the **clip cap alone is risk-control, not PnL** (−3% OOS — capping in FIFO
+order just diversifies into *thin* arbs; its job is bounding per-pair exposure against a settlement-void /
+leg-fail, while the *threshold* does the return work; a 5% cap under-deploys to ~42%, ~20% fully deploys);
+(2) under a ≥0.5¢ friction haircut FIFO collapses to **$0** (its lone funded arb is sub-edge and the haircut
+zeroes it) while the thresholded design stays positive — a one-position degeneracy at $500, but it shows why an
+edge floor above the friction cost is load-bearing; (3) a **book-initialization phantom** (a 37.7¢ ITF-tennis
+"arb" captured 1.5 s after a resubscribe during a restart storm — flat `c2==c1==c0` ladder, `censored=restart`)
+was **75% of the old in-sample headline** until `capturable()` was fixed to drop restart-censored episodes
+([L20]); the in-sample number fell from +7127% to +1744%, while the OOS conclusions barely moved (the phantom
+lived in the in-sample half). Ordering remains **second-order to capital velocity** — no rule rescues throughput
+while one clip locks the bankroll for ~15 d, and with a 2¢ floor only ~19 arbs clear in 0.81 d. Net: the (gated)
+clip stage should adopt a **2¢ edge-floor + a deploy-to-full per-pair cap** over FIFO, but the magnitude is a
+**method demo on <1 d / one event cluster** — real validation needs the weeks of multi-date data now accumulating
 (K-fold over disjoint windows, friction inside the OOS arm, per-position bootstrap CIs).
