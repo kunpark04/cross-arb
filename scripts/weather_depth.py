@@ -20,7 +20,7 @@ import os, sys, re, argparse, collections
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 from colisted_map import get, KAL, pm_catalog, pm_bounds, kbounds, WX, ktok_iso
 
-KOB = KAL.replace("api.elections", "external-api")
+KOB = KAL   # /orderbook serves the same orderbook_fp shape on api.elections (verified 2026-06-10)
 
 
 def _fl(v):

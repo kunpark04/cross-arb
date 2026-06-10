@@ -1,65 +1,27 @@
 """UNIFIED cross-venue scanner (READ-ONLY). Covers the ENTIRE co-listed universe and KEEPS EVERY
 market (no edge pruning) with uniform metrics, for the live bot's later trade-selection layer.
-  - Weather: all 5 cities x co-listed dates, every 2F bucket.
+  - Weather: all 5 cities x co-listed dates, every 2F bucket (IDENTICAL-bounds join).
   - Sports moneyline: every co-listed league. Team/esport -> abbreviation join; individual -> surname.
 Metric per market (2 complementary outcomes A/B): net = 1 - (min askA + min askB) - fees;
-fillable size + $ on positive edges. Output -> _data/scan_all.json (+ summary)."""
-import json, os, sys, re, urllib.request, urllib.error, time, math, collections, unicodedata
+fillable size + $ on positive edges. Output -> _data/scan_all.json (+ summary).
+Matchers + fee models are IMPORTED from bot/ (colisted_map + ledger) — the scanner's old private
+copies drifted (detection charged the n=1 CEIL fee, violating [L15]; weather used an index-zip)."""
+import json, os, sys, re, time, collections
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
-from colisted_map import econ_colisted   # ECON co-listing (verified same-orientation >=threshold + Fed categorical)
+from colisted_map import (get, pm_catalog, econ_colisted, pair_weather_date, pick_game,
+                          surname, ktok_iso, wcity, pmlg, WX, LEAGUES, KAL)
+from ledger import kfee, pfee            # detection uses the MARGINAL (at-scale) fee — L10/L15
 
-UA={"User-Agent":"Mozilla/5.0","Accept":"application/json"}
-def get(url,tries=4):
-    for i in range(tries):
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url,headers=UA),timeout=30) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            if e.code==429 and i<tries-1: time.sleep(3); continue
-            return {"_err":e.code}
-        except Exception as e:
-            return {"_err":str(e)[:60]}
-    return {}
 def fl(v):
     try: return float(v)
     except: return 0.0
-def kfee(p): return math.ceil(0.07*100*p*(1-p))/100 if 0<p<1 else 0.0
-def pfee(p): return round(0.05*p*(1-p),4) if 0<p<1 else 0.0
-MON=["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
-def ktok_iso(t):
-    m=re.match(r"(\d{2})([A-Z]{3})(\d{2})",t); return f"20{m.group(1)}-{MON.index(m.group(2))+1:02d}-{m.group(3)}" if m else None
-def dnear(a,b):
-    from datetime import date
-    try:
-        ya,ma,da=map(int,a.split("-")); yb,mb,db=map(int,b.split("-")); return abs((date(ya,ma,da)-date(yb,mb,db)).days)<=1
-    except: return a==b
-def surname(name):
-    n=unicodedata.normalize("NFKD",str(name)).encode("ascii","ignore").decode().lower()
-    n=re.sub(r"[^a-z \-]"," ",n); t=[x for x in n.split() if x]; return t[-1] if t else ""
-def smatch(a,b):  # exact OR <=1-char prefix; the <=1 guard rejects distinct players (martin~martinez) - L1
-    if a==b: return True
-    if len(a)<4 or len(b)<4: return False
-    return (a.startswith(b) or b.startswith(a)) and abs(len(a)-len(b))<=1
-def pm_bounds(slug):                          # pm bucket -> inclusive (lo,hi) degF (mirrors bot/colisted_map.py)
-    s=str(slug).lower()
-    m=re.search(r"gte(\d+)lt(\d+)",s)
-    if m: return (int(m.group(1)),int(m.group(2)))
-    m=re.search(r"-lt(\d+)f",s)
-    if m: return (None,int(m.group(1))-1)
-    m=re.search(r"gte(\d+)",s)
-    return (int(m.group(1)),None) if m else (None,None)
-def kbounds(m):                               # Kalshi -> inclusive (lo,hi): middle [floor,cap]; tails floor+1/cap-1
-    fls,cap=m.get("floor_strike"),m.get("cap_strike")
-    if fls is None and cap is not None: return (None,cap-1)
-    if cap is None and fls is not None: return (fls+1,None)
-    return (fls,cap)
 def pm_book(slug):
     md=(get(f"https://gateway.polymarket.us/v1/markets/{slug}/book") or {}).get("marketData",{})
     offs=[(fl(x['px']['value']),fl(x['qty'])) for x in md.get("offers",[]) if x.get('px')]
     bids=[(fl(x['px']['value']),fl(x['qty'])) for x in md.get("bids",[]) if x.get('px')]
     return (max(bids) if bids else (None,0)),(min(offs) if offs else (None,0))  # (bid),(ask)
 def k_ob(ticker):
-    ob=get(f"https://external-api.kalshi.com/trade-api/v2/markets/{ticker}/orderbook").get("orderbook_fp",{})
+    ob=get(f"{KAL}/{ticker}/orderbook").get("orderbook_fp",{})   # same host as the matcher (verified same shape)
     yb=[(fl(p),fl(s)) for p,s in ob.get("yes_dollars",[])]; nb=[(fl(p),fl(s)) for p,s in ob.get("no_dollars",[])]
     ybid,ybsz=(max(yb) if yb else (0.0,0)); nbid,nbsz=(max(nb) if nb else (0.0,0))
     return ybid,ybsz,(round(1-nbid,2) if nbid else None),nbsz  # yes_bid, yes_bid_sz, yes_ask, yes_ask_sz(=top no-bid sz)
@@ -67,60 +29,41 @@ def k_ob(ticker):
 def metric(pmA_ask,pmA_sz,pmB_ask,pmB_sz,kA_ask,kA_sz,kB_ask,kB_sz):
     if None in (pmA_ask,pmB_ask,kA_ask,kB_ask): return None
     minA=min(pmA_ask,kA_ask); minB=min(pmB_ask,kB_ask)
-    net=round((1-(minA+minB)) - (pfee(pmA_ask) if minA==pmA_ask else kfee(kA_ask))
-                              - (pfee(pmB_ask) if minB==pmB_ask else kfee(kB_ask)),3)
+    net=round((1-(minA+minB)) - (pfee(pmA_ask) if minA==pmA_ask else kfee(kA_ask,marginal=True))
+                              - (pfee(pmB_ask) if minB==pmB_ask else kfee(kB_ask,marginal=True)),3)
     bA="PM" if minA==pmA_ask else "K"; bB="PM" if minB==pmB_ask else "K"
     szA=pmA_sz if bA=="PM" else kA_sz; szB=pmB_sz if bB=="PM" else kB_sz
     size=int(min(szA,szB));
     return {"net":net,"buyA":bA,"buyB":bB,"size":size,"dollar":round(max(net,0.0)*size,2),
             "pm_askA":pmA_ask,"k_askA":kA_ask,"pm_askB":pmB_ask,"k_askB":kB_ask}
 
-# ---------- pull PM.us catalog ----------
-allm,off=[],0
-while True:
-    d=get(f"https://gateway.polymarket.us/v1/markets?closed=false&limit=500&offset={off}")
-    pg=d.get("markets",[]); allm+=pg
-    if len(pg)<500 or len(allm)>12000: break
-    off+=500
-def pmlg(s):
-    p=str(s).split("-"); return p[1] if len(p)>1 else "?"
+# ---------- pull PM.us catalog (shared paginator: 12k-cap warning included) ----------
+allm=pm_catalog()
 rows=[]
 
 # ---------- WEATHER ----------
-WX={"sfo":"KXHIGHTSFO","lax":"KXHIGHLAX","nyc":"KXHIGHNY","mia":"KXHIGHMIA","mdw":"KXHIGHCHI"}
 clim=[m for m in allm if m.get("category")=="climate"]
-def wcity(s):
-    m=re.search(r"tc-temp-([a-z]+?)high",str(s)); return m.group(1) if m else None
-def pm_lo(s):
-    m=re.search(r"-lt(\d+)f",s); m2=re.search(r"gte(\d+)",s); return (int(m.group(1))-100) if m else (int(m2.group(1)) if m2 else 0)
 for city,kser in WX.items():
     pmc=[m for m in clim if wcity(m.get("slug"))==city]
     if not pmc: continue
     bydate=collections.defaultdict(list)
     for m in pmc:
         dm=re.search(r"(\d{4}-\d{2}-\d{2})",str(m.get("slug")));  bydate[dm.group(1) if dm else "?"].append(m)
-    kd=get(f"https://external-api.kalshi.com/trade-api/v2/markets?series_ticker={kser}&limit=1000"); time.sleep(0.3)
+    kd=get(f"{KAL}?series_ticker={kser}&limit=1000"); time.sleep(0.3)
     kby=collections.defaultdict(list)
     for m in kd.get("markets",[]):
         dm=re.search(r"-(\d{2}[A-Z]{3}\d{2})",str(m.get("ticker")));
         if dm: kby[ktok_iso(dm.group(1))].append(m)
     for date in sorted(set(bydate)&set(kby)):
-        pm=sorted(bydate[date],key=lambda m:pm_lo(str(m.get("slug")).lower()))
-        kb=sorted(kby[date],key=lambda m:(m.get("floor_strike") if m.get("floor_strike") is not None else -999))
-        for i in range(min(len(pm),len(kb))):
-            if pm_bounds(pm[i].get("slug"))!=kbounds(kb[i]):   # C4: boundary-NUMBER equality guard
-                continue                                       # non-identical floor/cap -> don't pair (settlement-identity)
-            (pb,pbs),(pa,pas)=pm_book(str(pm[i].get("slug"))); time.sleep(0.12)
-            kyb,kybs,kya,kyas=k_ob(kb[i].get("ticker")); time.sleep(0.12)
+        pairs,_flags=pair_weather_date(bydate[date],kby[date])   # IDENTICAL-bounds dict join (C4/M1)
+        for pmm,kmm,_b in pairs:
+            (pb,pbs),(pa,pas)=pm_book(str(pmm.get("slug"))); time.sleep(0.12)
+            kyb,kybs,kya,kyas=k_ob(kmm.get("ticker")); time.sleep(0.12)
             mt=metric(pa,pas,(round(1-pb,2) if pb is not None else None),pbs, kya,kyas,(round(1-kyb,2) if kyb else None),kybs)
             if mt: rows.append({"cat":"weather","group":city,"date":date,
-                                "A":str(kb[i].get("yes_sub_title")),"B":"NOT "+str(kb[i].get("yes_sub_title")),**mt})
+                                "A":str(kmm.get("yes_sub_title")),"B":"NOT "+str(kmm.get("yes_sub_title")),**mt})
 
 # ---------- SPORTS moneyline ----------
-LEAGUES={"mlb":("KXMLBGAME","abbrev"),"wnba":("KXWNBAGAME","abbrev"),"nba":("KXNBAGAME","abbrev"),
- "nhl":("KXNHLGAME","abbrev"),"cs2":("KXCS2GAME","abbrev"),"lol":("KXLOLGAME","abbrev"),
- "valorant":("KXVALORANTGAME","abbrev"),"atp":("KXATPMATCH","surname"),"wta":("KXWTAMATCH","surname"),
- "itfm":("KXITFMATCH","surname"),"itfw":("KXITFWMATCH","surname"),"ufc":("KXUFCFIGHT","surname")}
 pmg=collections.defaultdict(list)
 for x in allm:
     if x.get("category")!="sports" or x.get("marketType")!="moneyline" or not x.get("gameStartTime"): continue
@@ -129,7 +72,7 @@ for x in allm:
     pmg[L].append(x)
 for L,(series,join) in LEAGUES.items():
     if not pmg.get(L): continue
-    kd=get(f"https://external-api.kalshi.com/trade-api/v2/markets?series_ticker={series}&status=open&limit=1000"); time.sleep(0.4)
+    kd=get(f"{KAL}?series_ticker={series}&status=open&limit=1000"); time.sleep(0.4)
     byev=collections.defaultdict(dict); evd={}
     for m in kd.get("markets",[]):
         ev=m.get("event_ticker"); tk=str(m.get("ticker",""));
@@ -138,6 +81,7 @@ for L,(series,join) in LEAGUES.items():
         if key: byev[ev][key]={"ybid":fl(m.get("yes_bid_dollars")),"yask":fl(m.get("yes_ask_dollars")),"ticker":tk}
     kbydate=collections.defaultdict(list)
     for ev,pl in byev.items(): kbydate[evd.get(ev)].append(pl)
+    used=set()                                                # doubleheader guard: one Kalshi event, one pm game
     for x in pmg[L]:
         sides=[s for s in (x.get("marketSides") or []) if (s.get("team") or {}).get("name")]
         if len(sides)<2: continue
@@ -146,17 +90,7 @@ for L,(series,join) in LEAGUES.items():
         else: kA=surname((lo.get("team") or {}).get("name")); kB=surname((ot.get("team") or {}).get("name"))
         sm=re.search(r"(\d{4}-\d{2}-\d{2})",str(x.get("slug")))   # C2: pm slug ET date == Kalshi ticker date (exact join)
         date=sm.group(1) if sm else str(x.get("gameStartTime"))[:10]
-        def _mg(pl, kA=kA, kB=kB, join=join):
-            ks=list(pl.keys())
-            mA=next((s for s in ks if (s==kA if join=="abbrev" else smatch(s,kA))),None)
-            mB=next((s for s in ks if (s==kB if join=="abbrev" else smatch(s,kB))),None)
-            return (pl,mA,mB) if (mA and mB and mA!=mB) else None
-        found=None
-        if date in kbydate:                                       # EXACT date -> kills the adjacent-series mispair
-            found=next((g for pl in kbydate[date] if (g:=_mg(pl))),None)
-        if not found and sm is None:                              # no slug date -> +/-1 fallback only if UNIQUE
-            near=[g for kdt in kbydate if kdt and dnear(kdt,date) for pl in kbydate[kdt] if (g:=_mg(pl))]
-            found=near[0] if len(near)==1 else None
+        found=pick_game(kbydate,kA,kB,join,date,slug_dated=sm is not None,used=used)   # shared binder (C2+M3)
         if not found: continue
         pl,mA,mB=found
         (pb,pbs),(pa,pas)=pm_book(str(x.get("slug"))); time.sleep(0.12)
