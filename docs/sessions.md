@@ -6,6 +6,45 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-10 (UTC) — GATED redeploy: droplet brought to current HEAD (ms+px+ECON now live)
+
+Found the live droplet was running a **pre-`dabc106` monitor** — diagnosed not by inference but by checksum:
+deployed `bot/monitor.py` (`596ac46d…`) ≠ local HEAD (`946dfcb0…`), and deployed `colisted_map.py` had **zero
+`ECON`**. So the multi-week accumulation was silently running on the **wrong schema**: integer-second `t` (can't
+resolve the sub-second leg-fill regime — the documented #1 execution risk), no per-venue `px` (no
+adverse-selection signal), and the entire **econ** category (the cleanest US-legal subset, 24 clean pairs)
+absent. Owner greenlit the gated redeploy ([0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
+
+- **Deployed current HEAD** via `deploy/deploy.sh cross-arb-droplet` (ships only the runtime cone + the two
+  read-only secrets out-of-band; re-provision; restart). Service `active (running)`, RSS ~47 MB.
+- **Verified end-to-end on disk** (not just "active", per [L9](../tasks/lessons.md)): deployed `monitor.py`
+  sha now **byte-identical** to local HEAD; `round(time.time(), 3)` ms-logging present; `ECON` present. Live
+  records carry fractional `t` (`1781057082.402`) + per-venue `px` (`{"p_yb":…,"k_ya":…}`). **ECON is live and
+  immediately found edges**: `urc-…-june-2026-07-02-atl4pt4 OPEN net 0.1222, depth c2=423` — a 12.2¢ U-3 edge
+  with real depth, event-date-partitioned to `transitions-2026-07-02.jsonl`. First econ data point ever
+  collected. (Magnitude preliminary / n=1 like every `$`/`%` figure here.)
+- **Effect:** the accumulation clock restarts now on the correct schema. Todo updated — next is let-it-run
+  ≥ weeks + re-pull, then re-run `shadow_fill`/`adverse_selection`/`settle_recon`/`analyze_persistence`/
+  `capital_sim` + a first ECON persistence read.
+- **Re-ran all five harnesses on the 0.86 d mirror** (owner asked for "now," not weeks): persistence (median
+  edge 0.46¢, median life 3 s; MLB line-lag is the persistent tail), `capital_sim` (peak ~$33 k / ~1.4%/day,
+  preliminary), `shadow_fill` (sub-second buckets STILL resolution-limited — the ms data is only ~30 min old,
+  so the gating leg-fill question is instrumented-not-answered), `adverse_selection` (n=7, noise),
+  `settle_recon` (still inconclusive — pmus `closed`≠finalized). All paper / gross / <1 day.
+- **Built `scripts/account_sim.py`** (self-tested) — fixed-bankroll ($500) sim answering "realized vs locked":
+  walks the bankroll forward, recycles capital at settlement, splits the book into **REALIZED** (exited) vs
+  **UNREALIZED** (locked). Result over 0.86 d: **~0 realized / ~100% locked** (nothing settles that fast —
+  the capital-velocity finding made literal). The clip sweep is non-monotonic because PnL = deployed-capital ×
+  avg-edge-per-contract and a fixed $500 saturates the capital term immediately → PnL peaks at moderate
+  diversification (~clip 25), not at max or min size.
+- **Confirmed discovery is parallel/batch, not sequential** (answering "how do arbs arrive first"): one catalog
+  pull + concurrent WS subscribe; `open_t` = the real book-crossing instant (~97% genuine, ~3% restart re-emits).
+  Corrected an earlier over-claim that arrival order was a subscription artifact — the clip's path-dependency is
+  a genuine online-allocation effect, not a bug.
+- **Added [docs/architecture.md](architecture.md)** — data-flow diagram (Mermaid + ASCII) venues → discovery →
+  monitor → transitions → analysis/bot, with a stage-walkthrough table and the read-only→trade boundary where the
+  clip / position-size lever sits. Indexed in CLAUDE.md (doc-hygiene rule).
+
 ## 2026-06-09 — Second adversarial review (92-agent audit) + full fix landing
 
 Ran a second, deeper reviewer audit (10-dimension multi-agent find→adversarially-verify pass + manual

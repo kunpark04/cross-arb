@@ -53,10 +53,16 @@ WARNs. **All landed + self-tests green this session (2026-06-09):**
       latency), `settle_recon` (invariant #1 empirically open — pmus finalization lag), `adverse_selection`
       (instrumented). Acted: `monitor.py` now logs **ms timestamps** + per-venue `px`. See
       [execution-feasibility brief](../research/execution-feasibility-2026-06-09.md) + [latency-playbook](../research/latency-playbook.md).
-- [ ] **Next concrete step — GATED redeploy (consult owner, [0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)):**
-      deploy the ms-resolution + `px`-logging monitor, let it run ≥ weeks, re-pull, then: re-run `shadow_fill`
-      (now sub-second-resolvable → the REAL leg-fill rate at ~150ms), `adverse_selection` (toxic-close share),
-      `settle_recon` (after pmus markets pass `endDate`), and `analyze_persistence`/`capital_sim` (multi-day edge).
+- [x] **GATED redeploy DONE (2026-06-10 UTC, owner-greenlit [0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)):**
+      droplet brought from a pre-`dabc106` build (integer-second `t`, no `px`, **no ECON**) to current HEAD
+      (`monitor.py` sha verified byte-identical to local). Verified live on disk: ms-precision `t`
+      (`…082.402`), per-venue `px` touches, **ECON now tracked** (U-3 `urc-…-atl4pt4` OPEN net **0.1222**,
+      depth c2=423 — first econ edge ever captured), event-date partitioned (`transitions-2026-07-02.jsonl`).
+      The multi-week accumulation clock effectively **restarts now** on the correct schema.
+- [ ] **Now: let it run ≥ weeks + re-pull**, then re-run on the new-schema data: `shadow_fill`
+      (now sub-second-resolvable → the REAL leg-fill rate at ~150ms), `adverse_selection` (toxic-close share
+      from `px`), `settle_recon` (after pmus markets pass `endDate`), `analyze_persistence`/`capital_sim`
+      (multi-day edge), and a first **ECON** persistence/depth read (brand-new category in the dataset).
 - [ ] **Still needs the trade layer or in-season data:** (a) the **bot unwind rule** (close MLB before Kalshi's
       2-day window; reads `void_clean`); (b) latency-haircut from a real order-ack study + leg-fill EV (0010 items
       2/3); (c) `p_gap`/`loss_frac` refinement; (d) NBA/NHL settlement read in season; (e) CLI-revision rate.
