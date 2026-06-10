@@ -132,3 +132,20 @@ size to commit per pair, bounded by the book's own depth and the remaining bankr
 deployed greedily as edges cross in real time, the clip controls the diversification/concentration tradeoff
 (see the `account_sim.py` sweep) — a genuine strategy parameter, which is why the same observed data yields
 different PnL at different clips.
+
+## Allocation policy: which arbs get the scarce bankroll (FIFO is *not* the plan)
+
+`account_sim.py` deploys the bankroll **strictly FIFO by arrival** (`sorted(key=open_t)`). Measured on the
+real data (`scripts/alloc_policy_experiment.py`, 0.86 d), that is the **worst** rule when the bankroll binds:
+at $500 the first arb to cross is a deep sports clip that eats **$499.97**, so FIFO funds **1 of 226**
+candidates. Because capital is **locked to settlement** (no early-exit), the arbs competing for that bankroll
+are spread across **days**, not seconds — so the intuitive fix of "wait 1 s and sort that batch largest-first"
+(`batch1s`) reorders almost nothing: it captures only **3.6%** of the FIFO→optimal gap and ties FIFO at $2 k,
+while *adding* an entry-latency tax (`shadow_fill`: ~39% naked-leg at 1 s). The lever that works is a **global
+reservation price** (edge threshold τ: skip thin arbs, keep powder for fat ones) **plus a clip cap** so no
+single arb monopolizes the bankroll — it captured **+7127%** at $500 and tied the clairvoyant knapsack ceiling,
+at **zero added fill latency** (evaluate each arb at arrival, fire both legs immediately or skip). Allocation
+priority is a *bankroll-policy* decision over days; it must **not** be implemented as an execution delay.
+Caveat: τ here is swept **in-sample** (an oracle ceiling, not a deployable constant) and ordering is still
+**second-order to capital velocity** — no rule rescues throughput while one clip locks the bankroll for ~15 d.
+This is the design the (gated) clip stage should adopt over FIFO.

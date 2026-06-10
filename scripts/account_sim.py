@@ -172,14 +172,14 @@ def _selftest():
     ]
     # bankroll $50 @ ~$0.98/contract -> affords ~51 contracts -> fills FIRST (400 wanted -> 51), skips SECOND
     r = run_account(eps, 50, 1000, 0.0, 0, 28, 0.0, 0.0, 1, 0)
-    assert r["entered"] == 1, r["entered"]
+    assert len(r["entered"]) == 1, r["entered"]
     assert r["skipped_capital"] == 1, r["skipped_capital"]
     assert r["skipped_partial"] == 1                          # first was depth-400 but only 51 affordable
     assert len(r["realized"]) == 0 and len(r["unrealized"]) == 1   # settle@+28h is after the window -> locked
     assert r["unrealized_pnl"] > 0 and r["realized_pnl"] == 0
     # generous bankroll -> both enter; still both unrealized (settle after window)
     r2 = run_account(eps, 100000, 1000, 0.0, 0, 28, 0.0, 0.0, 1, 0)
-    assert r2["entered"] == 2 and r2["skipped_capital"] == 0
+    assert len(r2["entered"]) == 2 and r2["skipped_capital"] == 0
     assert len(r2["unrealized"]) == 2 and len(r2["realized"]) == 0
     # a dated slug always returns its ABSOLUTE event-date settle time (far future for 2026) -> unrealized here
     r3 = run_account(eps, 100000, 1000, 0.0, 0, 0.001, 0.0, 0.0, 1, 0)
