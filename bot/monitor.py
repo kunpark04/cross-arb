@@ -162,9 +162,11 @@ def game_edge(pm_bid, pm_ask, kA_ask, kB_ask):
     (out of scope for a CROSS-venue strategy). A strictly-crossed pm book is rejected as stale (C3)."""
     if pm_bid is not None and pm_ask is not None and pm_bid > pm_ask:   # strictly-crossed pm book -> stale
         return None
-    if pm_ask is not None and kA_ask is not None and abs(pm_ask - kA_ask) > 0.40:   # C3 orientation/identity guard:
-        return None   # pm-YES(=A) ask and Kalshi-A ask price the SAME team -> a >40c gap is a flip/mismatch (L1/L12),
-                      # NOT edge (real cross-venue arb is a few cents). Quarantines a mis-oriented YES=teamA pair.
+    guard_pm = pm_ask if pm_ask is not None else pm_bid   # one-sided pm book: fall back to the bid so the
+    if guard_pm is not None and kA_ask is not None and abs(guard_pm - kA_ask) > 0.40:   # C3 orientation guard
+        return None   # still covers dir KP (pre-fix a missing pm ask left KP unguarded): pm-YES(=A) and
+                      # Kalshi-A price the SAME team -> a >40c gap is a flip/mismatch (L1/L12), NOT edge
+                      # (real cross-venue arb is a few cents). Quarantines a mis-oriented YES=teamA pair.
     opts = []   # DETECTION uses the at-scale marginal Kalshi fee (no ceil) — capture any arb +EV at size
     if pm_ask is not None and kB_ask is not None:                       # PK: back A@P + B@K
         opts.append(("PK", round((1 - (pm_ask + kB_ask)) - pfee(pm_ask) - kfee(kB_ask, marginal=True), 4)))
@@ -238,11 +240,14 @@ class FlipDebouncer:
     frames (the legs move one at a time), and a half-updated book can momentarily drop the arb. This
     holds a CLOSE for `window` seconds: if an OPPOSITE-direction OPEN follows it becomes one FLIP; a
     SAME-direction reopen is a flicker and is suppressed; otherwise the CLOSE is flushed once the window
-    elapses. feed()/flush() return the list of (label, state, key) tuples to actually log."""
+    elapses. feed()/flush() return (label, state, key, t) tuples to log — t is the DETECTION time, so a
+    flushed CLOSE carries the moment the edge actually died, NOT the flush time. (Pre-fix the flush time
+    was logged, silently adding ~1.0-1.5s to EVERY episode duration — fatal to sub-second leg-fill
+    analysis, the #1 execution-risk metric. See decision 0013.)"""
     def __init__(self, window=1.0):
         self.window = window
         self.last_arb_dir = {}                 # key -> dir while arb'd
-        self.pending = {}                      # key -> (t, closed_from_dir, close_state)
+        self.pending = {}                      # key -> (t_detect, closed_from_dir, close_state)
     def feed(self, label, state, key, now):
         if not label:
             return []
@@ -258,12 +263,12 @@ class FlipDebouncer:
                     self.last_arb_dir[key] = state["dir"]
                     return []                  # same-direction reopen = flicker, suppress
         self.last_arb_dir[key] = state["dir"]
-        return [(label, state, key)]
+        return [(label, state, key, now)]
     def flush(self, now):
         out = []
         for key in [k for k, (t, _, _) in self.pending.items() if now - t > self.window]:
             t, _, st = self.pending.pop(key); self.last_arb_dir.pop(key, None)
-            out.append(("CLOSE", st, key))
+            out.append(("CLOSE", st, key, t))  # t = detection time (when the edge died), not flush time
         return out
     def forget(self, key):                     # drop a settled market's debounce state (called on prune)
         self.pending.pop(key, None)
@@ -305,6 +310,16 @@ class TransitionLogger:
         books, which momentarily drops every Kalshi-derived edge then re-opens it — analysis force-closes
         episodes here (like a restart) so those spurious re-OPENs aren't counted as real."""
         rec = {"t": int(time.time()), "event": "kalshi_resync", **info}
+        with open(os.path.join(self.dir, "sessions.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return rec
+    def reconnect(self, venue, info=None):
+        """Mark a venue WS reconnect in sessions.jsonl. A Kalshi reconnect clears + rebuilds every book
+        from fresh snapshots (and a pmus reconnect resumes after a frozen gap), so edge changes that
+        happened DURING the outage surface as transitions stamped at reconnect time — the same
+        book-initialization phantom class as a restart ([L20]). Pre-fix these were UNMARKED, so analysis
+        could not censor them; now load() treats ws_reconnect like session_start/kalshi_resync."""
+        rec = {"t": int(time.time()), "event": "ws_reconnect", "venue": venue, **(info or {})}
         with open(os.path.join(self.dir, "sessions.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
         return rec
@@ -379,14 +394,16 @@ def _selftest():
     A = {"arb": True, "dir": "PK", "net": 0.03}; Ac = {"arb": False, "dir": "PK", "net": -0.01}
     B = {"arb": True, "dir": "KP", "net": 0.04}
     d = FlipDebouncer(1.0)
-    assert d.feed("OPEN", A, "m", 100.0) == [("OPEN", A, "m")]
-    assert d.feed("CLOSE", Ac, "m", 100.2) == []                  # held
-    assert d.feed("OPEN", B, "m", 100.3) == [("FLIP", B, "m")]    # opposite within window -> FLIP
+    assert d.feed("OPEN", A, "m", 100.0) == [("OPEN", A, "m", 100.0)]
+    assert d.feed("CLOSE", Ac, "m", 100.2) == []                       # held
+    assert d.feed("OPEN", B, "m", 100.3) == [("FLIP", B, "m", 100.3)]  # opposite within window -> FLIP
     d2 = FlipDebouncer(1.0); d2.feed("OPEN", A, "m", 0.0); d2.feed("CLOSE", Ac, "m", 0.1)
-    assert d2.feed("OPEN", A, "m", 0.2) == []                     # same dir within window -> flicker
+    assert d2.feed("OPEN", A, "m", 0.2) == []                          # same dir within window -> flicker
     d3 = FlipDebouncer(1.0); d3.feed("OPEN", A, "m", 0.0); d3.feed("CLOSE", Ac, "m", 0.1)
-    assert d3.flush(0.5) == [] and d3.flush(2.0) == [("CLOSE", Ac, "m")]   # real close flushes post-window
-    print("OK - FlipDebouncer: FLIP coalesce, flicker suppress, CLOSE flush")
+    assert d3.flush(0.5) == [] and d3.flush(2.0) == [("CLOSE", Ac, "m", 0.1)]   # flushed CLOSE carries the
+    # DETECTION time (0.1), NOT the flush tick (2.0) — pre-fix every episode duration gained ~1.0-1.5s,
+    # which is fatal to the sub-second leg-fill measurement (decision 0013).
+    print("OK - FlipDebouncer: FLIP coalesce, flicker suppress, CLOSE flushed at DETECTION time")
 
     # --- idle-market pruning: 2-miss debounce, then symmetric teardown frees every reference ---
     absent = {}
@@ -447,6 +464,8 @@ def _selftest():
     one = make_px([], lv([(0.55, 9)]), lv([(0.62, 9)]), lv([(0.70, 9)]))                   # P has NO bid (one-sided)
     os1 = edge_state(one); assert os1 and os1["arb"] and os1["dir"] == "P"                 # dir P still prices (was dropped before)
     assert game_edge(None, 0.50, 0.55, 0.44)["dir"] == "PK"                                # one-sided pm (no bid) -> PK still prices
+    assert game_edge(0.05, None, 0.55, 0.44) is None    # one-sided pm (no ASK): the >40c orientation guard now
+    # falls back to the BID, so a flipped/mismatched pair can't slip through dir KP unguarded
     print("OK - depth: signalled-direction pairs walk; crossed reject + ONE-SIDED books price per-direction")
 
     # --- NWS CLI parse (settlement timing/revision measurement) ---
@@ -554,6 +573,16 @@ def fetch_cli(station):
         return None
 
 
+def _build_id():
+    """Short content hash of this file — logged in session_start so deploys and crashes are
+    distinguishable in sessions.jsonl (same build restarting = crash; new build = deploy)."""
+    import hashlib
+    try:
+        return hashlib.sha256(open(__file__, "rb").read()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
 async def run_live(logger, refresh_sec=300, debounce=1.0):
     """Open both venue WS streams, route each book delta to the right tracker, log transitions. Self-
     discovers the co-listed universe (bot/colisted_map.py): WEATHER via the 1:1 MarketTracker, SPORTS via
@@ -569,20 +598,24 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     last_rx = {"pm": 0.0, "k": 0.0}               # epoch of the LAST frame received per venue (stream liveness,
                                                   # distinct from book-change `age`) -> beacon can expose a half-dead stream
 
-    def _write(label, state, key):
-        rec = logger.write(key, label, state, round(time.time(), 3))   # ms precision: int seconds hid the sub-second
-                                                                       # fill regime (shadow_fill.py couldn't resolve <1s)
+    def _write(label, state, key, t):
+        rec = logger.write(key, label, state, round(t, 3))   # ms precision + DETECTION time (a flushed CLOSE
+                                                             # carries when the edge died, not the flush tick)
         print(f"[{rec['t']}] {key} {label} dir={rec['dir']} net={rec['net_edge']}")
     def emit(label, state, key):
-        for lab, st, k in deb.feed(label, state, key, time.time()):
-            _write(lab, st, k)
+        for lab, st, k, t in deb.feed(label, state, key, time.time()):
+            _write(lab, st, k, t)
 
     def register(colisted):                       # add trackers for NEW markets; return (new slugs, new tickers)
         new_pm, new_k = [], []
-        # WEATHER + ECON = 1:1 binary same-outcome MarketTracker (pm /book is YES-oriented; econ >= matches
-        # Kalshi "Above T" YES, verified scripts/verify_econ_settlement.py + colisted_map ECON).
+        def _collide(*tks):                       # a Kalshi ticker may bind AT MOST one tracker: a silent
+            hit = [tk for tk in tks if tk in k_targets]   # overwrite cross-wires two markets' books (L1)
+            if hit: print(f"[coverage] WARNING duplicate Kalshi ticker(s) {hit} — pair SKIPPED (no-false-positive guard)")
+            return bool(hit)
+        # WEATHER + ECON = 1:1 binary same-outcome MarketTracker (pm /book is YES-oriented; econ pmus '>=T'
+        # matches the IDENTICAL Kalshi 'Above T-step' twin — decision 0013, scripts/verify_econ_settlement.py).
         for e in colisted["weather"] + colisted.get("econ", []):
-            if e["slug"] in pm_targets: continue
+            if e["slug"] in pm_targets or _collide(e["kalshi"]): continue
             trk = MarketTracker(e["slug"])
             def pm_fn(b, o, trk=trk, key=e["slug"]): trk.set_book("P", b, o); emit(*trk.evaluate(), key)
             def k_fn(book, trk=trk, key=e["slug"]): trk.set_book("K", book.yes_bid_ladder(), book.yes_offer_ladder()); emit(*trk.evaluate(), key)
@@ -590,7 +623,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             slug_k[e["slug"]] = [e["kalshi"]]
             new_pm.append(e["slug"]); new_k.append(e["kalshi"])
         for e in colisted["sports"]:              # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
-            if e["slug"] in pm_targets: continue
+            if e["slug"] in pm_targets or _collide(e["kalshi_a"], e["kalshi_b"]): continue
             g = GameTracker(e["slug"], e["kalshi_a"], e["kalshi_b"])
             def pm_fn(b, o, g=g, key=e["slug"]): g.set_pm(best_px(b), best_px(o)); g.feed_pm(b, o); emit(*g.evaluate(), key)
             def ka_fn(book, g=g, key=e["slug"]): g.set_kalshi("A", book.best()[1]); g.feed_kalshi("A", book); emit(*g.evaluate(), key)
@@ -611,8 +644,9 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports + "
           f"{len(colisted.get('econ', []))} econ ({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
     _counts = {"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
-               "econ": len(colisted.get("econ", [])), "pmus": len(pm_targets), "kalshi": len(k_targets)}
-    logger.session_start(_counts)   # restart marker
+               "econ": len(colisted.get("econ", [])), "pmus": len(pm_targets), "kalshi": len(k_targets),
+               "build": _build_id(), "argv": " ".join(sys.argv[1:])}   # deploy-vs-crash forensics: 23
+    logger.session_start(_counts)   # restart marker                   # indistinguishable restarts in 21h
     logger.health(_counts)          # liveness beacon (startup)
 
     async def pmus_stream():
@@ -639,8 +673,10 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                             fn(md.get("bids", []), md.get("offers", []))
             except Exception as e:
                 print(f"[pmus] stream dropped ({e!r}); reconnect in {backoff}s")
-            else:
+                logger.reconnect("pm", {"reason": "drop"})    # censoring marker: outage-gap changes surface
+            else:                                             # at reconnect time (book-init phantom class)
                 print(f"[pmus] stream closed cleanly; reconnect in {backoff}s")   # the dangerous case made non-fatal
+                logger.reconnect("pm", {"reason": "clean"})
             finally:
                 conns.pop("pm", None)
             await asyncio.sleep(backoff)
@@ -648,29 +684,31 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
 
     async def kalshi_stream():
         # RSA-PSS handshake + orderbook_delta, merged via KalshiBook (bot/kalshi_book.py; validated
-        # offline + live). seq is ONE per-connection counter -> a gap means resubscribe everything.
-        # SUPERVISED reconnect loop (see pmus_stream): on (re)connect, clear+rebuild books from fresh snapshots
-        # and re-subscribe the CURRENT tickers. Tracker `state` is intentionally NOT reset (retained state avoids a
-        # phantom CLOSE on every edge; the tracker's K-book cache is separate from the global `books` dict).
+        # offline + live). INVARIANT: exactly ONE subscribe per connection — SeqTracker's single
+        # monotonic counter was only ever live-verified for a single subscription, and a second
+        # subscribe's behavior (error? second sid with its own seq?) is UNVERIFIED (probe TODO). So a
+        # seq gap and a mid-session ticker ADD both CYCLE the connection (close -> supervised reconnect
+        # rebuilds everything from fresh snapshots with one subscribe over the CURRENT k_targets)
+        # instead of in-place resubscribing on unverified semantics. Tracker `state` is intentionally
+        # NOT reset (retained state avoids a phantom CLOSE on every edge; the reconnect MARKER below
+        # lets analysis censor the rebuild window instead).
         backoff = 1
         while True:
             try:
                 async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
                     conns["k"] = ws
-                    async def subscribe(tickers):
-                        await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
-                            "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}}))
                     books.clear()                              # fresh connection -> rebuild every book from snapshots
-                    await subscribe(list(k_targets))
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                        "params": {"channels": ["orderbook_delta"], "market_tickers": list(k_targets)}}))
                     st = SeqTracker()                          # books is shared (run_live scope) so prune can free it
                     backoff = 1
                     async for raw in ws:
                         last_rx["k"] = time.time()
                         o = json.loads(raw)
-                        if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> resync all
-                            books.clear(); st.reset(); await subscribe(list(k_targets))
+                        if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> missed data
                             logger.resync({"seq": o["seq"]})            # mark it so analysis censors the re-OPENs
-                            continue
+                            print("[kalshi] seq gap -> cycling connection (single-subscription invariant)")
+                            break                                       # close -> supervised loop rebuilds clean
                         typ, msg = o.get("type"), o.get("msg", {}); tk = msg.get("market_ticker")
                         if typ == "orderbook_snapshot":
                             books[tk] = KalshiBook(tk); books[tk].apply_snapshot(msg)
@@ -683,59 +721,86 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                             fn(books[tk])
             except Exception as e:
                 print(f"[kalshi] stream dropped ({e!r}); reconnect in {backoff}s")
-            else:
+                logger.reconnect("k", {"reason": "drop"})     # censoring marker: the books.clear() rebuild
+            else:                                             # surfaces outage-gap changes at reconnect time
                 print(f"[kalshi] stream closed cleanly; reconnect in {backoff}s")
+                logger.reconnect("k", {"reason": "clean"})
             finally:
                 conns.pop("k", None)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-    async def rest_heartbeat():     # periodic FULL re-discovery: subscribe NEW markets + coverage audit
+    async def rest_heartbeat():     # periodic FULL re-discovery: subscribe NEW markets + coverage audit.
+        # SUPERVISED (like the streams): pre-fix this task had no try/except, so ONE transient error —
+        # most likely a ws.send racing a closing socket — killed discovery/prune/health-beacon FOREVER
+        # while the streams kept running (a silently shrinking collector).
         while True:
             await asyncio.sleep(refresh_sec)
-            fresh, r2 = await asyncio.to_thread(build_colisted_map)
-            for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
-                if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
-            if r2.get("weather_bucket_MISALIGNED"):     # C4: surface newly-listed misaligned buckets each heartbeat
-                print(f"[coverage] {len(r2['weather_bucket_MISALIGNED'])} weather bucket misalignments (NOT paired)")
-            new_pm, new_k = register(fresh)             # trackers for new weather days / games
-            if new_pm and conns.get("pm"):
-                for i in range(0, len(new_pm), shard_size):
-                    await conns["pm"].send(json.dumps({"subscribe": {
-                        "requestId": f"md-add-{int(time.time())}-{i}",
-                        "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
-                        "marketSlugs": new_pm[i:i + shard_size]}}))
-            if new_k and conns.get("k"):
-                await conns["k"].send(json.dumps({"id": 2, "cmd": "subscribe",
-                    "params": {"channels": ["orderbook_delta"], "market_tickers": new_k}}))
-            if new_pm:
-                print(f"[discovery] +{len(new_pm)} new markets subscribed")
-            # FREE settled markets: anything gone from discovery for PRUNE_THRESHOLD heartbeats. Keeps the
-            # working set = the live universe, so memory stays flat over a multi-week run (no leak).
-            current = ({e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
-                       | {e["slug"] for e in fresh.get("econ", [])})   # incl. econ or it'd be pruned each heartbeat
-            stale = prune_decision(set(pm_targets), current, absent)
-            for slug in stale:
-                teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent)
-            if stale:
-                print(f"[prune] freed {len(stale)} settled markets; now tracking "
-                      f"{len(pm_targets)} pmus / {len(k_targets)} Kalshi ({len(books)} live books)")
-            now = time.time()                                                   # per-venue stream-liveness in the beacon:
-            logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
-                           "econ": len(fresh.get("econ", [])),
-                           "pmus": len(pm_targets), "kalshi": len(k_targets),
-                           "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
-                                      "k": round(now - last_rx["k"], 1) if last_rx["k"] else None}})  # off-box check can
-            # alert when one venue's rx_age stays high (stream silent/wedged) even though the process + beacon are live
+            try:
+                fresh, r2 = await asyncio.to_thread(build_colisted_map)
+                for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
+                    if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
+                if r2.get("weather_bucket_MISALIGNED"):     # C4: surface newly-listed misaligned buckets each heartbeat
+                    print(f"[coverage] {len(r2['weather_bucket_MISALIGNED'])} weather bucket misalignments (NOT paired)")
+                new_pm, new_k = register(fresh)             # trackers for new weather days / games
+                if new_pm and conns.get("pm"):
+                    for i in range(0, len(new_pm), shard_size):   # additional pmus subscriptions on one conn =
+                        await conns["pm"].send(json.dumps({"subscribe": {   # the live-verified shard pattern
+                            "requestId": f"md-add-{int(time.time())}-{i}",
+                            "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+                            "marketSlugs": new_pm[i:i + shard_size]}}))
+                if new_k and conns.get("k"):
+                    # single-subscription invariant: do NOT send a second subscribe on the live socket
+                    # (unverified semantics — error frame we'd silently ignore, or a second seq counter
+                    # that breaks SeqTracker). CYCLE the connection: the supervised loop reconnects and
+                    # subscribes the FULL current k_targets (incl. the new tickers) in one command.
+                    print(f"[discovery] +{len(new_k)} Kalshi tickers -> cycling Kalshi WS to subscribe them")
+                    await conns["k"].close()
+                if new_pm:
+                    print(f"[discovery] +{len(new_pm)} new markets subscribed")
+                # FREE settled markets: anything gone from discovery for PRUNE_THRESHOLD heartbeats. Keeps the
+                # working set = the live universe, so memory stays flat over a multi-week run (no leak).
+                # A DEGRADED pass (fetch errors) must NOT prune: a failed pull makes live markets look
+                # settled, and the later re-add would replay uncensored book-init re-OPENs (review H4).
+                if r2.get("fetch_errors"):
+                    print(f"[coverage] discovery DEGRADED ({len(r2['fetch_errors'])} fetch errors) — prune skipped")
+                else:
+                    current = ({e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
+                               | {e["slug"] for e in fresh.get("econ", [])})   # incl. econ or it'd be pruned each heartbeat
+                    stale = prune_decision(set(pm_targets), current, absent)
+                    for slug in stale:
+                        teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent)
+                    if stale:
+                        print(f"[prune] freed {len(stale)} settled markets; now tracking "
+                              f"{len(pm_targets)} pmus / {len(k_targets)} Kalshi ({len(books)} live books)")
+                now = time.time()                                                   # per-venue stream-liveness in the beacon:
+                logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
+                               "econ": len(fresh.get("econ", [])),
+                               "pmus": len(pm_targets), "kalshi": len(k_targets),
+                               "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
+                                          "k": round(now - last_rx["k"], 1) if last_rx["k"] else None}})  # off-box check can
+                # alert when one venue's rx_age stays high (stream silent/wedged) even though the process + beacon are live
+            except Exception as e:
+                print(f"[heartbeat] error (continuing next cycle): {e!r}")
 
-    async def flusher():            # emit debounced CLOSEs whose flip-window elapsed
+    async def flusher():            # emit debounced CLOSEs whose flip-window elapsed (stamped at DETECTION time)
         while True:
             await asyncio.sleep(0.5)
-            for lab, st, k in deb.flush(time.time()):
-                _write(lab, st, k)
+            for lab, st, k, t in deb.flush(time.time()):
+                _write(lab, st, k, t)
 
     async def cli_stream():         # poll NWS CLI per station every 30min; log each DISTINCT issuance
         last = {}                   # station -> (report_date, max); log only when the daily MAX changes (a revision),
+        try:                        # seed from the existing log so a RESTART doesn't re-log every station's
+            p = os.path.join(logger.dir, "cli.jsonl")    # current value (was ~8 duplicate rows/station-day)
+            if os.path.exists(p):
+                for ln in open(p, encoding="utf-8"):
+                    try:
+                        r = json.loads(ln); last[r["station"]] = (r["report_date"], r["max"])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         while True:                 # not on issuance-time flap (NWS version=1 can re-serve a same-max issuance)
             try:
                 for st in CLI_STATIONS:

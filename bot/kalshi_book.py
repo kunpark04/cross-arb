@@ -8,8 +8,11 @@ changes. You keep a local copy and apply each delta. Verified live 2026-06-08 (s
        yes_dollars_fp / no_dollars_fp = [[price_dollars, qty_fp], ...]  (a side is ABSENT if empty)
   • delta msg:    {market_ticker, side: "yes"|"no", price_dollars, delta_fp (signed)}
   • Kalshi quotes resting BIDS per side; a YES ask is the reciprocal of a NO bid:  yes_ask = 1 - no_bid.
-  • seq: ONE monotonic counter PER CONNECTION (single sid; covers snapshots, acks, deltas). A gap means
-       a missed message -> the whole subscription is stale -> resubscribe (SeqTracker handles detection).
+  • seq: ONE monotonic counter PER CONNECTION — live-verified ONLY for a SINGLE subscription (single
+       sid; covers snapshots, acks, deltas). A second subscribe's seq semantics are UNVERIFIED, so the
+       monitor enforces a single-subscription-per-connection invariant: a seq gap or a mid-session
+       ticker add CYCLES the connection (one fresh subscribe over the full universe) rather than
+       resubscribing in place. SeqTracker detects the gap.
 
   python bot/kalshi_book.py          # OFFLINE self-test (no network)
   python bot/kalshi_book.py --live   # connect with the READ-ONLY key, stream real books (READ-ONLY)
