@@ -79,6 +79,14 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   pair — is **~157 contracts at edge≥0 and ~1 at gross-2c** (an earlier `min(total offers, total bids)` estimate
   of ~71k was wrong — that isn't crossable). So weather is deep-resting but EFFICIENT; the "thin" finding stands
   (thin on LOCKABLE edge/size); lockable size appears intermittently, not in an efficient snapshot.
+- **Session synthesis (capital-efficiency thread).** Across categories: **weather** = clean + capital-efficient
+  (1.2d settle + liquid evening early-exit) but SMALL (5-city pmus cap, efficient/thin lockable); **sports** =
+  the depth (MLB line-lag) but capital-slow (~15d lock, book frozen — no early-exit) + void tail; **econ** =
+  cleanest number but slowest capital (no early-out). No category wins {clean, fast capital, real depth}.
+  Everything *measured* (latency ~86–261ms, lockups, early-exit, depth, coverage, settlement-source identity) is
+  solid; every *edge/$/%* figure is preliminary (one ~8h window). New: decision
+  [0011](../decisions/0011-econ-co-listing-same-orientation-only.md) (econ coverage) + lesson
+  [L18](../tasks/lessons.md) (measure the decision-relevant quantity, not a flattering proxy).
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 

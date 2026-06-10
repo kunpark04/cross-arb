@@ -205,3 +205,25 @@ are `[floor, cap]` inclusive while *tails* encode the boundary exclusively (`flo
 live data and confirm the decoding against the **primary raw fields**. A test written from the same wrong
 mental model passes while the guard quietly destroys coverage (false negatives) or admits false positives.
 "Tests green" ≠ "correct" when test and code share an unproven assumption.
+
+## L18 — Measure the DECISION-RELEVANT quantity, not a convenient proxy — and be suspicious when a number flatters
+
+**Pattern:** in one session, two "favorable" figures both collapsed under the rigorous version, *each time the
+optimistic proxy was the wrong quantity*:
+- **Leg-fill risk** was first quoted off the *full capturable cohort* (39% naked at 1s) — which is dominated by
+  1-second flickers you'd never trade. The decision-relevant cohort is the **persistent + deep** subset, where
+  the 100s+ duration makes leg-fill a non-issue. Quoting the aggregate made a fillability problem look worse (and
+  earlier, a different aggregate made the *opportunity* look thinner) than the tradeable subset actually is.
+- **Weather "depth"** was first reported as `min(total offers, total bids)` ≈ **71k** "fillable" — but that
+  counts resting orders that *never cross*. The decision-relevant quantity is **crossable** depth (Kalshi YES bid
+  must exceed the pmus YES ask), measured by the two-pointer walk: **~157 contracts at edge≥0, ~1 at gross-2c.**
+  The books are deep-*resting* but *efficient*; lockable size is tiny. `min(total,total)` flattered it ~450×.
+
+Both errors share a shape: a cheap aggregate (a sum, a min-of-totals, the whole cohort) stood in for the precise
+thing the decision turns on (the tradeable subset; the crossable, edge-qualified, settle-clean size).
+
+**Rule:** before citing a number, ask *"is this the quantity the decision actually turns on, or a proxy that
+happens to be easy to compute?"* Edge/depth/fill claims must be on the **tradeable, crossable, edge-qualified,
+settle-clean** subset — not the raw aggregate. And when a figure flatters the thesis, treat that as a prompt to
+re-derive it the hard way *before* repeating it: the favorable number is exactly the one most likely to be the
+wrong quantity. (The user named the tell: "the favorable numbers keep needing the asterisk.")
