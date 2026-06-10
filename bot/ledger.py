@@ -23,12 +23,20 @@ import math
 #      (summing per-contract ceils over-charges, e.g. 100@0.5 -> $2.00 vs the correct $1.75); polymarket
 #      fee is linear (no ceil), so per-order = n x per-contract. n=1 = the conservative per-unit fee that
 #      edge DETECTION (signal) uses; pass the real size where the order size is known (ledger booking).
+#      PINNED COEFFICIENTS (re-verify against the live fee schedules before any sizing decision):
+#        Kalshi taker ceil(0.07·N·P(1−P)), maker ceil(0.0175·N·P(1−P)) — the ceil applies to EACH SIDE'S
+#        OWN formula (research/kalshi-venue-audit.md §2.1 [VERIFIED]; pre-fix this file took 0.25× of the
+#        ceiled taker fee, a non-cent amount that understates the maker fee). Some series carry a
+#        fee_multiplier != 1 (audit §2.1, INFERRED) — not modeled; all tracked series were multiplier 1.
+#        pmus taker 0.05·N·P(1−P), maker rebate −0.0125 modeled as 0 (conservative)
+#        (research/us-legal-overlap-audit.md, live API pull).
 def kfee(p, n=1, taker=True, marginal=False):
     if not 0 < p < 1: return 0.0
-    if marginal:                                          # at-scale per-contract rate (NO ceil): the right
-        return (0.07 * p*(1-p)) * (1.0 if taker else 0.25)  # threshold for DETECTION (is it +EV at any size?)
-    cents = math.ceil(0.07 * n * p*(1-p) * 100 - 1e-9)   # whole order up to next cent; eps guards float noise
-    return (cents / 100.0) * (1.0 if taker else 0.25)
+    rate = 0.07 if taker else 0.0175                     # maker = 25% of the taker RATE (venue-audit §2.1)
+    if marginal:                                         # at-scale per-contract rate (NO ceil): the right
+        return rate * p*(1-p)                            # threshold for DETECTION (is it +EV at any size?)
+    cents = math.ceil(rate * n * p*(1-p) * 100 - 1e-9)   # whole order up to next cent; eps guards float noise
+    return cents / 100.0
 def pfee(p, n=1, taker=True):
     if not 0 < p < 1: return 0.0
     return (0.05 * n * p*(1-p)) * (1.0 if taker else 0.0)
@@ -209,7 +217,7 @@ def run():
     print(f"  but held-to-settlement value of first tranche is still +{L.entries[0]['net_edge']:.2f}")
     L.enter(t2,100,t="2pm")
     bad = Ledger("S4-mistake"); bad.enter(t1,100); loss = bad.unwind_all(t2)
-    print(f"  WRONG move (panic-unwind the first @2pm): realized {loss-0.94*100*0+bad.cash:+.2f}  -> book cash {bad.cash:+.2f} (a real loss)")
+    print(f"  WRONG move (panic-unwind the first @2pm): sale proceeds {loss:+.2f}  -> book cash {bad.cash:+.2f} (a real loss)")
     print(f"  RIGHT move (hold first + layer second): settle = {L.settlement_pnl('YES'):+.2f} = +edge1 +edge2")
     assert abs(L.settlement_pnl("YES")-L.sum_net_edges)<EPS
     print("  -> a MTM-negative locked arb is a paper number; hold to settlement (guaranteed +) and layer the new one.")
@@ -233,6 +241,9 @@ def run():
     print(f"  C1: kfee(.5, n=100) = ${kfee(0.5,100):.2f}/order   vs   100x per-contract = ${100*kfee(0.5,1):.2f} (old over-charge)")
     assert abs(kfee(0.5, marginal=True) - 0.0175) < 1e-9   # DETECTION = at-scale rate (no ceil) -> no over-filter
     print(f"  C1b: detection marginal fee = {kfee(0.5,marginal=True)*100:.2f}c  (vs n=1 ceil {kfee(0.5,1)*100:.2f}c -> would drop sub-{(kfee(0.5,1)-kfee(0.5,marginal=True))*100:.2f}c arbs)")
+    assert abs(kfee(0.5, 100, taker=False) - 0.44) < 1e-9   # maker = ceil(0.0175·N·P(1−P)) per venue-audit §2.1
+    assert abs(kfee(0.5, marginal=True, taker=False) - 0.004375) < 1e-9   # (NOT 0.25x the ceiled taker fee)
+    print(f"  C1c: maker fee/order(100@.5) = ${kfee(0.5,100,taker=False):.2f} (ceil of the MAKER formula, a whole cent)")
     flat = {"p_yb":0.59,"p_ya":0.61,"k_yb":0.59,"k_ya":0.61}        # venues agree -> no positive edge
     try:
         Ledger("g").enter(flat, 100); raise AssertionError("enter should have refused a no-edge book")
