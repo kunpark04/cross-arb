@@ -13,10 +13,11 @@ yet (just mapped) so it uses --econ-edge. READ-ONLY. `--selftest` for the offlin
 
   python scripts/capital_velocity.py [--exit-haircut 0.02] [--econ-edge 0.03]
 
-CAVEATS baked into the output: lockup-days are ESTIMATES; the early-exit assumes post-resolution EXIT LIQUIDITY at
-the converged price (unmeasured -- thin pmus books may force a bigger discount); and real turns/month are capped by
-min(capital-recycle rate, OPPORTUNITY-arrival rate) -- for the fast categories opportunity (breadth) is the binding
-constraint, not capital. Treat the monthly-RoC as an UPPER bound that isolates the velocity axis.
+UPDATE 2026-06-09 (MEASURED, scripts/exit_liquidity.py): EARLY-EXIT IS NOT AVAILABLE ON PMUS -- the order book
+FREEZES at resolution (closed=true; 10/10 resolved markets had empty books), so you cannot sell the winning leg
+and capital is locked to the endDate. The PASSIVE-HOLD column is reality for sports (~15d) + econ; weather is
+unaffected (~1.2d natural settlement). The early-exit column is retained only to quantify the cost of the missing
+exit. Other caveats: lockup-days are estimates; turns/month are also capped by OPPORTUNITY arrival (breadth).
 """
 import os, sys, argparse
 sys.path.insert(0, os.path.dirname(__file__))
@@ -77,16 +78,17 @@ def report(edges, exit_haircut):
                  f"{r['passive_lockup_d']:>14.1f}d{r['passive_turns_mo']:>10.1f}{r['passive_roc_mo_pct']:>8.0f}%"
                  + ("   <- edge < exit cost: NO early-out, stuck with passive lockup" if unprof else ""))
     L += ["",
-          "  READ: per-turn RoC is similar across categories (the EDGE is similar); the difference is VELOCITY.",
-          "  Early-exit lets weather + sports recycle ~same-day (outcome known hours after entry); econ CANNOT",
-          "  (its outcome is known only at the far-future release), so econ's velocity is fixed low regardless.",
-          "  => at equal edge, weather/sports earn many-x more PER DOLLAR PER MONTH than econ -- capital velocity,",
-          "     not edge, is econ's problem (consistent with the endDate probe: weather ~1.2d, sports/econ ~15d).",
+          "  *** MEASURED 2026-06-09 (scripts/exit_liquidity.py): EARLY-EXIT IS NOT AVAILABLE ON PMUS. ***",
+          "  pmus FREEZES the book at resolution (closed=true) -- 10/10 resolved markets had EMPTY books, so you",
+          "  CANNOT sell the winning leg; capital is locked from resolution to the endDate. The early-exit column",
+          "  is the hypothetical you do NOT get -- the PASSIVE-HOLD column is REALITY for sports (~15d) + econ.",
+          "  Weather is unaffected: its passive endDate is already ~1.2d (fast natural settlement, no exit needed).",
+          "  => MEASURED: WEATHER capital-efficient (~1.2d); SPORTS slow (~15d, book frozen, NO early-out rescue);",
+          "     ECON slow (weeks-mo, outcome known only at the far-future release). Velocity, not edge, separates",
+          "     them. Per-turn RoC is similar (~equal edge); the monthly divergence is all capital velocity.",
           "",
-          "  CAVEATS (do not read monthly-RoC as achievable): lockup-days are ESTIMATES; early-exit assumes",
-          "  post-resolution EXIT LIQUIDITY at the converged price (UNMEASURED - thin pmus books may force a",
-          "  bigger discount than the haircut); and real turns/mo are capped by OPPORTUNITY arrival (breadth),",
-          "  not just capital - for the fast categories that cap, not lockup, is binding. This isolates VELOCITY.",
+          "  OTHER CAVEATS: lockup-days are estimates; turns/mo are also capped by OPPORTUNITY arrival (breadth),",
+          "  not just capital. The 'early-exit' column is kept only to quantify the COST of the missing exit.",
           "=" * 92]
     return "\n".join(L)
 

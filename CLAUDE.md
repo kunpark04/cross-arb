@@ -83,6 +83,13 @@ See [deploy/README.md](deploy/README.md).
   OPEN**: `settle_recon.py` found pmus `closed`≠finalized (~2-week lag, unreliable interim outcomes — one verified
   wrong), so invariant #1 stays rules-verified-only until pmus finalizes. **None of this needs capital — it needs
   the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*, not yet a go.
+- **Capital velocity — MEASURED (2026-06-09, `scripts/exit_liquidity.py` + `capital_velocity.py`).** Velocity,
+  not edge, separates the categories. pmus **freezes the order book at resolution** (10/10 resolved markets had
+  empty books) → **no early-exit** → capital is locked to the far-future `endDate`. With the `endDate` probe
+  (weather ~1.2d, sports/econ ~15d): **weather is the capital-efficiency standout** (fast natural settlement),
+  while **sports (~15d, book frozen) and econ (weeks-mo, outcome known only at the far-future release) are
+  capital-locked** — the early-exit "rescue" for sports is refuted. So weather = clean+fast+thin; sports = deep
+  but capital-slow + void tail; econ = cleanest but slowest. No category wins {clean, fast capital, deep}.
 
 ## Managerial docs index
 

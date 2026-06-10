@@ -61,6 +61,22 @@ cheap quote was *informed*; you'd miss the dear leg = toxic). Needs the per-venu
 `bot/monitor.py` (`px` field, added this session). Current archive predates the field → 998 weather episodes, 0 yet
 attributable; produces real numbers after the next deploy + re-pull.
 
+## 5. Capital velocity / early-exit — MEASURED: no early-exit on pmus (`scripts/exit_liquidity.py`, `capital_velocity.py`)
+
+The capital case hinged on early-exit: once the outcome is known, sell the winning leg at ~$1 and redeploy rather
+than wait for the far-future pmus finalization (`endDate`). **Measured: it doesn't work.** pmus **freezes the order
+book at resolution** (`closed=true`) — **10/10 resolved 06-08 markets had empty books** (the one with a live book
+was still `closed=false`). So you cannot sell the winning leg; capital is locked from resolution to `endDate`.
+Combined with the `endDate` probe (weather ~1.2d, sports/econ ~15d):
+- **Weather** = capital-efficient (~1.2-day natural settlement; no early-exit needed). The standout.
+- **Sports** = ~**15-day** lock, **unavoidable** (book frozen, no early-out). Capital-inefficient — the early-exit
+  rescue is refuted.
+- **Econ** = weeks-to-months (outcome known only at the far-future release; no early-out either).
+
+`capital_velocity.py` quantifies the consequence: velocity, not edge, separates the categories (per-turn RoC is
+~equal; monthly RoC diverges by lockup). And early-exit only helps when **edge > exit-haircut** anyway — at the thin
+median edges (1.6–2c) a ~2c exit would wipe the edge even if a book existed.
+
 ## Net
 
 Latency is measured and benign-for-language-choice; **leg-fill is the gating risk and its true magnitude is now

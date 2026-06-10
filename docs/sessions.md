@@ -64,6 +64,13 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   flagged. Wired into the monitor (`MarketTracker`, like weather; fixed the prune-set so econ isn't dropped each
   heartbeat) + the analysis category functions (econ gets 0 void-haircut — cleanest settlement). Full universe
   now 60 weather + ~216 sports + 24 econ. 11/11 self-tests green.
+- **Capital velocity MEASURED — early-exit refuted (2026-06-09).** Built `scripts/capital_velocity.py`
+  (per-arb edge × capital recycle rate per category) + `scripts/exit_liquidity.py`. Probed resolved 06-08
+  markets: **10/10 had EMPTY order books once `closed=true`** → pmus freezes the book at resolution → **no
+  early-exit** → capital locked to `endDate` (~15d sports). Corrects the earlier optimistic "sports rescued by
+  early-exit" — it's not. MEASURED capital efficiency: weather fast (~1.2d), sports/econ slow (~15d / weeks-mo);
+  velocity (not edge) is the differentiator. Early-exit would only help when edge > exit-haircut anyway (the thin
+  median 1.6–2c edges can't clear a ~2c exit). Recorded in research/execution-feasibility-2026-06-09.md §5.
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 

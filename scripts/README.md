@@ -63,6 +63,8 @@ read access, never to trade in this phase.
 - `shadow_fill.py` — shadow leg-fill simulator: replays the edge trajectory to measure fill-survival % / realized edge / naked-leg rate vs assumed entry latency L. `--selftest`. (sub-second regime needs the new ms-timestamp data.)
 - `settle_recon.py` — empirical invariant-#1 test: compares both venues' *settled* outcomes on co-listed markets. `--selftest`. (Surfaced: pmus `closed`≠finalized, ~2wk lag, unreliable interim data — re-run after `endDate`.)
 - `adverse_selection.py` — "why is the cheap side cheap?": attributes each edge close to cheap-rose (benign) vs dear-fell (toxic). `--selftest`. (Needs the monitor's new `px` field; accrues after redeploy.)
+- `exit_liquidity.py` — can you EARLY-EXIT a pmus position once the outcome is known? `--selftest`. **MEASURED: NO** — pmus freezes the book at resolution (10/10 resolved markets empty), so capital is locked to `endDate` (~15d sports); no same-day exit.
+- `capital_velocity.py` — capital-velocity / early-exit lens: per-arb edge × how fast capital recycles, per category. `--selftest`. Shows velocity (not edge) separates categories; weather fast (~1.2d), sports/econ slow (~15d+), early-exit measured-unavailable.
 
 ⭐ = the current canonical script for that job.
 
