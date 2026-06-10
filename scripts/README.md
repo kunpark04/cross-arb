@@ -39,6 +39,7 @@ read access, never to trade in this phase.
 **Weather**
 - `nyc_align_check.py` — resolve the NYC 74–75 bucket alignment between venues (the boundary-equality logic now in `colisted_map.py`)
 - `weather_spread_snapshot.py` — live cross-venue weather spread snapshot + fee-netted lock
+- `weather_depth.py` — book-depth measurement across all 5 co-listed cities × buckets. `--selftest`. **Finding:** pmus lists only **5** weather cities (the cap; Kalshi has ~22 but a cross-arb needs both); the resting books are DEEP (~244k/~72k contracts) but **CROSSABLE depth is ~tiny** (~157 at edge≥0, ~1 at 2c) — weather is deep-resting but EFFICIENT, lockable size appears intermittently.
 - `weather_arb_scan.py` — depth-aware weather scan; date now defaults to TODAY + covers 5 cities, but reads a **cached** pmus snapshot — for the live 5-city universe use `scan_all.py` (the canonical scan)
 
 **Sports**

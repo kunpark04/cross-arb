@@ -71,6 +71,14 @@ causes, ~35 WARN). **Landed every fix this session; all 7 self-tests green + liv
   early-exit" — it's not. MEASURED capital efficiency: weather fast (~1.2d), sports/econ slow (~15d / weeks-mo);
   velocity (not edge) is the differentiator. Early-exit would only help when edge > exit-haircut anyway (the thin
   median 1.6–2c edges can't clear a ~2c exit). Recorded in research/execution-feasibility-2026-06-09.md §5.
+- **Weather coverage + depth measured (2026-06-09).** "Why only 5 cities": **pmus lists only 5 weather markets
+  total** (SF/LA/NYC/Miami/Chicago, all high-temp; 0 elsewhere) — Kalshi has ~22 cities but a cross-arb needs
+  both, so pmus is the cap and the `WX` map is complete. Built `scripts/weather_depth.py` to measure size (the
+  binding constraint on the one capital-efficient category). **Correction:** the resting books are DEEP (~244k
+  pmus / ~72k Kalshi contracts) but the CROSSABLE depth — where the cross-venue prices actually cross to lock a
+  pair — is **~157 contracts at edge≥0 and ~1 at gross-2c** (an earlier `min(total offers, total bids)` estimate
+  of ~71k was wrong — that isn't crossable). So weather is deep-resting but EFFICIENT; the "thin" finding stands
+  (thin on LOCKABLE edge/size); lockable size appears intermittently, not in an efficient snapshot.
 
 ## 2026-06-09 — Settlement residual-risk: live-object read + CLI revision logger
 
