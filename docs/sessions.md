@@ -39,6 +39,14 @@ Review verified code against live venue APIs and the pulled archive; every findi
   `session_start` self-identifies with `build`+argv; tracking 30/307/14). Epochs set:
   `ECON_REMAP_DEPLOY_TS = DEBOUNCE_STAMP_FIXED_TS = 1781082189` — **the multi-week accumulation clock
   restarts here on the corrected schema** (third restart: int-second build → ms+px build → 0013 build).
+- **Post-deploy verification + policy read**: droplet healthy (NRestarts=0, both streams `rx_age` 0.0,
+  the first live `ws_reconnect` marker was the new cycle-on-add behavior working as designed); local
+  scheduled tasks green. Re-ran the policy tables on the corrected pipeline (in-sample + OOS, all
+  policies) and **queued 8 next-session strategy/policy explorations in [todo](../tasks/todo.md)**
+  (headliners: pre-register the category-differentiated 2¢-floor+cap rule before the multi-week data;
+  edge-RATE ranking — ¢ per dollar-day, not ¢; a maker-side execution study attacking the 55%-naked
+  leg-fill risk + the taker-fee wall together). Skills considered and declined (drift risk; script +
+  existing `update-managerial-docs` cover it).
 
 ## 2026-06-10 (UTC) — GATED redeploy: droplet brought to current HEAD (ms+px+ECON now live)
 

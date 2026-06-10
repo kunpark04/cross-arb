@@ -130,6 +130,47 @@ backtest pipeline re-run on the corrected pipeline.**
       2-day window; reads `void_clean`); (b) latency-haircut from a real order-ack study + leg-fill EV (0010 items
       2/3); (c) `p_gap`/`loss_frac` refinement; (d) NBA/NHL settlement read in season; (e) CLI-revision rate.
 
+## Next-session explorations — policy + strategy upgrades (queued 2026-06-10)
+
+Owner-reviewed suggestions from the post-0013 policy read (OOS tables in the corrected pipeline).
+Ordered by expected value; none are decisions yet — each is an experiment or spec item.
+
+- [ ] **Pre-register the clip rule BEFORE the multi-week data arrives** (so the next test is
+      confirmatory, not another tuning pass): hard 2¢ *booked*-edge floor (≈3.5¢ touch; also the
+      friction buffer) + per-pair cap ~10–20% **differentiated by category tail** — weather ~20%
+      (identity verified + 1.2d capital + exit window), sports ~10% until the MLB unwind rule exists
+      (a void at 20% clip = −10–20% of bankroll), econ smallest (clean but capital-dead). Validation
+      plan: K-fold over disjoint multi-day windows, per-position bootstrap CIs, friction inside the
+      OOS arm. Rationale: only the *shape* (floor=return, cap=risk, FIFO/batch1s dead — batch1s now
+      ties FIFO exactly) is supported on 0.86 d; the 20%-flat row's marginal PnL is just more notional
+      in the same ~10 arbs, scaling exactly the tails the paper PnL excludes.
+- [ ] **Edge-RATE ranking (the one real policy upgrade):** reservation on
+      `booked_edge / expected_lock_days` instead of edge-level — capital velocity is the binding
+      constraint and a flat τ gets categories backwards (13¢ U-3 locking ~22 d = **0.6¢/$-day** vs a
+      3¢ weather arb locking 1.2 d = **2.5¢/$-day**). Lockups exist in `capital_velocity.py`,
+      settlement proxies in `settle_t`; ~small change to the `_profit_per`-based ranking; test with
+      the existing OOS harness on the multi-week data.
+- [ ] **Maker-side execution study (attacks the gating risk + the fee wall at once):** rest the cheap
+      leg as MAKER on the wide/sleepy venue (pmus weather quotes 20¢+ spreads), take the Kalshi side
+      only AFTER the maker fill (conditional hedge at the measured ~86–261 ms). Fee asymmetry pays for
+      it: taker round-trip ≈3.5¢ vs maker ≈0.9¢ → widens the +EV universe below the 2¢ taker floor
+      AND shrinks the 55%-naked-@1s tail. Largely simulatable READ-ONLY from book data (quote-presence
+      sim) before any capital.
+- [ ] **Fill-contingency rule in the policy spec:** if leg B unfilled within X ms of leg A → exit leg A
+      at market immediately (known small insurance premium vs unbounded naked coin-flip); price it into
+      the all-in edge filter as 0010's leg-fill EV term. Extend `shadow_fill` to simulate it from `px`.
+- [ ] **Adverse-selection gate on direction** (needs accumulated `px`): prefer arbs whose DEAR side
+      moved away (benign line-lag) over ones whose CHEAP side led (informed quote — the U-3-style wide
+      sleepy book where the tighter venue is righter). Use `adverse_selection.py` toxic-close share.
+- [ ] **Correlated-exposure cap per event cluster** (city-date / game), alongside the per-pair cap — a
+      single CLI-revision day hits every same-city weather pair at once; per-pair caps don't bound it.
+- [ ] **Recycle-time re-evaluation in the sims:** when settlement frees capital, re-score all still-open
+      arbs (arrival-or-never skips them today); the live monitor gives this for free — the backtest
+      should model what the bot will actually do.
+- [ ] **Weather-first scaling note:** the only category with {identity ✓, fast capital ✓, exit ✓};
+      constraint is crossable depth (~157 contracts) → growth = breadth (cities × buckets × days) +
+      layering on WIDEN, never bigger clips in one corner ([L16]).
+
 ## Done (discovery → matcher → scanner → monitor)
 - [x] **1–5. Sports matcher** — Kalshi game structure discovered; robust `(league, date, abbrev)` join
       (`sports_match_v2.py`); 2-outcome arb metric; **no false positives** (price-sanity guard, [L1](lessons.md)); MLB ~$23.
