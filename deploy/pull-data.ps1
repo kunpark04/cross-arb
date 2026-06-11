@@ -4,13 +4,14 @@
   Pull cross-arb persistence data from the droplet to this machine — FOOLPROOF (copy-keep + checksum).
 
 .DESCRIPTION
-  The droplet's event-date-partitioned logs (transitions-<YYYY-MM-DD>.jsonl + sessions.jsonl) are the
-  append-only source. This script MIRRORS them into Kalshi/data/cross-arb/, sha256-verifying every
-  transfer before it is trusted (sidecar <name>.sha256), and is idempotent: a file already present with
-  a matching hash is skipped. Finalized days (event-date < today UTC, hence immutable) are gzipped
-  locally to transitions-<date>.jsonl.gz and then DELETED on the droplet — but ONLY after the local .gz
-  is verified to decompress back to the remote sha256 (verify-before-delete). Today's file +
-  sessions.jsonl + health.json are LIVE and never deleted. Set CA_KEEP_REMOTE=1 for pure copy-keep.
+  The droplet's event-date-partitioned logs ((transitions|ladders|trades)-<YYYY-MM-DD>.jsonl +
+  sessions.jsonl + cli.jsonl + fee_changes.jsonl) are the append-only source. This script MIRRORS them
+  into Kalshi/data/cross-arb/, sha256-verifying every transfer before it is trusted (sidecar
+  <name>.sha256), and is idempotent: a file already present with a matching hash is skipped. Finalized
+  days (event-date < today UTC, hence immutable) are gzipped locally to <name>.jsonl.gz and then DELETED
+  on the droplet — but ONLY after the local .gz is verified to decompress back to the remote sha256
+  (verify-before-delete). Today's files + the undated live files (sessions/cli/fee_changes/health) are
+  LIVE and never deleted. Set CA_KEEP_REMOTE=1 for pure copy-keep.
 
   Batched to ~5 SSH round-trips total (Windows OpenSSH has NO ControlMaster multiplexing):
     1 ssh  list remote *.jsonl with sha256
@@ -91,12 +92,24 @@ if ($needed.Count -gt 0) {
 }
 
 # 3) finalize pass: gzip immutable past-day files locally (event-date < today UTC); raw -> .jsonl.gz.
-#    today's transitions + sessions.jsonl stay raw (still being appended). Verified content only.
+#    Covers every dated prefix (transitions|ladders|trades — wave-2 spec compat item 2: without this the
+#    new files would accumulate on the droplet unbounded). Today's dated files + the undated live files
+#    (sessions/cli/fee_changes) stay raw (still being appended). Verified content only.
 $finalized = 0
-foreach ($raw in (Get-ChildItem -LiteralPath $LocalDir -Filter 'transitions-*.jsonl' -File -ErrorAction SilentlyContinue)) {
-    if ($raw.Name -notmatch '^transitions-(\d{4}-\d{2}-\d{2})\.jsonl$') { continue }
-    if ($Matches[1] -ge $TodayUtc) { continue }                          # today/future -> still live
+foreach ($raw in (Get-ChildItem -LiteralPath $LocalDir -Filter '*.jsonl' -File -ErrorAction SilentlyContinue)) {
+    if ($raw.Name -notmatch '^(transitions|ladders|trades)-(\d{4}-\d{2}-\d{2})\.jsonl$') { continue }
+    if ($Matches[2] -ge $TodayUtc) { continue }                          # today/future -> still live
     if (-not (Test-Path -LiteralPath (Sidecar $raw.Name))) { continue }  # only verified content
+    if (Test-Path -LiteralPath "$($raw.FullName).gz") {
+        # The day was already archived, then the file REAPPEARED remotely (a late append for a past
+        # event-date recreates it after our verified delete). NEVER re-gzip: Create() truncates, which
+        # would replace the canonical full-day .gz with the late-records-only file (data loss). Keep
+        # the raw (it holds ONLY the late records) NEXT TO the .gz -- loaders glob both and
+        # analyze_persistence dedups per date -- and leave the remote copy alone (step 4 only deletes
+        # when the local .gz decompresses to the remote hash, which it now won't).
+        Write-Warning "late-append on archived day: $($raw.Name) kept RAW beside its .gz (not re-gzipped; remote kept)"
+        continue
+    }
     $in = [IO.File]::OpenRead($raw.FullName)
     try {
         $out = [IO.File]::Create("$($raw.FullName).gz")
@@ -110,13 +123,14 @@ foreach ($raw in (Get-ChildItem -LiteralPath $LocalDir -Filter 'transitions-*.js
 }
 
 # 4) MOVE finalized days off the droplet (unless CA_KEEP_REMOTE): delete a remote dated file ONLY after
-#    the local .gz is verified to DECOMPRESS to the remote sha256. Live files (today/sessions/health) stay.
+#    the local .gz is verified to DECOMPRESS to the remote sha256. Live files (today's dated files +
+#    sessions/cli/fee_changes/health) stay.
 $moved = 0
 if (-not $KeepRemote) {
     $cand = @()
     foreach ($name in $remote.Keys) {
-        if ($name -notmatch '^transitions-(\d{4}-\d{2}-\d{2})\.jsonl$') { continue }    # dated transitions only
-        if ($Matches[1] -ge $TodayUtc) { continue }                                     # finalized (past) only
+        if ($name -notmatch '^(transitions|ladders|trades)-(\d{4}-\d{2}-\d{2})\.jsonl$') { continue }  # dated data files only
+        if ($Matches[2] -ge $TodayUtc) { continue }                                     # finalized (past) only
         $gz = Join-Path $LocalDir "$name.gz"
         if (-not (Test-Path -LiteralPath $gz)) { continue }                             # need the local archive
         if ((Get-GzHash $gz) -ne $remote[$name]) { Write-Warning "local .gz != remote for $name — NOT deleting remote"; continue }
@@ -150,3 +164,22 @@ Write-Host "pull complete -> $LocalDir"
 Write-Host "  fetched/updated: $($needed.Count)   gzipped finalized: $finalized   moved off droplet: $moved   (raw live: $rawN, archived .gz: $gzN)"
 $mode = if ($KeepRemote) { 'copy-keep (CA_KEEP_REMOTE set)' } else { 'finalized days verified-then-deleted on droplet; live files kept' }
 Write-Host "  $mode; every transfer sha256-verified."
+
+# 5) daily settlement recon (probe-program 2026-06-11, owner-ask #3): the scheduled 8:30am ET pull
+#    lands ~12:30Z = ~T+0.5h after Kalshi's ~12:02Z weather settlement — exactly the previously
+#    unobserved 0–13.5h pmus-finality window. Read-only; a failure NEVER blocks the pull (warn only);
+#    ALERT.txt is raised only on a real DIVERGE (the both-legs-loss tail). Skip with CA_NO_RECON=1.
+if (-not $env:CA_NO_RECON) {
+    try {
+        $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+        $log  = Join-Path $LocalDir 'settle_recon_daily.log'
+        $out  = & python (Join-Path $repo 'scripts\settle_recon.py') --days-back 3 --no-sports --no-nws 2>&1 | Out-String
+        Add-Content -LiteralPath $log -Value ("`n===== {0:u} =====`n{1}" -f [DateTime]::UtcNow, $out)
+        if ($out -match '!!! DIVERGE') {
+            Add-Content -LiteralPath (Join-Path $LocalDir 'ALERT.txt') -Value ("{0:u} settle_recon DIVERGENCE — see settle_recon_daily.log" -f [DateTime]::UtcNow)
+            Write-Warning 'daily settle-recon: DIVERGENCE detected (settle_recon_daily.log / ALERT.txt)'
+        } else {
+            Write-Host '  daily settle-recon: no divergence (settle_recon_daily.log)'
+        }
+    } catch { Write-Warning "daily settle-recon skipped: $_" }
+}

@@ -23,13 +23,18 @@ import math
 #      (summing per-contract ceils over-charges, e.g. 100@0.5 -> $2.00 vs the correct $1.75); polymarket
 #      fee is linear (no ceil), so per-order = n x per-contract. n=1 = the conservative per-unit fee that
 #      edge DETECTION (signal) uses; pass the real size where the order size is known (ledger booking).
-#      PINNED COEFFICIENTS (re-verify against the live fee schedules before any sizing decision):
-#        Kalshi taker ceil(0.07·N·P(1−P)), maker ceil(0.0175·N·P(1−P)) — the ceil applies to EACH SIDE'S
-#        OWN formula (research/kalshi-venue-audit.md §2.1 [VERIFIED]; pre-fix this file took 0.25× of the
-#        ceiled taker fee, a non-cent amount that understates the maker fee). Some series carry a
-#        fee_multiplier != 1 (audit §2.1, INFERRED) — not modeled; all tracked series were multiplier 1.
-#        pmus taker 0.05·N·P(1−P), maker rebate −0.0125 modeled as 0 (conservative)
-#        (research/us-legal-overlap-audit.md, live API pull).
+#      PINNED COEFFICIENTS — PRIMARY-SOURCE RE-PINNED 2026-06-10 (research/fee-pin-2026-06-10.md):
+#        Kalshi taker ceil(0.07·N·P(1−P)) per ORDER — verbatim in the CFTC-filed schedule (incl. the
+#        no-settlement-fee line); the modern per-fill-centicent + accumulator/rebate mechanism nets to
+#        this cent-ceil within $0.01, conservative. Maker ceil(0.0175·N·P(1−P)) — the ceil applies to
+#        EACH SIDE'S OWN formula — but ONLY on fee_type=quadratic_with_maker_fees series (MLB/WNBA/NBA/
+#        NHL/ATP/WTA + all econ); plain `quadratic` series (ALL 5 weather, esports, ITF, UFC = 12/23
+#        tracked) charge resting orders $0, so kfee(taker=False) OVERSTATES maker cost there (today
+#        taker=False is selftest-only; a maker-leg study must model fee_type). All 23 tracked series:
+#        live fee_multiplier=1; /series/fee_changes empty.
+#        pmus taker 0.05·N·P(1−P) (docs.polymarket.us/fees eff. 2026-04-03 + live feeCoefficient=0.05);
+#        published rounding = banker's to nearest cent (pfee stays unrounded: ≤$0.005, unbiased);
+#        maker REBATE −0.0125 modeled as 0 (conservative).
 def kfee(p, n=1, taker=True, marginal=False):
     if not 0 < p < 1: return 0.0
     rate = 0.07 if taker else 0.0175                     # maker = 25% of the taker RATE (venue-audit §2.1)

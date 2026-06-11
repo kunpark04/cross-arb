@@ -329,6 +329,25 @@ class TransitionLogger:
         with open(os.path.join(self.dir, "cli.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
         return rec
+    def ladder(self, rec):
+        """Append one top-5 dual-venue ladder snapshot (k:'tr' transition / k:'hb' heartbeat) to
+        ladders-<event-date>.jsonl — a NEW file prefix, invisible to every transitions-* loader."""
+        with open(os.path.join(self.dir, f"ladders-{event_partition(rec['market'])}.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return rec
+    def trade(self, rec):
+        """Append one venue trade print to trades-<event-date>.jsonl. `vt` is the venue fill time
+        VERBATIM and `t` the local poll receipt — kept separately, never re-stamped (L22)."""
+        with open(os.path.join(self.dir, f"trades-{event_partition(rec['market'])}.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return rec
+    def fee(self, rec):
+        """Append a fee-schedule tripwire event to fee_changes.jsonl (rare + loud: a scheduled per-series
+        fee change can invalidate ledger.py's pinned coefficients — research/fee-pin-2026-06-10.md)."""
+        rec = {"t": int(time.time()), **rec}
+        with open(os.path.join(self.dir, "fee_changes.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return rec
     def session_start(self, info):
         """Append a session_start marker (one per monitor boot) to sessions.jsonl."""
         rec = {"t": int(time.time()), "event": "session_start", **info}
@@ -413,13 +432,25 @@ def _selftest():
     prune_decision({"a", "b"}, {"a", "b"}, absent)                        # b reappears -> miss count resets
     assert absent["b"] == 0
     # teardown removes the pmus closure + BOTH Kalshi tickers/books + slug map row + debouncer state
+    # + the weather ladder/trade-logging registry row (wave-2)
     pmt = {"g1": lambda *a: None}; kt = {"KA": 1, "KB": 2}; bks = {"KA": object(), "KB": object()}
-    sk = {"g1": ["KA", "KB"]}; ab = {"g1": 2}; d = FlipDebouncer(1.0)
+    sk = {"g1": ["KA", "KB"]}; ab = {"g1": 2}; wxr = {"g1": object()}; d = FlipDebouncer(1.0)
     d.feed("OPEN", {"arb": True, "dir": "PK", "net": 0.03}, "g1", 0.0)    # seed debouncer state for g1
-    teardown("g1", pmt, kt, bks, sk, d, ab)
-    assert pmt == {} and kt == {} and bks == {} and sk == {} and ab == {}
+    teardown("g1", pmt, kt, bks, sk, d, ab, wxr)
+    assert pmt == {} and kt == {} and bks == {} and sk == {} and ab == {} and wxr == {}
     assert "g1" not in d.last_arb_dir and "g1" not in d.pending
-    print("OK - prune: 2-miss debounce + symmetric teardown (closures, books, map, debounce) all freed")
+    print("OK - prune: 2-miss debounce + symmetric teardown (closures, books, map, debounce, wx) all freed")
+
+    # --- update_sub_cmd: exact probe-verified wire shape (a typo = silent no-data on added tickers) ---
+    assert update_sub_cmd(7, 3, ["T1", "T2"], "add_markets") == {
+        "id": 7, "cmd": "update_subscription",
+        "params": {"sids": [3], "market_tickers": ["T1", "T2"], "action": "add_markets"}}
+    assert update_sub_cmd(8, 3, ["T1"], "delete_markets")["params"]["action"] == "delete_markets"
+    try:
+        update_sub_cmd(9, 3, ["T1"], "remove_markets"); raise SystemExit("FAIL: bogus action accepted")
+    except ValueError:
+        pass
+    print("OK - update_sub_cmd: probe-verified wire shape (sids list + market_tickers + action)")
 
     # --- TransitionLogger: event-date partitioning (a lifecycle stays in ONE file) + sessions.jsonl ---
     import tempfile, glob, shutil
@@ -478,6 +509,61 @@ def _selftest():
     assert _cli_iso("JUNE 8 2026") == "2026-06-08"
     print("OK - NWS CLI parse: daily max + report-date + WMO id (settlement-revision rate logging)")
 
+    # --- WAVE-2: ladder snapshots + trade-print poll + fee tripwire (ladder-logging spec 2026-06-11) ---
+    assert ladder_cents([{"px": {"value": "0.0900"}, "qty": "120.00"}, {"px": {"value": "0.08"}, "qty": "300"},
+                         {"px": {"value": "0.07"}, "qty": "55"}, {"px": {"value": "0.05"}, "qty": "1000"},
+                         {"px": {"value": "0.04"}, "qty": "12"}, {"px": {"value": "0.03"}, "qty": "9"}]
+                        ) == [[9, 120.0], [8, 300.0], [7, 55.0], [5, 1000.0], [4, 12.0]]   # top-5 only, int cents
+    assert ladder_cents(None) == [] and ladder_cents([{"px": {}, "qty": "1"}]) == []        # malformed level skipped
+    wl = MarketTracker("tc-temp-x-2026-06-11-gte70f")
+    wl.set_book("P", lv([(0.09, 120)]), lv([(0.11, 40)]))
+    kbk = KalshiBook("KX"); kbk.apply_snapshot({"yes_dollars_fp": [["0.10", "70.00"]], "no_dollars_fp": [["0.88", "30.00"]]})
+    wl.set_book("K", kbk.yes_bid_ladder(), kbk.yes_offer_ladder())
+    assert wx_ladders(wl) == {"pb": [[9, 120.0]], "pa": [[11, 40.0]], "kb": [[10, 70.0]], "ka": [[12, 30.0]]}
+    # TradePollState: min_ts = floor(max ts)-1 (1s boundary overlap), ids pruned to that window
+    tps = TradePollState()
+    assert tps.min_ts() == 0 and not tps.seen("a")
+    tps.add("a", 1000.4); assert tps.min_ts() == 999 and tps.seen("a")
+    tps.add("b", 1000.9); tps.add("c", 1004.0)
+    assert tps.min_ts() == 1003 and not tps.seen("a") and not tps.seen("b") and tps.seen("c")
+    assert _iso_unix("1970-01-01T01:00:00.000000Z") == 3600.0 and _iso_unix("garbage") == 0.0   # UTC, not local
+    # trade_rec: venue fill time VERBATIM in vt + local poll receipt in t (L22 — no re-stamping)
+    tr = {"count_fp": "25.00", "created_time": "2026-06-11T00:40:09.714292Z", "taker_side": "yes",
+          "ticker": "KXHIGHNY-26JUN11-T95", "trade_id": "8bfb", "yes_price_dollars": "0.0800"}
+    assert trade_rec(tr, "tc-temp-nychigh-2026-06-11-gte95f", 1781139999.1234) == {
+        "t": 1781139999.123, "venue": "k", "market": "tc-temp-nychigh-2026-06-11-gte95f",
+        "ktk": "KXHIGHNY-26JUN11-T95", "vt": "2026-06-11T00:40:09.714292Z",
+        "yes_c": 8, "qty": 25.0, "taker": "yes", "id": "8bfb"}
+    # ingest: oldest-first, deduped on re-poll; partitioned by EVENT date; seed-from-log resumes a restart
+    td2 = tempfile.mkdtemp(); lg2 = TransitionLogger(td2); st2 = TradePollState()
+    two = [dict(tr, trade_id="t2", created_time="2026-06-11T00:40:10.000000Z"), tr]    # newest-first like the API
+    assert ingest_trades(two, "tc-temp-nychigh-2026-06-11-gte95f", st2, lg2, 1.0) == 2
+    assert ingest_trades(two, "tc-temp-nychigh-2026-06-11-gte95f", st2, lg2, 2.0) == 0
+    tlines = [json.loads(l) for l in open(os.path.join(td2, "trades-2026-06-11.jsonl"))]
+    assert len(tlines) == 2 and tlines[0]["id"] == "8bfb" and tlines[1]["id"] == "t2"
+    st3 = seed_trade_state(td2)["KXHIGHNY-26JUN11-T95"]
+    assert st3.seen("8bfb") and st3.seen("t2") and st3.min_ts() == int(_iso_unix("2026-06-11T00:40:10.000000Z")) - 1
+    # fee tripwire: boot baseline (empty) silent; non-empty / changed / cleared all log; failed poll = no-op
+    fs = {}
+    assert fee_tick([], fs, lg2) is None and fs == {"n": 0, "last": []}
+    ch1 = [{"series_ticker": "KXHIGHNY", "fee_type": "quadratic_with_maker_fees"}]
+    r1 = fee_tick(ch1, fs, lg2); assert r1 and r1["n"] == 1 and fs["n"] == 1
+    assert fee_tick(None, fs, lg2) is None and fs["n"] == 1               # poll error keeps last known state
+    assert fee_tick(list(ch1), fs, lg2) is None                           # unchanged -> suppressed
+    r2 = fee_tick([], fs, lg2); assert r2 and r2["n"] == 0                # cleared -> logged too
+    flines = [json.loads(l) for l in open(os.path.join(td2, "fee_changes.jsonl"))]
+    assert len(flines) == 2 and all(f["event"] == "fee_change" for f in flines)
+    # hb ladder pass: emits on change only (delta-suppression) + frees pruned markets' state
+    hb = {}; wxreg = {"tc-temp-x-2026-06-11-gte70f": wl}
+    assert hb_ladder_pass(wxreg, hb, lg2, 10.0) == 1 and hb_ladder_pass(wxreg, hb, lg2, 20.0) == 0
+    wl.set_book("P", lv([(0.10, 120)]), lv([(0.11, 40)]))                 # book moved -> re-emitted
+    assert hb_ladder_pass(wxreg, hb, lg2, 30.0) == 1
+    assert hb_ladder_pass({}, hb, lg2, 40.0) == 0 and hb == {}            # pruned -> suppression state freed
+    llines = [json.loads(l) for l in open(os.path.join(td2, "ladders-2026-06-11.jsonl"))]
+    assert [x["k"] for x in llines] == ["hb", "hb"] and llines[0]["pb"] == [[9, 120.0]]
+    shutil.rmtree(td2, ignore_errors=True)
+    print("OK - wave-2: ladder_cents/wx_ladders, trade-poll state+dedupe+seed, fee tripwire, hb delta-suppression")
+
 
 # ============================================================================================
 # LIVE LAYER  (both venue streams validated; weather=MarketTracker, sports=GameTracker; deploy gated)
@@ -521,15 +607,38 @@ def prune_decision(tracked, current, absent, threshold=PRUNE_THRESHOLD):
                 to_prune.add(slug)
     return to_prune
 
-def teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent):
+def teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent, wx=None):
     """Symmetrically remove EVERY reference to a settled market so it can be GC'd: the pmus closure, the
-    1-or-2 Kalshi closures + their KalshiBooks, the slug↔ticker map row, and the debouncer state."""
+    1-or-2 Kalshi closures + their KalshiBooks, the slug↔ticker map row, the debouncer state, and (when
+    given) the weather ladder/trade-logging registry row."""
     pm_targets.pop(slug, None)
     for tk in slug_k.pop(slug, []):
         k_targets.pop(tk, None)
         books.pop(tk, None)
     deb.forget(slug)
     absent.pop(slug, None)
+    if wx is not None:
+        wx.pop(slug, None)
+
+
+# --- Kalshi in-place subscription mutation (NO-GAP add/delete) -----------------------------------------
+# PROBE-VERIFIED 2026-06-10 (scripts/probe_kalshi_ws.py --multisub, raw frames in _data/):
+#   • ONE sid per channel per connection; a repeat `subscribe` MERGES into the existing sid (ack type=ok)
+#     — the feared "second sid / second seq counter" does not exist.
+#   • update_subscription acks type=ok and the ack itself CONSUMES a seq slot -> SeqTracker stays
+#     contiguous across the mutation (verified seq 1..16 unbroken across add + overlap-add + delete).
+#   • add_markets snapshots ONLY the added tickers on the same sid; existing books stream uninterrupted
+#     (this is what makes the add NO-GAP: no books.clear(), no reconnect-censoring window).
+#   • an overlapping add (already-subscribed ticker) is a harmless merge — NO re-snapshot, books intact.
+#   • delete_markets silences the removed tickers (0 frames observed >1s past the ack).
+ADD_CONFIRM_SECS = 60        # an added ticker must snapshot within this window, else next heartbeat cycles
+
+def update_sub_cmd(cmd_id, sid, tickers, action):
+    """The exact probe-verified wire shape (a typo here = silent no-data, so it's selftested)."""
+    if action not in ("add_markets", "delete_markets"):
+        raise ValueError(f"unknown update_subscription action: {action}")
+    return {"id": cmd_id, "cmd": "update_subscription",
+            "params": {"sids": [sid], "market_tickers": list(tickers), "action": action}}
 
 
 # --- NWS CLI revision logging: MEASURE how often the morning preliminary daily-max is later CORRECTED.
@@ -573,6 +682,166 @@ def fetch_cli(station):
         return None
 
 
+# --- WAVE-2 LADDER + TRADE LOGGING + FEE TRIPWIRE (weather only; spec: tasks/_agent_bus/20260611-probes/
+#     ladder-logging-spec.md). All ADDITIVE: new file prefixes (trades-*/ladders-*/fee_changes.jsonl), the
+#     transitions-* record shape is untouched. Kalshi trade prints come from the PUBLIC REST cursor-poll
+#     (envelope {cursor, trades} + min_ts filter VERIFIED live 2026-06-11; final page cursor "") — the WS
+#     `trade` channel stays OUT until its 2-channel sid/seq semantics are probed (spec A). ----------------
+KALSHI_REST = "https://api.elections.kalshi.com/trade-api/v2"
+WX_POLL_SEC = 300            # trades/ladders/fee cadence (the spec's heartbeat) — deliberately NOT tied to
+LADDER_LEVELS = 5            # refresh_sec, so a fast-refresh test/--live run never hammers the REST API
+
+def ladder_cents(levels, n=LADDER_LEVELS):
+    """Top-n of a best-first {px:{value},qty} ladder -> [[price_int_cents, qty_1dp], ...] (spec B shape)."""
+    out = []
+    for l in (levels or [])[:n]:
+        try: out.append([int(round(float(l["px"]["value"]) * 100)), round(float(l["qty"]), 1)])
+        except (KeyError, ValueError, TypeError): pass
+    return out
+
+def wx_ladders(trk, n=LADDER_LEVELS):
+    """The 4 top-n ladder fields (both sides, both venues) of one weather MarketTracker."""
+    (pb, po), (kb, ko) = trk.books["P"], trk.books["K"]
+    return {"pb": ladder_cents(pb, n), "pa": ladder_cents(po, n),
+            "kb": ladder_cents(kb, n), "ka": ladder_cents(ko, n)}
+
+def hb_ladder_pass(trackers, last, logger, now):
+    """Delta-suppressed heartbeat snapshots (spec B k:'hb'): one ladder record per tracked weather market,
+    SKIPPED when all 4 top-5 ladders are unchanged since the last pass (idle overnight books cost ~0).
+    Drops suppression state for pruned markets. Returns #emitted."""
+    for gone in set(last) - set(trackers):
+        last.pop(gone, None)
+    n = 0
+    for market, trk in list(trackers.items()):
+        lad = wx_ladders(trk)
+        if last.get(market) == lad:
+            continue
+        last[market] = lad
+        logger.ladder({"t": round(now, 3), "market": market, "k": "hb", **lad})
+        n += 1
+    return n
+
+class TradePollState:
+    """Per-ticker cursor for the trades REST poll: min_ts = floor(max venue ts seen) - 1 (the 1 s overlap
+    absorbs the endpoint's boundary semantics either way), deduped by trade_id inside that window."""
+    def __init__(self, start_ts=0.0):
+        self.max_ts, self.ids = float(start_ts), {}
+    def min_ts(self):
+        return max(0, int(self.max_ts) - 1)
+    def seen(self, tid):
+        return bool(tid) and tid in self.ids
+    def add(self, tid, ts):
+        if ts > self.max_ts:
+            self.max_ts = ts
+            lo = int(self.max_ts) - 1
+            self.ids = {i: t for i, t in self.ids.items() if t >= lo}
+        if tid:
+            self.ids[tid] = ts
+
+def _iso_unix(s):
+    """Kalshi created_time (RFC3339 with microseconds + Z) -> unix float; 0.0 if unparseable."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+def trade_rec(tr, market, now):
+    """One Kalshi trade print -> the spec's ~150 B record. `vt` = venue fill time verbatim (the TRUE fill
+    time); `t` = local poll receipt, kept separately (L22). `market` = the pm-slug join key."""
+    return {"t": round(now, 3), "venue": "k", "market": market, "ktk": tr.get("ticker"),
+            "vt": tr.get("created_time"), "yes_c": int(round(float(tr["yes_price_dollars"]) * 100)),
+            "qty": round(float(tr.get("count_fp") or 0), 2), "taker": tr.get("taker_side"),
+            "id": tr.get("trade_id")}
+
+def ingest_trades(trades, market, st, logger, now):
+    """Dedupe + log one ticker's poll result, OLDEST print first: the cursor state only advances past a
+    print AFTER its record is durably written, so a mid-batch failure resumes behind the gap. Returns #logged."""
+    n = 0
+    for tr in sorted(trades, key=lambda x: str(x.get("created_time") or "")):
+        tid = tr.get("trade_id")
+        if st.seen(tid):
+            continue
+        logger.trade(trade_rec(tr, market, now))
+        st.add(tid, _iso_unix(tr.get("created_time")) or now)
+        n += 1
+    return n
+
+def seed_trade_state(data_dir):
+    """Rebuild the per-ticker dedupe cursors from the trades-*.jsonl already on disk, so a RESTART resumes
+    where the log ends instead of re-logging a day of prints (mirrors cli_stream's seed-from-own-log)."""
+    import glob
+    st = {}
+    for p in glob.glob(os.path.join(data_dir, "trades-*.jsonl")):
+        try:
+            for ln in open(p, encoding="utf-8"):
+                try:
+                    r = json.loads(ln)
+                except Exception:
+                    continue
+                tk = r.get("ktk")
+                if not tk:
+                    continue
+                s = st.setdefault(tk, TradePollState())
+                if not s.seen(r.get("id")):
+                    s.add(r.get("id"), _iso_unix(r.get("vt")) or float(r.get("t") or 0))
+        except Exception:
+            pass
+    return st
+
+def fetch_k_trades(ticker, min_ts, limit=200, max_pages=25):
+    """All public trade prints for one ticker since min_ts (cursor-paged, newest-first). One-shot, no
+    retries — the next poll cycle is the retry; raises on network error (caller skips this ticker)."""
+    import urllib.request, urllib.parse
+    out, cursor = [], None
+    for _ in range(max_pages):
+        q = {"ticker": ticker, "limit": limit, "min_ts": min_ts}
+        if cursor:
+            q["cursor"] = cursor
+        with urllib.request.urlopen(urllib.request.Request(
+                f"{KALSHI_REST}/markets/trades?{urllib.parse.urlencode(q)}",
+                headers={"User-Agent": "cross-arb/1.0"}), timeout=15) as r:
+            d = json.load(r)
+        page = d.get("trades") or []
+        out += page
+        cursor = d.get("cursor")
+        if not cursor or len(page) < limit:
+            return out
+    # paging is newest-first, so a truncation gaps the OLDER tail PERMANENTLY (min_ts advances past it).
+    # 25x200 = 5000 prints/ticker/cycle, ~3 orders of magnitude above observed weather rates — loud if ever.
+    print(f"[trades] WARNING {ticker}: >{max_pages * limit} prints in one cycle — older tail GAPPED")
+    return out
+
+def fetch_fee_changes():
+    """The /series/fee_changes tripwire (public; envelope {'series_fee_change_arr': [...]} VERIFIED live
+    2026-06-11, currently empty). Returns the array, or None on any error (caller keeps last state)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"{KALSHI_REST}/series/fee_changes", headers={"User-Agent": "cross-arb/1.0"}), timeout=15) as r:
+            return json.load(r).get("series_fee_change_arr") or []
+    except Exception:
+        return None
+
+def fee_tick(changes, fee_state, logger):
+    """Tripwire transition logic: log LOUDLY when the scheduled-fee-change array becomes non-empty OR
+    changes (incl. clearing). The boot baseline (empty) logs nothing; a failed poll (None) keeps the last
+    known state. Mutates fee_state {n, last}; returns the logged record or None."""
+    if changes is None:
+        return None
+    fee_state["n"] = len(changes)
+    first = "last" not in fee_state
+    if not first and changes == fee_state["last"]:
+        return None
+    fee_state["last"] = changes
+    if first and not changes:
+        return None
+    rec = logger.fee({"event": "fee_change", "n": len(changes), "changes": changes})
+    print(f"[FEES] /series/fee_changes {'NON-EMPTY' if changes else 'cleared'} ({len(changes)} scheduled) — "
+          f"pinned fee coefficients may be invalidated (research/fee-pin-2026-06-10.md)")
+    return rec
+
+
 def _build_id():
     """Short content hash of this file — logged in session_start so deploys and crashes are
     distinguishable in sessions.jsonl (same build restarting = crash; new build = deploy)."""
@@ -597,13 +866,24 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     deb = FlipDebouncer(debounce)
     last_rx = {"pm": 0.0, "k": 0.0}               # epoch of the LAST frame received per venue (stream liveness,
                                                   # distinct from book-change `age`) -> beacon can expose a half-dead stream
+    ksub = {"sid": None, "pending": {}}           # live Kalshi sub: sid from the `subscribed` ack + added
+    kcmd = [1]                                    # tickers awaiting their snapshot (no-gap add confirm);
+    def _kcmd():                                  # monotonic WS command id (id=1 is the connect subscribe)
+        kcmd[0] += 1; return kcmd[0]
+    wx_trackers = {}                              # slug -> MarketTracker, WEATHER only (ladder/trade logging
+    fee_state = {}                                # scope, spec wave-2); fee tripwire state for the beacon
 
     def _write(label, state, key, t):
+        lad = state.pop("_lad", None)             # detection-time ladders stashed by emit (weather only)
         rec = logger.write(key, label, state, round(t, 3))   # ms precision + DETECTION time (a flushed CLOSE
                                                              # carries when the edge died, not the flush tick)
+        if lad:
+            logger.ladder({"t": rec["t"], "market": key, "k": "tr", **lad})   # same t = the join key (L22)
         print(f"[{rec['t']}] {key} {label} dir={rec['dir']} net={rec['net_edge']}")
     def emit(label, state, key):
-        for lab, st, k, t in deb.feed(label, state, key, time.time()):
+        if label and key in wx_trackers:          # capture BOTH venues' top-5 ladders AT DETECTION, so a
+            state["_lad"] = wx_ladders(wx_trackers[key])     # debounce-held CLOSE flushes detection-time
+        for lab, st, k, t in deb.feed(label, state, key, time.time()):       # content, not flush-time (L22)
             _write(lab, st, k, t)
 
     def register(colisted):                       # add trackers for NEW markets; return (new slugs, new tickers)
@@ -614,13 +894,16 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             return bool(hit)
         # WEATHER + ECON = 1:1 binary same-outcome MarketTracker (pm /book is YES-oriented; econ pmus '>=T'
         # matches the IDENTICAL Kalshi 'Above T-step' twin — decision 0013, scripts/verify_econ_settlement.py).
-        for e in colisted["weather"] + colisted.get("econ", []):
+        wx_n = len(colisted["weather"])
+        for i, e in enumerate(colisted["weather"] + colisted.get("econ", [])):
             if e["slug"] in pm_targets or _collide(e["kalshi"]): continue
             trk = MarketTracker(e["slug"])
             def pm_fn(b, o, trk=trk, key=e["slug"]): trk.set_book("P", b, o); emit(*trk.evaluate(), key)
             def k_fn(book, trk=trk, key=e["slug"]): trk.set_book("K", book.yes_bid_ladder(), book.yes_offer_ladder()); emit(*trk.evaluate(), key)
             pm_targets[e["slug"]] = pm_fn; k_targets[e["kalshi"]] = k_fn
             slug_k[e["slug"]] = [e["kalshi"]]
+            if i < wx_n:
+                wx_trackers[e["slug"]] = trk      # weather-only registry: ladder/trade logging scope (wave-2)
             new_pm.append(e["slug"]); new_k.append(e["kalshi"])
         for e in colisted["sports"]:              # SPORTS = 2-outcome GameTracker (pm game + 2 K tickers)
             if e["slug"] in pm_targets or _collide(e["kalshi_a"], e["kalshi_b"]): continue
@@ -684,21 +967,21 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
 
     async def kalshi_stream():
         # RSA-PSS handshake + orderbook_delta, merged via KalshiBook (bot/kalshi_book.py; validated
-        # offline + live). INVARIANT: exactly ONE subscribe per connection — SeqTracker's single
-        # monotonic counter was only ever live-verified for a single subscription, and a second
-        # subscribe's behavior (error? second sid with its own seq?) is UNVERIFIED (probe TODO). So a
-        # seq gap and a mid-session ticker ADD both CYCLE the connection (close -> supervised reconnect
-        # rebuilds everything from fresh snapshots with one subscribe over the CURRENT k_targets)
-        # instead of in-place resubscribing on unverified semantics. Tracker `state` is intentionally
-        # NOT reset (retained state avoids a phantom CLOSE on every edge; the reconnect MARKER below
-        # lets analysis censor the rebuild window instead).
+        # offline + live). Subscription semantics PROBE-VERIFIED (2026-06-10, probe_kalshi_ws --multisub
+        # — see update_sub_cmd's header note): ONE sid per channel per connection, control acks consume
+        # seq slots, and update_subscription add/delete is a NO-GAP in-place mutation — so a discovery
+        # ADD no longer cycles the connection (rest_heartbeat sends add_markets on the live sid). A SEQ
+        # GAP still cycles (missed data has no replay). Tracker `state` is intentionally NOT reset
+        # (retained state avoids a phantom CLOSE on every edge; the reconnect MARKER below lets
+        # analysis censor the rebuild window instead).
         backoff = 1
         while True:
             try:
                 async with websockets.connect(KALSHI_WS, additional_headers=kalshi_ws_headers()) as ws:
                     conns["k"] = ws
-                    books.clear()                              # fresh connection -> rebuild every book from snapshots
-                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                    ksub["sid"] = None; ksub["pending"].clear()   # fresh connection subscribes the FULL
+                    books.clear()                              # current k_targets -> nothing left pending;
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe",   # rebuild every book from snapshots
                         "params": {"channels": ["orderbook_delta"], "market_tickers": list(k_targets)}}))
                     st = SeqTracker()                          # books is shared (run_live scope) so prune can free it
                     backoff = 1
@@ -707,10 +990,14 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                         o = json.loads(raw)
                         if "seq" in o and not st.check(o["seq"]):       # connection-level gap -> missed data
                             logger.resync({"seq": o["seq"]})            # mark it so analysis censors the re-OPENs
-                            print("[kalshi] seq gap -> cycling connection (single-subscription invariant)")
+                            print("[kalshi] seq gap -> cycling connection (no replay for missed deltas)")
                             break                                       # close -> supervised loop rebuilds clean
                         typ, msg = o.get("type"), o.get("msg", {}); tk = msg.get("market_ticker")
+                        if typ == "subscribed":
+                            ksub["sid"] = msg.get("sid")                # update_subscription targets this sid
+                            continue
                         if typ == "orderbook_snapshot":
+                            ksub["pending"].pop(tk, None)               # no-gap add confirmed for this ticker
                             books[tk] = KalshiBook(tk); books[tk].apply_snapshot(msg)
                         elif typ == "orderbook_delta" and tk in books:
                             books[tk].apply_delta(msg)
@@ -749,13 +1036,27 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                             "requestId": f"md-add-{int(time.time())}-{i}",
                             "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
                             "marketSlugs": new_pm[i:i + shard_size]}}))
-                if new_k and conns.get("k"):
-                    # single-subscription invariant: do NOT send a second subscribe on the live socket
-                    # (unverified semantics — error frame we'd silently ignore, or a second seq counter
-                    # that breaks SeqTracker). CYCLE the connection: the supervised loop reconnects and
-                    # subscribes the FULL current k_targets (incl. the new tickers) in one command.
-                    print(f"[discovery] +{len(new_k)} Kalshi tickers -> cycling Kalshi WS to subscribe them")
-                    await conns["k"].close()
+                # NO-GAP Kalshi add (probe-verified — update_sub_cmd header): mutate the live sid in
+                # place; existing books keep streaming (no books.clear(), no reconnect-censor window),
+                # ONLY the new tickers snapshot. Failure self-heals: a ticker that never snapshots
+                # within ADD_CONFIRM_SECS is caught HERE next heartbeat and we fall back to the old
+                # reliable path (cycle -> reconnect subscribes the FULL current k_targets).
+                overdue = [t for t, dl in ksub["pending"].items() if time.time() > dl]
+                if overdue and conns.get("k"):
+                    print(f"[discovery] {len(overdue)} added Kalshi tickers never snapshotted "
+                          f"(e.g. {overdue[:2]}) -> cycling Kalshi WS (fallback)")
+                    ksub["pending"].clear()
+                    await conns["k"].close()                  # reconnect covers new_k too (already in k_targets)
+                elif new_k and conns.get("k"):
+                    if ksub["sid"] is not None:
+                        dl = time.time() + ADD_CONFIRM_SECS
+                        for t in new_k: ksub["pending"][t] = dl
+                        await conns["k"].send(json.dumps(update_sub_cmd(_kcmd(), ksub["sid"], new_k, "add_markets")))
+                        print(f"[discovery] +{len(new_k)} Kalshi tickers -> update_subscription add_markets "
+                              f"(no-gap, sid={ksub['sid']})")
+                    else:                                     # subscribed-ack not seen yet (connection mid-build)
+                        print(f"[discovery] +{len(new_k)} Kalshi tickers, sid not yet known -> cycling Kalshi WS")
+                        await conns["k"].close()
                 if new_pm:
                     print(f"[discovery] +{len(new_pm)} new markets subscribed")
                 # FREE settled markets: anything gone from discovery for PRUNE_THRESHOLD heartbeats. Keeps the
@@ -768,15 +1069,25 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                     current = ({e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
                                | {e["slug"] for e in fresh.get("econ", [])})   # incl. econ or it'd be pruned each heartbeat
                     stale = prune_decision(set(pm_targets), current, absent)
+                    dead_k = [tk for slug in stale for tk in slug_k.get(slug, [])]   # before teardown pops slug_k
                     for slug in stale:
-                        teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent)
+                        teardown(slug, pm_targets, k_targets, books, slug_k, deb, absent, wx_trackers)
                     if stale:
                         print(f"[prune] freed {len(stale)} settled markets; now tracking "
                               f"{len(pm_targets)} pmus / {len(k_targets)} Kalshi ({len(books)} live books)")
+                    if dead_k and conns.get("k") and ksub["sid"] is not None:
+                        # subscription hygiene: without this, the now-long-lived connection's ticker set
+                        # would grow monotonically (adds, never removes). delete_markets is probe-verified
+                        # (silences the ticker; ack consumes a seq slot). An added-then-settled ticker must
+                        # not force a fallback cycle, so drop it from pending too.
+                        for tk in dead_k: ksub["pending"].pop(tk, None)
+                        await conns["k"].send(json.dumps(update_sub_cmd(_kcmd(), ksub["sid"], dead_k, "delete_markets")))
+                        print(f"[prune] unsubscribed {len(dead_k)} settled Kalshi tickers (delete_markets, no-gap)")
                 now = time.time()                                                   # per-venue stream-liveness in the beacon:
                 logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
                                "econ": len(fresh.get("econ", [])),
                                "pmus": len(pm_targets), "kalshi": len(k_targets),
+                               "fee_changes": fee_state.get("n"),   # tripwire count (None until first poll)
                                "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
                                           "k": round(now - last_rx["k"], 1) if last_rx["k"] else None}})  # off-box check can
                 # alert when one venue's rx_age stays high (stream silent/wedged) even though the process + beacon are live
@@ -788,6 +1099,36 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             await asyncio.sleep(0.5)
             for lab, st, k, t in deb.flush(time.time()):
                 _write(lab, st, k, t)
+
+    async def weather_poll():       # WAVE-2 (ladder-logging spec): Kalshi trade prints via the verified REST
+        # cursor-poll, delta-suppressed heartbeat ladder snapshots, and the /series/fee_changes tripwire.
+        # Cadence = WX_POLL_SEC (the spec's 300 s heartbeat), deliberately decoupled from refresh_sec.
+        # Supervised like cli_stream: one bad cycle (or one bad ticker) never kills the task.
+        try:                        # like cli_stream's seed: a boot-time surprise must not kill the task
+            tstate = await asyncio.to_thread(seed_trade_state, logger.dir)   # restart resumes, never re-logs
+        except Exception:
+            tstate = {}             # fallback cost: ≤ one lookback window of duplicate prints (dedupable on id)
+        hb_last = {}
+        while True:
+            await asyncio.sleep(WX_POLL_SEC)
+            try:
+                fee_tick(await asyncio.to_thread(fetch_fee_changes), fee_state, logger)
+                wx_map = {slug_k[s][0]: s for s in wx_trackers if slug_k.get(s)}   # ticker -> pm-slug join key
+                for tk in set(tstate) - set(wx_map):
+                    tstate.pop(tk, None)                       # settled+pruned ticker -> drop its cursor
+                for tk, market in wx_map.items():
+                    st = tstate.get(tk)
+                    if st is None:                             # first contact: look back one cycle, not full
+                        st = tstate[tk] = TradePollState(time.time() - WX_POLL_SEC - 60)   # history (no burst)
+                    try:
+                        trades = await asyncio.to_thread(fetch_k_trades, tk, st.min_ts())
+                        ingest_trades(trades, market, st, logger, time.time())
+                    except Exception as e:
+                        print(f"[trades] {tk} poll failed ({e!r}) — retried next cycle")
+                    await asyncio.sleep(0.25)                  # ~0.2 req/s averaged over the cycle (spec A)
+                hb_ladder_pass(wx_trackers, hb_last, logger, time.time())
+            except Exception as e:
+                print(f"[wxpoll] error (continuing next cycle): {e!r}")
 
     async def cli_stream():         # poll NWS CLI per station every 30min; log each DISTINCT issuance
         last = {}                   # station -> (report_date, max); log only when the daily MAX changes (a revision),
@@ -821,8 +1162,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     # (logged) rather than cancelling the whole collector. (A truly unrecoverable error -> task ends -> if all end
     # the process exits -> systemd Restart=always; the silent clean-return hole is closed by the while-loops.)
     results = await asyncio.gather(pmus_stream(), kalshi_stream(), rest_heartbeat(), flusher(), cli_stream(),
-                                   return_exceptions=True)
-    for name, r in zip(("pmus", "kalshi", "heartbeat", "flusher", "cli"), results):
+                                   weather_poll(), return_exceptions=True)
+    for name, r in zip(("pmus", "kalshi", "heartbeat", "flusher", "cli", "wxpoll"), results):
         if isinstance(r, Exception):
             print(f"[run_live] task {name} exited with {r!r}")
 

@@ -41,8 +41,8 @@ capacity. **$6 / 1 GB / NYC1 / Ubuntu 24.04 LTS** is the right pick; 2 GB only b
 | [`deploy.sh`](deploy.sh) | your laptop | one command: ship the runtime cone → secrets out-of-band → provision → start |
 | [`provision.sh`](provision.sh) | the droplet (root) | create the confined `cross-arb` user, venv + pinned deps, `0700` the dir, install + enable the unit |
 | [`cross-arb-monitor.service`](cross-arb-monitor.service) | the droplet | systemd unit: runs as `cross-arb`, `--forever`, `Restart=always`, read-only-FS hardening, journald |
-| [`pull-data.ps1`](pull-data.ps1) | your laptop | **foolproof pull** — sha256-verified + idempotent mirror to `Kalshi/data/cross-arb/`; gzips finalized days, then verified-deletes them on the droplet |
-| [`healthcheck.ps1`](healthcheck.ps1) | your laptop | liveness check — alerts (desktop balloon + `ALERT.txt` + non-zero exit) if the collector stops |
+| [`pull-data.ps1`](pull-data.ps1) | your laptop | **foolproof pull** — sha256-verified + idempotent mirror to `Kalshi/data/cross-arb/`; gzips finalized days (`transitions/ladders/trades`), then verified-deletes them on the droplet; **never overwrites** an archived day a late append recreates (kept raw beside the `.gz`); runs a **daily settle-recon** post-pull (~12:30 Z = the pmus-finality window; `ALERT.txt` on divergence, `CA_NO_RECON=1` skips) |
+| [`healthcheck.ps1`](healthcheck.ps1) | your laptop | liveness check — alerts (desktop balloon + `ALERT.txt` + non-zero exit) if the collector stops; also polls Kalshi `/series/fee_changes` and alerts on any scheduled fee change |
 | [`register-tasks.ps1`](register-tasks.ps1) | your laptop | register both jobs: `PullCrossArbData` (daily) + `CrossArbHealthcheck` (every 30 min) |
 
 ## Deploy (once greenlit)

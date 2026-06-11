@@ -74,8 +74,12 @@ python bot/monitor.py --live N # bounded ~N-second READ-ONLY dual-stream run (no
   real MLB edges nyy-cle PK +3.75¢, phi-tor KP +6.81¢).
 - **Dynamic re-subscribe + FLIP debounce** — the heartbeat (supervised; one bad cycle never kills it)
   re-discovers and registers new markets; new **pmus** slugs subscribe on the live socket (the verified
-  shard pattern), new **Kalshi** tickers CYCLE the Kalshi connection (single-subscription invariant: a
-  second subscribe's seq semantics were never probed — a seq gap cycles it too). `FlipDebouncer` coalesces
+  shard pattern), new **Kalshi** tickers are added IN-PLACE via `update_subscription add_markets` — a
+  **NO-GAP add** (probe-verified 2026-06-10, `probe_kalshi_ws.py --multisub`: one sid per channel, control
+  acks consume seq slots, only added tickers snapshot; offline integration test
+  `scripts/test_monitor_nogap.py`). An add whose snapshot never arrives within `ADD_CONFIRM_SECS` falls
+  back to the old reliable cycle; pruned tickers are `delete_markets`-unsubscribed (hygiene); a genuine
+  **seq gap still cycles** (missed deltas have no replay). `FlipDebouncer` coalesces
   a CLOSE + opposite-direction OPEN within ~1s into one FLIP (same-dir reopen = suppressed flicker) and
   emits flushed CLOSEs stamped at **DETECTION time** — flush-time stamps silently added ~1.0–1.5s to every
   episode duration pre-[0013](../decisions/0013-econ-grid-step-twin-and-measurement-integrity.md).
@@ -95,6 +99,29 @@ python bot/monitor.py --live N # bounded ~N-second READ-ONLY dual-stream run (no
   `_data/cli.jsonl`; feeds `scripts/cli_revisions.py`, the settlement **revision-rate** gauge that
   quantifies the one open settlement-timing risk (a downward 8–10 AM CLI correction splitting the venues).
   READ-ONLY public NWS endpoint.
+- **Wave-2 ladder + trade logging, WEATHER only** (`weather_poll`; spec
+  [tasks/_agent_bus/20260611-probes/ladder-logging-spec.md](../tasks/_agent_bus/20260611-probes/ladder-logging-spec.md))
+  — all ADDITIVE: new file prefixes, the `transitions-*` record shape is untouched and every existing
+  loader (`analyze_persistence.py` etc.) runs unmodified.
+  - **`trades-<event-date>.jsonl`** — Kalshi weather **trade prints** via the public REST cursor-poll
+    (`/markets/trades`; envelope `{cursor, trades}` + `min_ts` filter verified live 2026-06-11 — the WS
+    `trade` channel stays OUT until its 2-channel sid/seq semantics are probed). Per print: `vt` = venue
+    fill time **verbatim**, `t` = local poll receipt, kept separately ([L22] — nothing re-stamps the
+    clock); deduped on `trade_id` with a 1 s `min_ts` overlap; a restart seeds from the log tail (like
+    `cli_stream`) so nothing is re-logged. ~+3.6 MB/day.
+  - **`ladders-<event-date>.jsonl`** — top-5 dual-venue ladder snapshots (`pb/pa/kb/ka`, integer cents,
+    qty 1 dp): `k:"tr"` rides every weather transition with the ladders captured **at detection time**
+    and the same `t` as the transition record (the join key; a debounce-held CLOSE flushes
+    detection-time content, not flush-time — [L22]); `k:"hb"` every `WX_POLL_SEC` (300 s) per tracked
+    weather market, **delta-suppressed** when all four ladders are unchanged. ~+2.2 +≤3.7 MB/day.
+  - **`fee_changes.jsonl` + a `fee_changes` beacon field** — the `/series/fee_changes` tripwire (envelope
+    key `series_fee_change_arr`, verified live): the array turning non-empty / changing logs LOUDLY —
+    a scheduled per-series fee change can invalidate `ledger.py`'s pinned coefficients
+    ([research/fee-pin-2026-06-10.md](../research/fee-pin-2026-06-10.md)). `deploy/healthcheck.ps1`
+    polls the same endpoint laptop-side every 30 min and raises its alert path on non-empty.
+  - Cadence is `WX_POLL_SEC` (300 s), deliberately decoupled from `--forever`'s refresh interval;
+    offline coverage: `scripts/test_monitor_trades_ladders.py` + the extended `bot/monitor.py` self-test;
+    `deploy/pull-data.ps1` finalizes/deletes the new dated files exactly like transitions.
 - **Extended run = DigitalOcean droplet deploy** — gated on owner sign-off ([0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
 - **Deploy is gated** → DigitalOcean droplet, consult the owner first
   ([decisions/0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)).
