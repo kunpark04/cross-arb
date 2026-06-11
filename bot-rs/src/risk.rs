@@ -90,18 +90,27 @@ pub fn evaluate(
         return Err(Reject::TooEarly);
     }
 
-    // 2. per-venue book sanity (L12 crossed, L13 stale)
+    // 2. per-venue book sanity (L12 crossed, L13 stale). For SPORTS the AWAY-team Kalshi book (`k_b`) is
+    //    a THIRD book the hedge fills against, so it gets the same crossed/stale gates as the other two —
+    //    a stale/crossed Kalshi-B book is as fatal as a stale Kalshi-A book (both legs can leg out). It is
+    //    `None` for weather/econ, so those paths are unchanged.
     if q.k.crossed() {
         return Err(Reject::CrossedBook(Venue::Kalshi));
     }
     if q.pm.crossed() {
         return Err(Reject::CrossedBook(Venue::Pmus));
     }
+    if q.k_b.is_some_and(|kb| kb.crossed()) {
+        return Err(Reject::CrossedBook(Venue::Kalshi));
+    }
     if q.k.age_s > cfg.max_book_age_s {
         return Err(Reject::StaleBook(Venue::Kalshi));
     }
     if q.pm.age_s > cfg.max_book_age_s {
         return Err(Reject::StaleBook(Venue::Pmus));
+    }
+    if q.k_b.is_some_and(|kb| kb.age_s > cfg.max_book_age_s) {
+        return Err(Reject::StaleBook(Venue::Kalshi));
     }
 
     // 3. cross-venue mid-divergence (L1): two settlement-identical legs should price close; a huge
@@ -232,6 +241,7 @@ mod tests {
             cat: Cat::Weather,
             pm: Book { yes_bid: Some(0.74), yes_ask: Some(0.75), age_s: 0.1 },
             k: Book { yes_bid: Some(0.86), yes_ask: Some(0.87), age_s: 0.0 },
+            k_b: None, // weather is 1:1 — no away-team book
             depth: Depth { c2: 50, c1: 60, c0: 70 },
             settle_clean: true,
             cluster: "nychigh-2026-06-11".into(),
@@ -275,6 +285,24 @@ mod tests {
             evaluate(&cfg(), &q, &edge(), &Exposure::new(), 1000),
             Err(Reject::StaleBook(Venue::Pmus))
         );
+    }
+
+    #[test]
+    fn rejects_crossed_or_stale_away_team_book() {
+        // SPORTS pair: the away-team Kalshi book (k_b) gets the same crossed + stale gates as k/pm.
+        let e = Edge { net: 0.03, dir: Dir::PK };
+        let mut q = quote();
+        q.cat = Cat::Sports;
+        q.settle_clean = true;
+        // crossed k_b (bid > ask) -> CrossedBook(Kalshi)
+        q.k_b = Some(Book { yes_bid: Some(0.60), yes_ask: Some(0.50), age_s: 0.0 });
+        assert_eq!(evaluate(&cfg(), &q, &e, &Exposure::new(), 1000), Err(Reject::CrossedBook(Venue::Kalshi)));
+        // stale k_b (old) -> StaleBook(Kalshi)
+        q.k_b = Some(Book { yes_bid: Some(0.40), yes_ask: Some(0.45), age_s: 9.0 });
+        assert_eq!(evaluate(&cfg(), &q, &e, &Exposure::new(), 1000), Err(Reject::StaleBook(Venue::Kalshi)));
+        // a fresh, uncrossed k_b passes the book-sanity gates (other gates may still apply, but not these).
+        q.k_b = Some(Book { yes_bid: Some(0.40), yes_ask: Some(0.45), age_s: 0.1 });
+        assert!(evaluate(&cfg(), &q, &e, &Exposure::new(), 1000).is_ok());
     }
 
     #[test]

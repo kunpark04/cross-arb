@@ -4,6 +4,37 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
+## bot-rs STAGE-2.5 — SPORTS TRADABLE (2026-06-11) — in progress
+
+Make sports a tradeable category in the live loop. Sports is genuinely TWO-OUTCOME (not 1:1): a pmus
+game market (YES = team A) hedges against the OTHER team's SEPARATE Kalshi market. Two cross-venue
+configs (port of `monitor.py::game_edge`):
+- **PK** = back A@pmus (Buy YES @ pmus slug) + B@Kalshi (Buy YES @ **Kalshi ticker B**) — uses the 2nd ticker.
+- **KP** = back A@Kalshi (Buy YES @ Kalshi ticker A) + B@pmus (Buy **NO** @ pmus slug = 1 − pm_bid).
+
+- [ ] `signal::game_signal(pm_bid,pm_ask,kA_ask,kB_ask)` — port `game_edge`: strictly-crossed-pm reject;
+      C3 orientation guard (|guard_pm − kA_ask|>0.40 → no_arb); the two opts above w/ marginal fees; best>0.
+- [ ] `book::game_depth_at_edge(pm,kA,kB,dir)` — port `GameTracker._depth`: PK a=pm YES-asks, b=kB YES-asks;
+      KP a=kA YES-asks, b=pmus NO-asks(1−pm_bid). Reuse `depth_curve`.
+- [ ] `discovery`: emit sports as a real `Pair{kalshi:tickerA, kalshi_b:Some(tickerB)}` (add `kalshi_b`), with
+      a faithful `pick_game` bind — **exact slug-ET-date** + a **doubleheader `used`-set** (the parity WARN);
+      ±1-day fallback only when slug undated AND globally unique. `days_to_event` = slug-date − today (epoch-days,
+      dep-free; pure `assemble` takes `today_epoch_days`, live `discover` passes SystemTime).
+- [ ] `types::Quote` gains `k_b: Option<Book>` (away-team Kalshi book; None for wx/econ); `risk` checks k_b
+      crossed/stale too. `q.k` = Kalshi-A (same team as pm) so the C3 mid-div gate still applies.
+- [ ] **Leg-market FIX (latent bug):** each leg's `market` must be the VENUE-NATIVE id — Kalshi legs carry the
+      Kalshi **ticker**, pmus legs the slug. Today `fire_pair` sends the pmus slug as the Kalshi leg's ticker
+      (would 404 live). Unify leg construction: prices from BOOKS (never edge, the self-review CRITICAL), correct
+      per-venue market id, correct sides (sports PK leg2 = YES@KalshiB; KP leg2 = NO@pmus).
+- [ ] `main`: sports branch (read pm + kA + kB books; `game_signal`; `game_depth`; Quote w/ k_b; evaluate; fire
+      sports legs). `PairState`/`k_tracked`/refresh register BOTH tickers → slug; prune frees both books.
+- [ ] `Position` generalized to two explicit legs `[{venue,market,side};2]` so the postponement unwind SELLs the
+      correct sports legs (the current yes/no-venue model mis-flattens a sports pair). Update `unwind` + smoke.
+- [ ] Keep all 66 tests green + add game_signal/game_depth/pick_game/leg-mapping tests; self-review; then an
+      **independent parity review** of `game_signal` + `pick_game` + the leg mapping vs the Python (C2/C3 surface).
+
+> **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
+
 ## bot-rs stage-2 NETWORK LAYER (2026-06-11) — ✅
 
 Build the venue I/O + live transport that completes the Rust bot (compile + unit-test only; live

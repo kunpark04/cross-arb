@@ -95,7 +95,12 @@ pub struct Quote {
     pub market: String,
     pub cat: Cat,
     pub pm: Book,
+    /// Kalshi book for the SAME team pmus lists as YES (= team-A ticker for sports; the only Kalshi
+    /// book for weather/econ). The C3 mid-divergence guard compares this against `pm`.
     pub k: Book,
+    /// SPORTS only: the Kalshi book for the AWAY team (team-B ticker). `None` for weather/econ, which are
+    /// 1:1 (one pmus market <-> one Kalshi market). The game signal needs both Kalshi YES asks.
+    pub k_b: Option<Book>,
     pub depth: Depth,
     /// Settlement-identity EMPIRICALLY verified for this pair (weather=true; sports/econ per recon).
     pub settle_clean: bool,
@@ -131,14 +136,25 @@ pub struct OrderIntent {
     pub client_order_id: String,
 }
 
+/// One leg of a held position: the exact (venue, venue-native market id, side) we own. Generalizes the
+/// old yes_venue/no_venue pair so a SPORTS hedge — whose two legs can be two YES legs on two different
+/// Kalshi tickers (dir PK: YES@pmus + YES@Kalshi-B) — is represented faithfully, not forced into a
+/// yes-leg/no-leg shape. The unwind SELLs each leg with this exact (venue, market, side).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionLeg {
+    pub venue: Venue,
+    pub market: String, // venue-native id: Kalshi ticker for a Kalshi leg, pmus slug for a pmus leg
+    pub side: Side,
+}
+
 /// A held, hedged cross-arb position — the two legs we own. Used by the unwind logic to close out
-/// (e.g. a postponement that would break the hedge).
+/// (e.g. a postponement that would break the hedge). `market` is the PAIR identity (the pmus slug),
+/// distinct from each leg's venue-native `market`.
 #[derive(Clone, Debug)]
 pub struct Position {
-    pub market: String,
+    pub market: String, // pair identity = the pmus slug (NOT a venue-native order id)
     pub cat: Cat,
-    pub yes_venue: Venue, // where we hold the long YES leg
-    pub no_venue: Venue,  // where we hold the NO leg
+    pub legs: [PositionLeg; 2],
     pub size: u32,
     pub cluster: String,
 }

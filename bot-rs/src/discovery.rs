@@ -12,10 +12,11 @@
 //!     `?closed=false&limit=500&offset=`, Kalshi `?series_ticker=&limit=&cursor=`) and hand the parsed
 //!     JSON to `assemble`. NOT exercised by any test (no live HTTP on a test path).
 //!
-//! SCOPE: the live loop is 1:1 (one pmus slug ↔ one Kalshi ticker — see `main::LivePair`), so only
-//! WEATHER + ECON are emitted as subscribable [`Pair`]s. SPORTS (two Kalshi tickers per game) is matched
-//! and COUNTED (so a live league is never silently missed — L7) but not emitted as a `Pair`: the 1:1
-//! Quote path can't price a two-ticker market. That boundary mirrors `main::LivePair`'s own doc.
+//! SCOPE: WEATHER + ECON are 1:1 (one pmus slug ↔ one Kalshi ticker) and SPORTS is 2-outcome (a pmus
+//! game ↔ TWO single-team Kalshi tickers). All three are emitted as subscribable [`Pair`]s; sports
+//! carries `kalshi_b = Some(team-B ticker)` so the live loop can read both Kalshi books and run the
+//! 2-outcome `game_signal`. A live league with no Kalshi match is still COUNTED for the coverage audit
+//! (so a new/unmapped league is never silently missed — L7).
 
 use crate::matcher::{self, Ineq};
 use crate::types::Cat;
@@ -32,15 +33,17 @@ const MON: [&str; 12] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG",
 /// One Kalshi weather bucket as `match_weather` consumes it: `(ticker, floor_strike, cap_strike)`.
 type KBucket = (String, Option<i64>, Option<i64>);
 
-/// A co-listed pair the live loop can subscribe + price (1:1 binary: weather/econ). Maps 1:1 onto
-/// `main::LivePair`. (Sports' two-ticker shape is out of the 1:1 loop's scope — see module docs.)
+/// A co-listed pair the live loop can subscribe + price. Weather/econ are 1:1 (one pmus slug <-> one
+/// Kalshi ticker, `kalshi_b = None`). SPORTS is 2-outcome: `kalshi` = team-A ticker (the team pmus lists
+/// as YES), `kalshi_b = Some(team-B ticker)` — both are subscribed and the game signal needs both.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pair {
     pub slug: String,        // pmus market slug (the WS subscribe key + book key)
-    pub kalshi: String,      // the settlement-identical Kalshi ticker (1:1)
+    pub kalshi: String,      // the settlement-identical Kalshi ticker (team-A ticker for sports)
+    pub kalshi_b: Option<String>, // SPORTS only: the team-B (away) Kalshi ticker; None for weather/econ
     pub cat: Cat,
-    pub cluster: String,     // correlated-exposure key (city-date / family-period)
-    pub settle_clean: bool,  // weather=true (empirically verified); econ=false (recon open) — from matcher
+    pub cluster: String,     // correlated-exposure key (city-date / family-period / game)
+    pub settle_clean: bool,  // weather=true (empirically verified); econ/sports=false (recon open)
     pub days_to_event: Option<f64>,
 }
 
@@ -51,7 +54,7 @@ pub struct Discovery {
     pub pairs: Vec<Pair>,
     pub weather_pairs: usize,
     pub econ_pairs: usize,
-    pub sports_pairs: usize,                 // matched but NOT subscribed (two-ticker; out of 1:1 scope)
+    pub sports_pairs: usize,                 // matched + emitted as 2-ticker subscribable Pairs (team A + B)
     pub weather_cities_unmapped: Vec<String>, // pmus lists these climate cities, WX map doesn't -> MISSED
     pub sports_leagues_unmapped: Vec<String>,
     pub weather_buckets_misaligned: usize,    // pmus weather buckets with no identical-bounds Kalshi twin
@@ -347,6 +350,98 @@ fn parse_release_period(s: &str) -> Option<String> {
     Some(format!("{:02}{}", data_year % 100, MON[dmon - 1]))
 }
 
+/// `YYYY-MM-DD` -> days since the Unix epoch (1970-01-01), via Howard Hinnant's `days_from_civil`
+/// (dep-free, no chrono). Used only for the sports `days_to_event = slug_date - today`. Returns `None`
+/// on a malformed date.
+fn ymd_to_epoch_days(ymd: &str) -> Option<i64> {
+    let p: Vec<&str> = ymd.split('-').collect();
+    if p.len() != 3 {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (p[0].parse().ok()?, p[1].parse().ok()?, p[2].parse().ok()?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // days_from_civil: y' = y - (m <= 2); era/year-of-era/day-of-year algebra (proleptic Gregorian).
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    Some(era * 146097 + doe - 719468)
+}
+
+/// Bind a pmus game (abbrevs A, B) to ONE Kalshi event's `{abbrev: ticker}` set, returning the two
+/// DISTINCT tickers `(ticker_a, ticker_b)`. FAITHFUL port of `colisted_map.py::pick_game` (lines
+/// 139-158): the slug ET date == the Kalshi ticker date, so an EXACT-date match is correct and kills the
+/// adjacent-series wrong-game mispair. The ±1-day window is the fallback ONLY when the slug carried no
+/// date (`slug_dated=false`) AND the match is GLOBALLY UNIQUE. `used` (shared across one league's pass)
+/// marks each bound Kalshi event by index so two same-day same-team games don't both bind the first event
+/// (the DOUBLEHEADER guard). `kbydate` maps a date -> the league's `[{abbrev: ticker}]` event dicts.
+fn pick_game(
+    kbydate: &std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>>,
+    ka: &str,
+    kb: &str,
+    date: &str,
+    slug_dated: bool,
+    used: &mut std::collections::HashSet<(String, usize)>,
+) -> Option<(String, String)> {
+    // exact-date arm: first un-used event on `date` whose two abbrevs resolve to two DISTINCT tickers.
+    if let Some(events) = kbydate.get(date) {
+        for (i, ev) in events.iter().enumerate() {
+            if used.contains(&(date.to_string(), i)) {
+                continue;
+            }
+            if let Some(pair) = resolve_two(ev, ka, kb) {
+                used.insert((date.to_string(), i));
+                return Some(pair);
+            }
+        }
+    }
+    // ±1-day fallback: ONLY when the slug was undated AND the match is GLOBALLY UNIQUE across all dates.
+    if !slug_dated {
+        let mut hits: Vec<(String, usize, (String, String))> = Vec::new();
+        for (kdate, events) in kbydate {
+            if !kdate.is_empty() && dnear(kdate, date) {
+                for (i, ev) in events.iter().enumerate() {
+                    if used.contains(&(kdate.clone(), i)) {
+                        continue;
+                    }
+                    if let Some(pair) = resolve_two(ev, ka, kb) {
+                        hits.push((kdate.clone(), i, pair));
+                    }
+                }
+            }
+        }
+        if hits.len() == 1 {
+            let (kdate, i, pair) = hits.into_iter().next().unwrap();
+            used.insert((kdate, i));
+            return Some(pair);
+        }
+    }
+    None
+}
+
+/// In one Kalshi event's `{abbrev: ticker}` dict, resolve A and B to two DISTINCT tickers (the
+/// no-false-positive invariant). Port of `_match_game`'s abbrev arm.
+fn resolve_two(ev: &std::collections::HashMap<String, String>, ka: &str, kb: &str) -> Option<(String, String)> {
+    let ta = ev.get(ka)?;
+    let tb = ev.get(kb)?;
+    if ta != tb {
+        Some((ta.clone(), tb.clone()))
+    } else {
+        None
+    }
+}
+
+/// `|a - b| <= 1 day` on `YYYY-MM-DD` dates (port of `dnear`); a parse failure falls back to `a == b`.
+fn dnear(a: &str, b: &str) -> bool {
+    match (ymd_to_epoch_days(a), ymd_to_epoch_days(b)) {
+        (Some(x), Some(y)) => (x - y).abs() <= 1,
+        _ => a == b,
+    }
+}
+
 // ============================================================================================
 // ASSEMBLE  (pure: already-fetched catalogs -> Discovery, reusing matcher.rs joins)
 // ============================================================================================
@@ -354,10 +449,13 @@ fn parse_release_period(s: &str) -> Option<String> {
 /// Build the `Discovery` from already-fetched catalog JSON: the pmus `closed=false` market list, and a
 /// closure that returns a Kalshi series' markets (so the offline test can stub it; the live `discover`
 /// hands it the real per-series pulls). `truncated` flags a pmus catalog that hit the page cap.
+/// `today_epoch_days` is today's date as days-since-epoch (the live `discover` computes it from the
+/// system clock; `None` -> sports `days_to_event` is `None`, so the event-proximity gate stays dormant).
 ///
-/// Reuses [`matcher`] for every join (no identity logic re-implemented here). WEATHER + ECON become
-/// subscribable `Pair`s; SPORTS is matched-and-counted only (1:1 loop scope — see module docs).
-pub fn assemble<F>(pm_markets: &[Value], truncated: bool, mut kalshi_series: F) -> Discovery
+/// Reuses [`matcher`] for every join (no identity logic re-implemented here). WEATHER + ECON become 1:1
+/// `Pair`s; SPORTS becomes a 2-ticker `Pair` (team A + B) via `pick_game` (exact-date binding + a
+/// doubleheader `used`-set; ±1-day fallback only when the slug is undated AND globally unique).
+pub fn assemble<F>(pm_markets: &[Value], truncated: bool, today_epoch_days: Option<i64>, mut kalshi_series: F) -> Discovery
 where
     F: FnMut(&str) -> Vec<Value>,
 {
@@ -389,6 +487,7 @@ where
                     d.pairs.push(Pair {
                         slug,
                         kalshi: m.kalshi,
+                        kalshi_b: None, // weather is 1:1
                         cat: Cat::Weather,
                         cluster: m.cluster,
                         settle_clean: m.settle_clean,
@@ -435,6 +534,7 @@ where
                     d.pairs.push(Pair {
                         slug,
                         kalshi: m.kalshi,
+                        kalshi_b: None, // econ is 1:1
                         cat: Cat::Econ,
                         cluster: m.cluster,
                         settle_clean: m.settle_clean,
@@ -447,10 +547,12 @@ where
         }
     }
 
-    // ---- SPORTS (abbrev leagues): matched + COUNTED only (two-ticker; not a 1:1 subscribable Pair).
+    // ---- SPORTS (abbrev leagues): emitted as 2-ticker subscribable Pairs via pick_game (exact-date
+    //      binding + doubleheader used-set; ±1-day fallback only when the slug is undated AND globally
+    //      unique). pmus YES = team A; Kalshi-A is the same team (`kalshi`), Kalshi-B is `kalshi_b`.
     let sports_m: Vec<&Value> = pm_markets
         .iter()
-        .filter(|m| field_str(m, "category") == Some("sports".into()) && field_str(m, "marketType") == Some("moneyline".into()))
+        .filter(|m| field_str(m, "category") == Some("sports".into()) && field_str(m, "marketType") == Some("moneyline".into()) && m.get("gameStartTime").is_some())
         .collect();
     let pm_leagues: std::collections::BTreeSet<String> = sports_m.iter().filter_map(|m| field_str(m, "slug").and_then(|s| pm_league(&s))).collect();
     for (league, kser) in LEAGUES_ABBREV {
@@ -459,28 +561,49 @@ where
             continue;
         }
         let kmarkets = kalshi_series(kser);
-        // per Kalshi event_ticker: [(abbrev, ticker)] + the event date.
-        let mut by_event: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+        // group Kalshi markets by EVENT -> {abbrev: ticker}, recording each event's date (from the ticker);
+        // then bucket events by date for pick_game's exact-date binding (colisted_map.py kbydate).
+        let mut by_event: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+        let mut event_date: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for m in &kmarkets {
             let Some(tk) = field_str(m, "ticker") else { continue };
             let Some(ev) = field_str(m, "event_ticker") else { continue };
+            event_date.entry(ev.clone()).or_insert_with(|| ktok_date(&tk).unwrap_or_default());
             let abbrev = tk.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
             if !abbrev.is_empty() {
-                by_event.entry(ev).or_default().push((abbrev, tk));
+                by_event.entry(ev).or_default().insert(abbrev, tk);
             }
         }
+        let mut kbydate: std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>> = std::collections::HashMap::new();
+        for (ev, dict) in by_event {
+            let date = event_date.get(&ev).cloned().unwrap_or_default();
+            kbydate.entry(date).or_default().push(dict);
+        }
+        // one used-set per league-pass: a bound Kalshi event can't bind a second pm game (doubleheaders).
+        let mut used: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
         for pm in group {
             let Some(slug) = field_str(pm, "slug") else { continue };
             let Some((a, b)) = sports_abbrevs(pm) else { continue };
-            let date = iso_date(&slug).unwrap_or_default();
-            // try every Kalshi event for this league (exact-date binding is the python refinement; the
-            // matcher already refuses unless BOTH teams resolve to two DISTINCT tickers — L1).
-            let matched = by_event.values().any(|ev| {
-                matcher::match_sports_abbrev(&a, &b, league, &date, ev, None).is_some()
+            // pm slug ET date == Kalshi ticker date (exact join); undated slug -> the ±1 fallback path.
+            let slug_date = iso_date(&slug);
+            let slug_dated = slug_date.is_some();
+            let date = slug_date.unwrap_or_default();
+            let Some((ta, tb)) = pick_game(&kbydate, &a, &b, &date, slug_dated, &mut used) else { continue };
+            // days_to_event = slug_date - today (in days); None when either date is unknown -> gate dormant.
+            let days_to_event = match (today_epoch_days, ymd_to_epoch_days(&date)) {
+                (Some(today), Some(game)) => Some((game - today) as f64),
+                _ => None,
+            };
+            d.pairs.push(Pair {
+                slug,
+                kalshi: ta,
+                kalshi_b: Some(tb),
+                cat: Cat::Sports,
+                cluster: format!("{league}-{date}"),
+                settle_clean: false, // only a game that COMPLETES on schedule settles identically (void tail)
+                days_to_event,
             });
-            if matched {
-                d.sports_pairs += 1;
-            }
+            d.sports_pairs += 1;
         }
     }
     d.sports_leagues_unmapped = pm_leagues.iter().filter(|l| !LEAGUES_ABBREV.iter().any(|(x, _)| *x == l.as_str())).cloned().collect();
@@ -488,17 +611,37 @@ where
     d
 }
 
-/// pmus moneyline game -> the two team abbreviations from `marketSides[].team.abbreviation`.
+/// pmus moneyline game -> the two team abbreviations `(A, B)` from `marketSides[].team.abbreviation`,
+/// where A is the LONG-named side (the side with a truthy `long` field) and B is the other — matching
+/// colisted_map.py's `lo = next((s for s in sides if s.get("long")), sides[0]); ot = the other`. The A/B
+/// ORDER decides which Kalshi ticker is `kalshi` vs `kalshi_b`, so it must follow the Python exactly
+/// (pmus YES = team A; Kalshi-A must be the same team). Only sides whose `team.name` is present count
+/// (the Python's `(s.get("team") or {}).get("name")` filter).
 fn sports_abbrevs(m: &Value) -> Option<(String, String)> {
-    let sides = m.get("marketSides")?.as_array()?;
-    let abbrevs: Vec<String> = sides
+    let sides: Vec<&Value> = m
+        .get("marketSides")?
+        .as_array()?
         .iter()
-        .filter_map(|s| s.get("team").and_then(|t| t.get("abbreviation")).and_then(Value::as_str).map(|x| x.to_ascii_lowercase()))
+        .filter(|s| s.get("team").and_then(|t| t.get("name")).and_then(Value::as_str).is_some())
         .collect();
-    if abbrevs.len() >= 2 {
-        Some((abbrevs[0].clone(), abbrevs[1].clone()))
-    } else {
-        None
+    if sides.len() < 2 {
+        return None;
+    }
+    // long-named side first (truthy `long`), else the first side; the other is whichever is not it.
+    let lo_idx = sides.iter().position(|s| is_truthy(s.get("long"))).unwrap_or(0);
+    let ot_idx = (0..sides.len()).find(|&i| i != lo_idx)?;
+    let abbrev = |s: &Value| s.get("team").and_then(|t| t.get("abbreviation")).and_then(Value::as_str).map(|x| x.to_ascii_lowercase());
+    Some((abbrev(sides[lo_idx])?, abbrev(sides[ot_idx])?))
+}
+
+/// Python truthiness of a JSON value for the `s.get("long")` test: present + not null/false/empty/0.
+fn is_truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Some(_) => true,
     }
 }
 
@@ -538,7 +681,12 @@ pub async fn discover(http: &reqwest::Client) -> Result<Discovery, String> {
         let markets = pull_kalshi_series(http, kser).await?;
         series_cache.insert(kser.to_string(), markets);
     }
-    Ok(assemble(&pm_markets, truncated, |kser| series_cache.get(kser).cloned().unwrap_or_default()))
+    // today as days-since-epoch (UTC), dep-free: system seconds / 86400. Feeds sports days_to_event.
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| (d.as_secs() / 86_400) as i64);
+    Ok(assemble(&pm_markets, truncated, today, |kser| series_cache.get(kser).cloned().unwrap_or_default()))
 }
 
 /// Paginate the pmus `closed=false` catalog by `offset` (page < limit = last; the page cap guards a
@@ -675,11 +823,13 @@ mod tests {
             pm("cpic-uscpi-may2026yoy-2026-06-10-3pt8pct", "macro", ""),
             // ECON: U-3 <=4.0 (opposite orientation -> skipped).
             pm("urc-us-seasonadj-lte-june-2026-07-02-lte4pt0pct", "macro", ""),
-            // SPORTS: an MLB moneyline with two team sides (matched + counted, not subscribed).
+            // SPORTS: an MLB moneyline with two team sides. PIT is listed FIRST but LAD carries `long`
+            // (the long-named side), so pick_game's A = LAD, B = PIT -> kalshi = LAD ticker, kalshi_b = PIT.
+            // This proves the long-team-first ordering (not array order) decides A/B, matching the Python.
             pm(
                 "aec-mlb-lad-pit-2026-06-16",
                 "sports",
-                r#""marketType":"moneyline","gameStartTime":"2026-06-16T20:00:00Z","marketSides":[{"team":{"abbreviation":"LAD"}},{"team":{"abbreviation":"PIT"}}]"#,
+                r#""marketType":"moneyline","gameStartTime":"2026-06-16T20:00:00Z","marketSides":[{"long":false,"team":{"name":"Pittsburgh Pirates","abbreviation":"PIT"}},{"long":true,"team":{"name":"Los Angeles Dodgers","abbreviation":"LAD"}}]"#,
             ),
         ]
     }
@@ -711,7 +861,9 @@ mod tests {
 
     #[test]
     fn assemble_joins_the_right_pairs_and_no_false_joins() {
-        let d = assemble(&sample_pm_catalog(), false, kalshi_stub);
+        // today = 2026-06-11 in epoch-days; the MLB game is 2026-06-16 -> days_to_event = 5.
+        let today = ymd_to_epoch_days("2026-06-11");
+        let d = assemble(&sample_pm_catalog(), false, today, kalshi_stub);
 
         // WEATHER: gte64lt65f -> B64, gte72f -> T72. gte80lt81f has no twin -> misaligned.
         let wx: Vec<&Pair> = d.pairs.iter().filter(|p| p.cat == Cat::Weather).collect();
@@ -732,9 +884,16 @@ mod tests {
         assert_eq!(econ[0].cluster, "u3-26JUN");
         assert_eq!(d.econ_skipped, 2); // the == point bucket + the <= tail are both skipped
 
-        // SPORTS: the MLB game is matched + COUNTED, but never emitted as a subscribable Pair (1:1 loop).
+        // SPORTS: the MLB game is now emitted as a 2-ticker Pair (team A = LAD, team B = PIT). pmus lists
+        // LAD as the long-named side -> kalshi = LAD ticker, kalshi_b = PIT ticker; days_to_event = 5.
         assert_eq!(d.sports_pairs, 1);
-        assert!(d.pairs.iter().all(|p| p.cat != Cat::Sports), "sports is counted, not a 1:1 Pair");
+        let sp: Vec<&Pair> = d.pairs.iter().filter(|p| p.cat == Cat::Sports).collect();
+        assert_eq!(sp.len(), 1, "sports is emitted as a subscribable 2-ticker Pair");
+        assert_eq!(sp[0].kalshi, "KXMLBGAME-26JUN16-LAD");
+        assert_eq!(sp[0].kalshi_b.as_deref(), Some("KXMLBGAME-26JUN16-PIT"));
+        assert_eq!(sp[0].cluster, "mlb-2026-06-16");
+        assert!(!sp[0].settle_clean); // void tail -> never marked clean
+        assert_eq!(sp[0].days_to_event, Some(5.0)); // 2026-06-16 minus 2026-06-11
 
         // COVERAGE: philadelphia is the unmapped climate city.
         assert_eq!(d.weather_cities_unmapped, vec!["phl".to_string()]);
@@ -757,10 +916,87 @@ mod tests {
             }
         }
         let cat = vec![pm("gdpc-us-saa-q2-2026-07-30-atl2pt0", "macro", "")];
-        let d = assemble(&cat, false, stub);
+        let d = assemble(&cat, false, None, stub);
         assert_eq!(d.econ_pairs, 1, "GDP must join on the full-date period");
         assert_eq!(d.pairs[0].kalshi, "KXGDP-26JUL30-T1.9");
         assert_eq!(d.pairs[0].cluster, "gdp-26JUL30");
+    }
+
+    // ---- SPORTS pick_game: exact-date binding + doubleheader used-set + ±1 fallback -------------------
+    fn ev(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs.iter().map(|(a, t)| (a.to_string(), t.to_string())).collect()
+    }
+
+    /// Exact-date binding: a pm game binds the Kalshi event on its OWN date, never an adjacent-date event
+    /// for the same teams (the adjacent-series wrong-game mispair pick_game exists to kill).
+    #[test]
+    fn pick_game_binds_exact_date_not_adjacent() {
+        let mut kbydate = std::collections::HashMap::new();
+        kbydate.insert("2026-06-16".to_string(), vec![ev(&[("lad", "K-LAD-16"), ("pit", "K-PIT-16")])]);
+        kbydate.insert("2026-06-17".to_string(), vec![ev(&[("lad", "K-LAD-17"), ("pit", "K-PIT-17")])]);
+        let mut used = std::collections::HashSet::new();
+        // dated slug on the 16th binds the 16th event, NOT the 17th.
+        assert_eq!(pick_game(&kbydate, "lad", "pit", "2026-06-16", true, &mut used), Some(("K-LAD-16".into(), "K-PIT-16".into())));
+        // a dated slug whose date has no event does NOT fall back (slug_dated=true) even though ±1 exists.
+        let mut used2 = std::collections::HashSet::new();
+        assert_eq!(pick_game(&kbydate, "lad", "pit", "2026-06-18", true, &mut used2), None);
+    }
+
+    /// DOUBLEHEADER guard: two same-day same-team pm games must bind TWO DISTINCT Kalshi events, not both
+    /// the first. The shared `used` set makes the second pick skip the already-bound event.
+    #[test]
+    fn pick_game_doubleheader_used_set_binds_distinct_events() {
+        let mut kbydate = std::collections::HashMap::new();
+        kbydate.insert(
+            "2026-06-16".to_string(),
+            vec![ev(&[("lad", "K-LAD-G1"), ("pit", "K-PIT-G1")]), ev(&[("lad", "K-LAD-G2"), ("pit", "K-PIT-G2")])],
+        );
+        let mut used = std::collections::HashSet::new();
+        let g1 = pick_game(&kbydate, "lad", "pit", "2026-06-16", true, &mut used).unwrap();
+        let g2 = pick_game(&kbydate, "lad", "pit", "2026-06-16", true, &mut used).unwrap();
+        assert_ne!(g1, g2, "two games on the same day must bind DIFFERENT Kalshi events (no double-bind)");
+        assert_eq!(g1, ("K-LAD-G1".into(), "K-PIT-G1".into()));
+        assert_eq!(g2, ("K-LAD-G2".into(), "K-PIT-G2".into()));
+        // a third pm game finds no remaining event -> None (not a re-bind of an already-used event).
+        assert_eq!(pick_game(&kbydate, "lad", "pit", "2026-06-16", true, &mut used), None);
+    }
+
+    /// ±1-day fallback fires ONLY when the slug is undated AND the match is globally unique. The fallback
+    /// is reached only when the EXACT date has no event (the exact arm runs first, unconditionally — the
+    /// Python order); an ambiguous (>1 candidate) undated match then refuses rather than guess.
+    #[test]
+    fn pick_game_undated_fallback_only_when_unique() {
+        // exact date "2026-06-15" has NO event; the only candidate is the adjacent 16th -> fallback binds.
+        let mut kbydate = std::collections::HashMap::new();
+        kbydate.insert("2026-06-16".to_string(), vec![ev(&[("lad", "K-LAD-16"), ("pit", "K-PIT-16")])]);
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(pick_game(&kbydate, "lad", "pit", "2026-06-15", false, &mut used), Some(("K-LAD-16".into(), "K-PIT-16".into())));
+        // exact date "2026-06-17" has NO event but TWO same-team candidates within ±1 (16th + 18th) ->
+        // ambiguous -> refuse (the exact arm finds nothing, so the fallback's uniqueness check governs).
+        let mut amb = std::collections::HashMap::new();
+        amb.insert("2026-06-16".to_string(), vec![ev(&[("lad", "K-LAD-16"), ("pit", "K-PIT-16")])]);
+        amb.insert("2026-06-18".to_string(), vec![ev(&[("lad", "K-LAD-18"), ("pit", "K-PIT-18")])]);
+        let mut used2 = std::collections::HashSet::new();
+        assert_eq!(pick_game(&amb, "lad", "pit", "2026-06-17", false, &mut used2), None, "ambiguous ±1 match must refuse");
+        // a DATED slug never falls back even with a unique ±1 neighbour (slug_dated=true short-circuits).
+        let mut used3 = std::collections::HashSet::new();
+        assert_eq!(pick_game(&kbydate, "lad", "pit", "2026-06-15", true, &mut used3), None);
+    }
+
+    /// The civil-days epoch conversion (dep-free) against known anchors + a date arithmetic round-trip.
+    #[test]
+    fn ymd_epoch_days_known_anchors() {
+        assert_eq!(ymd_to_epoch_days("1970-01-01"), Some(0));
+        assert_eq!(ymd_to_epoch_days("1970-01-02"), Some(1));
+        assert_eq!(ymd_to_epoch_days("2000-01-01"), Some(10957)); // 30y incl. leap days
+        // a 5-day forward difference (the assemble test's days_to_event).
+        let a = ymd_to_epoch_days("2026-06-11").unwrap();
+        let b = ymd_to_epoch_days("2026-06-16").unwrap();
+        assert_eq!(b - a, 5);
+        // across a month boundary, and a leap-day.
+        assert_eq!(ymd_to_epoch_days("2026-03-01").unwrap() - ymd_to_epoch_days("2026-02-28").unwrap(), 1);
+        assert_eq!(ymd_to_epoch_days("2024-03-01").unwrap() - ymd_to_epoch_days("2024-02-28").unwrap(), 2); // 2024 leap
+        assert_eq!(ymd_to_epoch_days("bad-date"), None);
     }
 
     /// A no-twin econ market (>=T whose T-step floor isn't listed) is skipped, not falsely paired.
@@ -775,7 +1011,7 @@ mod tests {
             }
         }
         let cat = vec![pm("urc-us-seasonadj-gte-june-2026-07-02-atl4pt4", "macro", "")];
-        let d = assemble(&cat, false, stub);
+        let d = assemble(&cat, false, None, stub);
         assert_eq!(d.econ_pairs, 0);
         assert_eq!(d.econ_skipped, 1);
     }

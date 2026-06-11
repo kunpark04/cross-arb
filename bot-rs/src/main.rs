@@ -97,27 +97,41 @@ fn banner(cfg: &Config) {
     println!();
 }
 
-/// A co-listed pair the live loop tracks: the pmus slug + its settlement-identical Kalshi twin (1:1).
-/// Filled by `discovery` (the colisted_map.py port). Sports' two-ticker shape is out of this 1:1 loop's
-/// scope — discovery counts it but does not emit it here (see `discovery` module docs).
+/// A co-listed pair the live loop tracks. Weather/econ are 1:1 (`kalshi_b = None`). SPORTS is 2-outcome:
+/// `kalshi` = team-A ticker (the team pmus lists as YES), `kalshi_b = Some(team-B ticker)` — BOTH Kalshi
+/// books are subscribed and the 2-outcome `game_signal` needs both. Filled by `discovery`.
 #[derive(Clone, Debug)]
 struct LivePair {
     slug: String,         // pmus market slug
-    kalshi: String,       // Kalshi ticker (the 1:1 twin)
+    kalshi: String,       // Kalshi ticker (team-A ticker for sports)
+    kalshi_b: Option<String>, // SPORTS: team-B (away) Kalshi ticker; None for weather/econ
     cat: Cat,
     cluster: String,
     settle_clean: bool,
     days_to_event: Option<f64>,
 }
 
+impl LivePair {
+    /// Every Kalshi ticker this pair subscribes (team-A always; team-B for sports). Drives `by_ticker`
+    /// registration, `k_tracked`, and book freeing on prune — so a sports pair tracks BOTH books.
+    fn kalshi_tickers(&self) -> Vec<String> {
+        let mut v = vec![self.kalshi.clone()];
+        if let Some(b) = &self.kalshi_b {
+            v.push(b.clone());
+        }
+        v
+    }
+}
+
 impl From<discovery::Pair> for LivePair {
     fn from(p: discovery::Pair) -> Self {
-        LivePair { slug: p.slug, kalshi: p.kalshi, cat: p.cat, cluster: p.cluster, settle_clean: p.settle_clean, days_to_event: p.days_to_event }
+        LivePair { slug: p.slug, kalshi: p.kalshi, kalshi_b: p.kalshi_b, cat: p.cat, cluster: p.cluster, settle_clean: p.settle_clean, days_to_event: p.days_to_event }
     }
 }
 
 /// Shared, mutable pair state the event loop READS and the refresh task MUTATES (add new pairs / drop
-/// settled). `by_slug` is the authoritative pair record; `by_ticker` indexes the Kalshi side.
+/// settled). `by_slug` is the authoritative pair record; `by_ticker` indexes EVERY Kalshi ticker (both
+/// teams for a sports pair) back to the pmus slug, so a frame on either Kalshi book finds its pair.
 #[derive(Default)]
 struct PairState {
     by_slug: std::collections::HashMap<String, LivePair>,
@@ -126,12 +140,16 @@ struct PairState {
 
 impl PairState {
     fn insert(&mut self, p: LivePair) {
-        self.by_ticker.insert(p.kalshi.clone(), p.slug.clone());
+        for tk in p.kalshi_tickers() {
+            self.by_ticker.insert(tk, p.slug.clone());
+        }
         self.by_slug.insert(p.slug.clone(), p);
     }
     fn remove(&mut self, slug: &str) {
         if let Some(p) = self.by_slug.remove(slug) {
-            self.by_ticker.remove(&p.kalshi);
+            for tk in p.kalshi_tickers() {
+                self.by_ticker.remove(&tk);
+            }
         }
     }
 }
@@ -172,9 +190,12 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         let mut kt = k_tracked.lock().unwrap();
         let mut pt = pm_tracked.lock().unwrap();
         for p in initial {
-            kt.insert(p.kalshi.clone());
-            pt.insert(p.slug.clone());
-            ps.insert(LivePair::from(p));
+            let lp = LivePair::from(p);
+            for tk in lp.kalshi_tickers() {
+                kt.insert(tk); // sports registers BOTH team tickers
+            }
+            pt.insert(lp.slug.clone());
+            ps.insert(lp);
         }
     }
 
@@ -250,19 +271,31 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         // build the COMPLETE dual-venue Quote (L5: classify on both venues' current state, not one frame).
         // Each touch carries its book's REAL staleness `age` (seconds since its last applied frame), so a
         // wedged stream ages its leg out and `risk::evaluate` fires `Reject::StaleBook` (L13). The gate
-        // checks BOTH legs, so the worse (older) leg governs the pair's staleness.
+        // checks ALL legs (sports reads THREE books), so the worse (older) leg governs staleness.
         let pm = match pmus_books.get(&slug) {
             Some(b) => b.touch(),
             None => continue, // no pmus book yet -> incomplete, wait
         };
-        let (k, depth_dir, edge) = {
+        // SPORTS (kalshi_b.is_some()) is 2-outcome: read pmus + Kalshi-A + Kalshi-B (ALL required) and use
+        // the game signal/depth. Weather/econ is 1:1: pmus + the single Kalshi book + the binary signal.
+        let (k, k_b, depth_dir, edge) = {
             let kb = kalshi_books.lock().unwrap();
-            let Some(kbook) = kb.get(&pair.kalshi) else { continue }; // no Kalshi book yet -> incomplete
-            let k = kbook.touch();
+            let Some(ka_book) = kb.get(&pair.kalshi) else { continue }; // no Kalshi-A book yet -> incomplete
+            let k = ka_book.touch();
             let pmb = pmus_books.get(&slug).unwrap();
-            let sig = signal::signal(&pm, &k);
-            let depth = book::depth_at_edge(kbook, pmb, sig.edge.dir);
-            (k, depth, sig.edge)
+            match &pair.kalshi_b {
+                Some(tb) => {
+                    let Some(kb_book) = kb.get(tb) else { continue }; // no Kalshi-B book yet -> incomplete
+                    let sig = signal::game_signal(pm.yes_bid, pm.yes_ask, k.yes_ask, kb_book.touch().yes_ask);
+                    let depth = book::game_depth_at_edge(pmb, ka_book, kb_book, sig.edge.dir);
+                    (k, Some(kb_book.touch()), depth, sig.edge)
+                }
+                None => {
+                    let sig = signal::signal(&pm, &k);
+                    let depth = book::depth_at_edge(ka_book, pmb, sig.edge.dir);
+                    (k, None, depth, sig.edge)
+                }
+            }
         };
 
         // led_by: which venue's mid MOVED to open/realign this edge, vs the prior snapshot (H1 input).
@@ -273,6 +306,7 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
             cat: pair.cat,
             pm,
             k,
+            k_b,
             depth: depth_dir,
             settle_clean: pair.settle_clean,
             cluster: pair.cluster.clone(),
@@ -282,13 +316,11 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
 
         match evaluate(cfg, &quote, &edge, &exposure, affordable(cfg, &edge)) {
             Ok(a) => {
-                // Per-leg LIMIT prices from the books — NOT derived from the pair edge. The YES leg pays
-                // the CHEAP venue's YES ask; the NO leg pays the DEAR venue's NO ask (= 1 - its YES bid).
-                // (A prior version used (1-edge) as the YES price, which set the NO limit to ~edge cents —
-                // far below the real NO ask, so the NO leg would never fill and the hedge would leg out.)
-                let (yes_ask, no_ask) = leg_prices(&quote, edge.dir);
-                let (Some(yc), Some(nc)) = (cents(yes_ask), cents(no_ask)) else { continue };
-                fire_pair(backend, &quote, &edge, a.size, yc, nc);
+                // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
+                // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
+                // one-sided book) yields no legs -> skip rather than fire a naked leg.
+                let Some(legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
+                let _ = backend.submit_pair(&legs[0], &legs[1]);
             }
             Err(_r) => {} // rejected by a gate — silent in the live loop; transitions/metrics are stage-2
         }
@@ -311,6 +343,16 @@ fn report_coverage(d: &discovery::Discovery) {
     if d.truncated {
         println!("[coverage] WARNING pmus catalog hit the page cap — coverage INCOMPLETE");
     }
+}
+
+/// Every Kalshi ticker a freshly-discovered pair subscribes (team-A always; team-B for sports). Mirrors
+/// `LivePair::kalshi_tickers` for the pre-`LivePair` `discovery::Pair` the refresh task iterates.
+fn pair_tickers(p: &discovery::Pair) -> Vec<String> {
+    let mut v = vec![p.kalshi.clone()];
+    if let Some(b) = &p.kalshi_b {
+        v.push(b.clone());
+    }
+    v
 }
 
 /// Set-diff the CURRENT subscribed keys against a FRESH discovery's keys -> the in-place `SubUpdate`
@@ -374,23 +416,24 @@ async fn refresh_loop(
         };
         report_coverage(&fresh);
 
-        // fresh keys by venue.
+        // fresh keys by venue. A sports pair contributes BOTH Kalshi tickers (team A + B).
         let fresh_slugs: HashSet<String> = fresh.pairs.iter().map(|p| p.slug.clone()).collect();
-        let fresh_tickers: HashSet<String> = fresh.pairs.iter().map(|p| p.kalshi.clone()).collect();
+        let fresh_tickers: HashSet<String> = fresh.pairs.iter().flat_map(pair_tickers).collect();
 
-        // snapshot the PRE-refresh subscribed set (slugs + each pair's Kalshi ticker) before mutating.
-        let (pre_slugs, slug_to_ticker): (HashSet<String>, HashMap<String, String>) = {
+        // snapshot the PRE-refresh subscribed set (slugs + each pair's Kalshi ticker(s)) before mutating.
+        let (pre_slugs, slug_to_tickers): (HashSet<String>, HashMap<String, Vec<String>>) = {
             let ps = pairs.lock().unwrap();
             (
                 ps.by_slug.keys().cloned().collect(),
-                ps.by_slug.iter().map(|(s, p)| (s.clone(), p.kalshi.clone())).collect(),
+                ps.by_slug.iter().map(|(s, p)| (s.clone(), p.kalshi_tickers())).collect(),
             )
         };
-        let pre_tickers: HashSet<String> = slug_to_ticker.values().cloned().collect();
+        let pre_tickers: HashSet<String> = slug_to_tickers.values().flatten().cloned().collect();
 
-        // PRUNE debounce (keyed on the pmus slug = the pair identity); pruned slugs -> their Kalshi tickers.
+        // PRUNE debounce (keyed on the pmus slug = the pair identity); pruned slugs -> their Kalshi
+        // tickers (both teams for a sports pair).
         let prune_slugs = prune_step(&pre_slugs, &fresh_slugs, &mut absent, 2);
-        let prune_tickers: HashSet<String> = prune_slugs.iter().filter_map(|s| slug_to_ticker.get(s).cloned()).collect();
+        let prune_tickers: HashSet<String> = prune_slugs.iter().filter_map(|s| slug_to_tickers.get(s)).flatten().cloned().collect();
 
         // the in-place WIRE updates: add = fresh keys not already subscribed; del = the pruned keys. Pure
         // set-diff (the stream tolerates a re-add as a harmless no-gap merge, but we send the minimal set).
@@ -406,7 +449,9 @@ async fn refresh_loop(
             let mut pt = pm_tracked.lock().unwrap();
             for p in &fresh.pairs {
                 if !ps.by_slug.contains_key(&p.slug) {
-                    kt.insert(p.kalshi.clone());
+                    for tk in pair_tickers(p) {
+                        kt.insert(tk); // sports adds BOTH team tickers
+                    }
                     pt.insert(p.slug.clone());
                     ps.insert(LivePair::from(p.clone()));
                     added += 1;
@@ -483,17 +528,91 @@ fn led_by_from_prior(
     led
 }
 
-/// The two per-leg LIMIT prices (dollars) for the hedge in direction `dir`: the YES leg buys at the
-/// CHEAP venue's YES ask; the NO leg buys at the DEAR venue's NO ask (= 1 - that venue's YES bid). These
-/// come from the live touches, never from the pair edge (the edge is YES_ask + NO_ask, not either leg).
-fn leg_prices(q: &Quote, dir: Dir) -> (Option<f64>, Option<f64>) {
-    let (cheap, dear) = match dir {
-        Dir::PK => (&q.pm, &q.k), // YES@pmus + NO@Kalshi
-        Dir::KP => (&q.k, &q.pm), // YES@Kalshi + NO@pmus
-    };
-    let yes_ask = cheap.yes_ask;
-    let no_ask = dear.yes_bid.map(|b| (1.0 - b).clamp(0.01, 0.99));
-    (yes_ask, no_ask)
+/// A single planned leg before pricing-to-tick: the venue, the VENUE-NATIVE market id (Kalshi ticker for
+/// a Kalshi leg, pmus slug for a pmus leg — the leg-market fix), the side, and the limit price in dollars
+/// read from the BOOKS (never the pair edge). `tag` ('A'/'B') makes the two client_order_ids distinct.
+struct PlannedLeg {
+    venue: Venue,
+    market: String,
+    side: Side,
+    price: f64,
+    tag: char,
+}
+
+/// Plan both hedge legs for `dir`, with each leg's market id VENUE-NATIVE and each limit price read from
+/// the quote's BOOKS. This is the single unified builder (it replaced the old weather-only `leg_prices` +
+/// `fire_pair`, which sent the pmus SLUG as the Kalshi leg's ticker — a wrong-ticker live order).
+///   - weather/econ (1:1): PK = YES@pmus(slug) + NO@Kalshi(ticker); KP = YES@Kalshi(ticker) + NO@pmus(slug).
+///   - sports (2-outcome): PK = YES@pmus(slug) + YES@Kalshi-B(ticker_b); KP = YES@Kalshi-A(ticker_a) + NO@pmus(slug).
+///
+/// Prices (monitor.py game_edge / signal): a YES leg pays that book's YES ask; a NO@pmus leg pays
+/// `1 - pm_bid`; a NO@Kalshi leg pays `1 - k_bid`. Returns `None` if any leg lacks a book price (one-sided
+/// book) -> the caller skips rather than fire a naked leg.
+fn plan_legs(pair: &LivePair, q: &Quote, dir: Dir) -> Option<[PlannedLeg; 2]> {
+    let slug = pair.slug.clone();
+    let ka = pair.kalshi.clone();
+    let no_at = |b: &Book| b.yes_bid.map(|bid| 1.0 - bid); // NO ask = 1 - that book's YES bid
+    match (pair.kalshi_b.as_ref(), dir) {
+        // ---- SPORTS ----
+        (Some(kb_ticker), Dir::PK) => {
+            // back A@pmus (YES@pmus slug) + B@Kalshi (YES@Kalshi-B ticker).
+            let pm_ask = q.pm.yes_ask?;
+            let kb_ask = q.k_b.as_ref().and_then(|b| b.yes_ask)?;
+            Some([
+                PlannedLeg { venue: Venue::Pmus, market: slug, side: Side::Yes, price: pm_ask, tag: 'A' },
+                PlannedLeg { venue: Venue::Kalshi, market: kb_ticker.clone(), side: Side::Yes, price: kb_ask, tag: 'B' },
+            ])
+        }
+        (Some(_), Dir::KP) => {
+            // back A@Kalshi (YES@Kalshi-A ticker) + B@pmus (NO@pmus slug = 1 - pm_bid).
+            let ka_ask = q.k.yes_ask?;
+            let pm_no = no_at(&q.pm)?;
+            Some([
+                PlannedLeg { venue: Venue::Kalshi, market: ka, side: Side::Yes, price: ka_ask, tag: 'A' },
+                PlannedLeg { venue: Venue::Pmus, market: slug, side: Side::No, price: pm_no, tag: 'B' },
+            ])
+        }
+        // ---- WEATHER / ECON (1:1) ----
+        (None, Dir::PK) => {
+            // YES@pmus(slug) + NO@Kalshi(ticker = 1 - Kalshi YES bid).
+            let pm_ask = q.pm.yes_ask?;
+            let k_no = no_at(&q.k)?;
+            Some([
+                PlannedLeg { venue: Venue::Pmus, market: slug, side: Side::Yes, price: pm_ask, tag: 'A' },
+                PlannedLeg { venue: Venue::Kalshi, market: ka, side: Side::No, price: k_no, tag: 'B' },
+            ])
+        }
+        (None, Dir::KP) => {
+            // YES@Kalshi(ticker) + NO@pmus(slug = 1 - pm_bid).
+            let k_ask = q.k.yes_ask?;
+            let pm_no = no_at(&q.pm)?;
+            Some([
+                PlannedLeg { venue: Venue::Kalshi, market: ka, side: Side::Yes, price: k_ask, tag: 'A' },
+                PlannedLeg { venue: Venue::Pmus, market: slug, side: Side::No, price: pm_no, tag: 'B' },
+            ])
+        }
+    }
+}
+
+/// Plan + price-to-tick both legs into `OrderIntent`s ready to submit. `None` if any leg can't be priced
+/// (one-sided book) or rounds outside the 1..=99c venue tick range. The two legs share the pmus slug
+/// (the pair identity) in their client_order_id so retries dedupe per pair-leg.
+fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32) -> Option<[OrderIntent; 2]> {
+    let planned = plan_legs(pair, q, dir)?;
+    let mut out: Vec<OrderIntent> = Vec::with_capacity(2);
+    for leg in planned {
+        let pc = cents(Some(leg.price))?;
+        out.push(OrderIntent {
+            venue: leg.venue,
+            market: leg.market,
+            action: Action::Buy,
+            side: leg.side,
+            price_cents: pc,
+            qty: size,
+            client_order_id: format!("xarb-{}-{}", pair.slug, leg.tag),
+        });
+    }
+    Some([out.remove(0), out.remove(0)])
 }
 
 /// Dollars (0..1) -> a valid integer venue tick price in 1..=99 cents, or None if non-finite/out of range.
@@ -510,43 +629,29 @@ fn cents(price: Option<f64>) -> Option<u8> {
     }
 }
 
-/// Fire the hedged pair: buy YES on the cheap venue at `yes_price_cents` + NO on the dear venue at
-/// `no_price_cents`, as ONE pair (the backend fires both legs concurrently). Shared by smoke + live loop.
-fn fire_pair(backend: &mut dyn ExecutionBackend, q: &Quote, edge: &Edge, size: u32, yes_price_cents: u8, no_price_cents: u8) {
-    let (yes_venue, no_venue) = match edge.dir {
-        Dir::PK => (Venue::Pmus, Venue::Kalshi),
-        Dir::KP => (Venue::Kalshi, Venue::Pmus),
-    };
-    let leg_yes = OrderIntent {
-        venue: yes_venue,
-        market: q.market.clone(),
-        action: Action::Buy,
-        side: Side::Yes,
-        price_cents: yes_price_cents,
-        qty: size,
-        client_order_id: format!("xarb-{}-Y", q.market),
-    };
-    let leg_no = OrderIntent {
-        venue: no_venue,
-        market: q.market.clone(),
-        action: Action::Buy,
-        side: Side::No,
-        price_cents: no_price_cents,
-        qty: size,
-        client_order_id: format!("xarb-{}-N", q.market),
-    };
-    let _ = backend.submit_pair(&leg_yes, &leg_no);
+/// Fire the hedged pair from an already-built pair of legs (the backend fires both concurrently). Thin
+/// wrapper kept for the smoke path; the live loop calls `submit_pair` directly off `build_legs`.
+fn fire_legs(backend: &mut dyn ExecutionBackend, legs: &[OrderIntent; 2]) {
+    let _ = backend.submit_pair(&legs[0], &legs[1]);
 }
 
-/// Stage-1 smoke: prove the risk+exec spine behaves on two real-shaped snapshots.
+/// Stage-1 smoke: prove the risk+exec spine behaves on real-shaped snapshots (weather/econ/sports).
 fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
+    // a 1:1 LivePair (weather/econ) builder for the smoke (kalshi_b = None).
+    let lp = |slug: &str, kalshi: &str, cat: Cat, cluster: &str| LivePair {
+        slug: slug.into(), kalshi: kalshi.into(), kalshi_b: None, cat, cluster: cluster.into(),
+        settle_clean: false, days_to_event: None,
+    };
+
     // (1) the live U-3 >=4.2 gap (pmus YES 0.75 / Kalshi YES 0.86) — but ECON, settlement NOT yet
     //     empirically verified (the cumulative-twin recon is 2026-07-02), so the gate MUST refuse it.
+    let econ_pair = lp("urc-us-seasonadj-gte-june-2026-07-02-atl4pt2", "KXU3-26JUN-T4.1", Cat::Econ, "u3-2026-07-02");
     let econ = Quote {
-        market: "urc-us-seasonadj-gte-june-2026-07-02-atl4pt2".into(),
+        market: econ_pair.slug.clone(),
         cat: Cat::Econ,
         pm: Book { yes_bid: Some(0.60), yes_ask: Some(0.75), age_s: 1.0 },
         k: Book { yes_bid: Some(0.86), yes_ask: Some(0.87), age_s: 0.0 },
+        k_b: None,
         depth: Depth { c2: 100, c1: 100, c0: 100 },
         settle_clean: false,
         cluster: "u3-2026-07-02".into(),
@@ -554,14 +659,16 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         days_to_event: None,
     };
     println!("[smoke] econ U-3 9c gap, settlement NOT yet verified:");
-    report(cfg, &econ, Edge { net: 0.09, dir: Dir::PK }, backend);
+    report(cfg, &econ_pair, &econ, Edge { net: 0.09, dir: Dir::PK }, backend);
 
     // (2) a clean, settlement-verified weather arb above the 2c floor, cheap-led (benign) -> approved.
+    let wx_pair = lp("tc-temp-nychigh-2026-06-11-gte95f", "KXHIGHNY-26JUN11-T95", Cat::Weather, "nychigh-2026-06-11");
     let wx = Quote {
-        market: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+        market: wx_pair.slug.clone(),
         cat: Cat::Weather,
         pm: Book { yes_bid: Some(0.05), yes_ask: Some(0.07), age_s: 0.2 },
         k: Book { yes_bid: Some(0.10), yes_ask: Some(0.11), age_s: 0.0 },
+        k_b: None,
         depth: Depth { c2: 40, c1: 50, c0: 60 },
         settle_clean: true,
         cluster: "nychigh-2026-06-11".into(),
@@ -569,41 +676,58 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         days_to_event: None,
     };
     println!("[smoke] weather arb, verified, 3c edge, cheap-led (benign):");
-    report(cfg, &wx, Edge { net: 0.03, dir: Dir::PK }, backend);
+    report(cfg, &wx_pair, &wx, Edge { net: 0.03, dir: Dir::PK }, backend);
 
     // (3) same weather arb but DEAR-led -> the H1 toxicity-direction gate rejects it (weather-only).
     let mut wx_toxic = wx.clone();
     wx_toxic.led_by = Some(Venue::Kalshi); // dear venue (dir PK) led -> ~79% toxic
     println!("[smoke] weather arb, verified, 3c edge, DEAR-led (toxic):");
-    report(cfg, &wx_toxic, Edge { net: 0.03, dir: Dir::PK }, backend);
+    report(cfg, &wx_pair, &wx_toxic, Edge { net: 0.03, dir: Dir::PK }, backend);
 
-    // (4) SPORTS, owner-assumed reconciled: the game-proximity gate skips it 5 days out, takes it 1 day out.
+    // (4) SPORTS (2-outcome): pmus YES = LAD (team A); Kalshi-A = LAD ticker, Kalshi-B = PIT ticker. The
+    //     game-proximity gate skips it 5 days out, takes it 1 day out. The PK legs are YES@pmus + YES@Kalshi-B.
     let mut sc = cfg.clone();
     sc.assume_sports_settled = true;
-    let sport = Quote {
-        market: "aec-mlb-lad-pit-2026-06-16".into(),
+    let sport_pair = LivePair {
+        slug: "aec-mlb-lad-pit-2026-06-16".into(),
+        kalshi: "KXMLBGAME-26JUN16-LAD".into(),
+        kalshi_b: Some("KXMLBGAME-26JUN16-PIT".into()),
         cat: Cat::Sports,
-        pm: Book { yes_bid: Some(0.54), yes_ask: Some(0.55), age_s: 0.3 },
-        k: Book { yes_bid: Some(0.58), yes_ask: Some(0.59), age_s: 0.0 },
+        cluster: "mlb-2026-06-16".into(),
+        settle_clean: false,
+        days_to_event: Some(5.0),
+    };
+    let sport = Quote {
+        market: sport_pair.slug.clone(),
+        cat: Cat::Sports,
+        pm: Book { yes_bid: Some(0.54), yes_ask: Some(0.55), age_s: 0.3 }, // pmus YES = back LAD
+        k: Book { yes_bid: Some(0.56), yes_ask: Some(0.58), age_s: 0.0 },  // Kalshi-A (LAD) book
+        k_b: Some(Book { yes_bid: Some(0.40), yes_ask: Some(0.42), age_s: 0.0 }), // Kalshi-B (PIT) book
         depth: Depth { c2: 200, c1: 220, c0: 250 },
         settle_clean: false, // not actually reconciled — assumed via config
-        cluster: "mlb-lad-pit-2026-06-16".into(),
+        cluster: "mlb-2026-06-16".into(),
         led_by: None,
         days_to_event: Some(5.0),
     };
     println!("[smoke] sports arb (assumed-settled), 5 days pre-game -> event-proximity gate:");
-    report(&sc, &sport, Edge { net: 0.03, dir: Dir::PK }, backend);
+    report(&sc, &sport_pair, &sport, Edge { net: 0.03, dir: Dir::PK }, backend);
     let mut sport_soon = sport.clone();
     sport_soon.days_to_event = Some(1.0);
+    let mut sport_pair_soon = sport_pair.clone();
+    sport_pair_soon.days_to_event = Some(1.0);
     println!("[smoke] sports arb (assumed-settled), 1 day pre-game -> within window:");
-    report(&sc, &sport_soon, Edge { net: 0.03, dir: Dir::PK }, backend);
+    report(&sc, &sport_pair_soon, &sport_soon, Edge { net: 0.03, dir: Dir::PK }, backend);
 
-    // (5) postponement unwind: a held MLB pair + a postponement with an unknown/late reschedule ->
-    //     flatten BOTH legs (SELL) before Kalshi voids. (Stage-2 wires live statsapi detection.)
+    // (5) postponement unwind: a held MLB pair (dir PK: YES@pmus + YES@Kalshi-B) + a postponement with an
+    //     unknown/late reschedule -> flatten BOTH legs (SELL) before Kalshi voids. (Stage-2 wires statsapi.)
     let held = types::Position {
         market: "aec-mlb-lad-pit-2026-06-16".into(), cat: Cat::Sports,
-        yes_venue: Venue::Pmus, no_venue: Venue::Kalshi, size: 10,
-        cluster: "mlb-lad-pit-2026-06-16".into(),
+        legs: [
+            types::PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), side: Side::Yes },
+            types::PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), side: Side::Yes },
+        ],
+        size: 10,
+        cluster: "mlb-2026-06-16".into(),
     };
     let postponed = vec![unwind::Postponement {
         market: held.market.clone(), reschedule_in_days: None, // makeup unknown -> Kalshi will void
@@ -617,15 +741,14 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
     println!();
 }
 
-fn report(cfg: &Config, q: &Quote, edge: Edge, backend: &mut dyn ExecutionBackend) {
+fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &mut dyn ExecutionBackend) {
     match evaluate(cfg, q, &edge, &Exposure::new(), 1000) {
         Ok(a) => {
             println!("  APPROVED size={}  (edge {:.1}c, dir {:?})", a.size, edge.net * 100.0, edge.dir);
-            // per-leg limit prices from the quote's books (same correct path the live loop uses).
-            let (yes_ask, no_ask) = leg_prices(q, edge.dir);
-            match (cents(yes_ask), cents(no_ask)) {
-                (Some(yc), Some(nc)) => fire_pair(backend, q, &edge, a.size, yc, nc),
-                _ => println!("  (no two-sided book to price both legs)"),
+            // build both legs from the BOOKS (same unified path the live loop uses) and fire.
+            match build_legs(pair, q, edge.dir, a.size) {
+                Some(legs) => fire_legs(backend, &legs),
+                None => println!("  (no two-sided book to price both legs)"),
             }
         }
         Err(r) => println!("  REJECTED: {:?}", r),
@@ -644,10 +767,22 @@ mod tests {
             cat: Cat::Weather,
             pm: Book { yes_bid: Some(0.05), yes_ask: Some(0.07), age_s: 0.0 },
             k: Book { yes_bid: Some(0.10), yes_ask: Some(0.11), age_s: 0.0 },
+            k_b: None,
             depth: Depth { c2: 40, c1: 50, c0: 60 },
             settle_clean: true,
             cluster: "nychigh-2026-06-11".into(),
             led_by: None,
+            days_to_event: None,
+        }
+    }
+    fn wx_pair() -> LivePair {
+        LivePair {
+            slug: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+            kalshi: "KXHIGHNY-26JUN11-T95".into(),
+            kalshi_b: None,
+            cat: Cat::Weather,
+            cluster: "nychigh-2026-06-11".into(),
+            settle_clean: true,
             days_to_event: None,
         }
     }
@@ -656,16 +791,63 @@ mod tests {
     /// venue's YES ask; NO = 1 - dear venue's YES bid), NOT from the pair edge. The buggy version set
     /// YES = (1-edge) ~= 0.97 and NO ~= edge, so the NO leg's limit sat far below its real ask and could
     /// never fill -> a naked YES leg. Here YES must be 7c and NO must be 90c (sum = pair cost = 1-edge).
+    /// ALSO pins the leg-market FIX: the Kalshi leg carries the Kalshi TICKER, never the pmus slug.
     #[test]
     fn leg_prices_come_from_books_not_edge() {
-        let q = q_pk();
-        let (yes_ask, no_ask) = leg_prices(&q, Dir::PK);
-        assert_eq!(cents(yes_ask), Some(7)); // pmus YES ask 0.07 — the cheap YES leg
-        assert_eq!(cents(no_ask), Some(90)); // 1 - Kalshi YES bid 0.10 — the dear NO leg
-        // KP flips which venue is cheap/dear: YES = Kalshi ask 0.11; NO = 1 - pmus YES bid 0.05 = 0.95.
-        let (yk, nk) = leg_prices(&q, Dir::KP);
-        assert_eq!(cents(yk), Some(11));
-        assert_eq!(cents(nk), Some(95));
+        let (pair, q) = (wx_pair(), q_pk());
+        let pk = build_legs(&pair, &q, Dir::PK, 1).unwrap();
+        // leg A = YES@pmus(slug) @ 7c (pmus YES ask 0.07); leg B = NO@Kalshi(ticker) @ 90c (1 - 0.10).
+        assert_eq!((pk[0].venue, pk[0].side, pk[0].price_cents), (Venue::Pmus, Side::Yes, 7));
+        assert_eq!(pk[0].market, "tc-temp-nychigh-2026-06-11-gte95f"); // pmus leg -> slug
+        assert_eq!((pk[1].venue, pk[1].side, pk[1].price_cents), (Venue::Kalshi, Side::No, 90));
+        assert_eq!(pk[1].market, "KXHIGHNY-26JUN11-T95"); // LEG-MARKET FIX: Kalshi leg -> the TICKER, not the slug
+        // KP flips cheap/dear: YES@Kalshi(ticker) 0.11; NO@pmus(slug) = 1 - 0.05 = 0.95.
+        let kp = build_legs(&pair, &q, Dir::KP, 1).unwrap();
+        assert_eq!((kp[0].venue, kp[0].side, kp[0].price_cents), (Venue::Kalshi, Side::Yes, 11));
+        assert_eq!(kp[0].market, "KXHIGHNY-26JUN11-T95");
+        assert_eq!((kp[1].venue, kp[1].side, kp[1].price_cents), (Venue::Pmus, Side::No, 95));
+        assert_eq!(kp[1].market, "tc-temp-nychigh-2026-06-11-gte95f");
+    }
+
+    /// SPORTS leg construction: PK = "YES@pmus(slug) and YES@Kalshi-B(ticker_b)"; KP = "YES@Kalshi-A
+    /// (ticker_a) and NO@pmus(slug)". Both Kalshi legs carry their own TICKER (the leg-market fix), and
+    /// the sports PK second leg is a YES on the AWAY team's book (kb ask), not a NO leg.
+    #[test]
+    fn sports_legs_use_venue_native_tickers_and_correct_sides() {
+        let pair = LivePair {
+            slug: "aec-mlb-lad-pit-2026-06-16".into(),
+            kalshi: "KXMLBGAME-26JUN16-LAD".into(),
+            kalshi_b: Some("KXMLBGAME-26JUN16-PIT".into()),
+            cat: Cat::Sports,
+            cluster: "mlb-2026-06-16".into(),
+            settle_clean: false,
+            days_to_event: Some(1.0),
+        };
+        let q = Quote {
+            market: pair.slug.clone(),
+            cat: Cat::Sports,
+            pm: Book { yes_bid: Some(0.54), yes_ask: Some(0.55), age_s: 0.0 }, // back A@pmus pays 0.55
+            k: Book { yes_bid: Some(0.56), yes_ask: Some(0.58), age_s: 0.0 },  // Kalshi-A (LAD) ask 0.58
+            k_b: Some(Book { yes_bid: Some(0.40), yes_ask: Some(0.42), age_s: 0.0 }), // Kalshi-B (PIT) ask 0.42
+            depth: Depth { c2: 50, c1: 50, c0: 50 },
+            settle_clean: false,
+            cluster: "mlb-2026-06-16".into(),
+            led_by: None,
+            days_to_event: Some(1.0),
+        };
+        // PK: leg A = YES@pmus(slug) @ pm_ask 55c; leg B = YES@Kalshi-B(PIT ticker) @ kB_ask 42c.
+        let pk = build_legs(&pair, &q, Dir::PK, 3).unwrap();
+        assert_eq!((pk[0].venue, pk[0].side, pk[0].price_cents), (Venue::Pmus, Side::Yes, 55));
+        assert_eq!(pk[0].market, "aec-mlb-lad-pit-2026-06-16");
+        assert_eq!((pk[1].venue, pk[1].side, pk[1].price_cents), (Venue::Kalshi, Side::Yes, 42));
+        assert_eq!(pk[1].market, "KXMLBGAME-26JUN16-PIT", "PK leg2 = YES on the AWAY team's Kalshi TICKER");
+        assert!(pk[0].qty == 3 && pk[1].qty == 3);
+        // KP: leg A = YES@Kalshi-A(LAD ticker) @ kA_ask 58c; leg B = NO@pmus(slug) @ 1-pm_bid = 46c.
+        let kp = build_legs(&pair, &q, Dir::KP, 3).unwrap();
+        assert_eq!((kp[0].venue, kp[0].side, kp[0].price_cents), (Venue::Kalshi, Side::Yes, 58));
+        assert_eq!(kp[0].market, "KXMLBGAME-26JUN16-LAD", "KP leg1 = YES on the HOME team's Kalshi TICKER");
+        assert_eq!((kp[1].venue, kp[1].side, kp[1].price_cents), (Venue::Pmus, Side::No, 46));
+        assert_eq!(kp[1].market, "aec-mlb-lad-pit-2026-06-16");
     }
 
     /// `cents` rounds to the nearest tick and rejects prices that round outside the 1..=99 range or are
@@ -681,14 +863,15 @@ mod tests {
         assert_eq!(cents(Some(f64::NAN)), None);
     }
 
-    /// A one-sided book (no dear-venue YES bid) yields no NO-leg price -> the loop skips (no naked fire).
+    /// A one-sided book (no dear-venue YES bid) yields no NO-leg price -> `build_legs` returns None and
+    /// the live loop skips (no naked fire). Pins the "skip rather than leg out" invariant.
     #[test]
-    fn one_sided_book_blocks_the_no_leg_price() {
-        let mut q = q_pk();
-        q.k.yes_bid = None; // no Kalshi bid -> can't price the NO@Kalshi leg
-        let (yes_ask, no_ask) = leg_prices(&q, Dir::PK);
-        assert_eq!(cents(yes_ask), Some(7));
-        assert_eq!(cents(no_ask), None); // -> the live loop `continue`s instead of firing a naked leg
+    fn one_sided_book_blocks_leg_construction() {
+        let (pair, mut q) = (wx_pair(), q_pk());
+        q.k.yes_bid = None; // no Kalshi bid -> can't price the NO@Kalshi leg (dir PK)
+        assert!(build_legs(&pair, &q, Dir::PK, 1).is_none()); // -> the live loop `continue`s, no naked leg
+        // the OTHER direction (KP needs Kalshi YES ask + pmus YES bid) still prices -> two legs.
+        assert!(build_legs(&pair, &q, Dir::KP, 1).is_some());
     }
 
     use std::collections::{HashMap, HashSet};
@@ -728,13 +911,31 @@ mod tests {
         assert_eq!(prune_step(&tracked, &set(&["a", "c"]), &mut absent2, 2), HashSet::new()); // b missing once again -> hold
     }
 
-    /// `LivePair` carries discovery's settle_clean through unchanged (weather true, econ false) so the
-    /// risk gate's settlement-identity check is fed the right value per category.
+    /// `LivePair` carries discovery's settle_clean + the two-ticker sports shape through unchanged so the
+    /// risk gate / book wiring is fed the right values per category.
     #[test]
-    fn livepair_from_discovery_preserves_settle_clean() {
-        let wx = discovery::Pair { slug: "tc-temp-x-2026-06-11-gte95f".into(), kalshi: "K".into(), cat: Cat::Weather, cluster: "x".into(), settle_clean: true, days_to_event: Some(0.0) };
-        let ec = discovery::Pair { slug: "urc-x".into(), kalshi: "K2".into(), cat: Cat::Econ, cluster: "u3-26JUN".into(), settle_clean: false, days_to_event: None };
+    fn livepair_from_discovery_preserves_settle_clean_and_tickers() {
+        let wx = discovery::Pair { slug: "tc-temp-x-2026-06-11-gte95f".into(), kalshi: "K".into(), kalshi_b: None, cat: Cat::Weather, cluster: "x".into(), settle_clean: true, days_to_event: Some(0.0) };
+        let ec = discovery::Pair { slug: "urc-x".into(), kalshi: "K2".into(), kalshi_b: None, cat: Cat::Econ, cluster: "u3-26JUN".into(), settle_clean: false, days_to_event: None };
+        let sp = discovery::Pair { slug: "aec-mlb-lad-pit-2026-06-16".into(), kalshi: "K-LAD".into(), kalshi_b: Some("K-PIT".into()), cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0) };
         assert!(LivePair::from(wx).settle_clean);
         assert!(!LivePair::from(ec).settle_clean);
+        // a sports LivePair subscribes BOTH team tickers (kalshi_tickers / pair_tickers parity).
+        let sp_lp = LivePair::from(sp.clone());
+        assert_eq!(sp_lp.kalshi_tickers(), vec!["K-LAD".to_string(), "K-PIT".to_string()]);
+        assert_eq!(pair_tickers(&sp), vec!["K-LAD".to_string(), "K-PIT".to_string()]);
+    }
+
+    /// PairState registers BOTH sports tickers in `by_ticker` -> slug, and `remove` frees both (so a
+    /// frame on either team's Kalshi book finds the pair, and a pruned pair leaves no dangling index).
+    #[test]
+    fn pairstate_indexes_and_frees_both_sports_tickers() {
+        let mut ps = PairState::default();
+        ps.insert(LivePair { slug: "aec-mlb-lad-pit-2026-06-16".into(), kalshi: "K-LAD".into(), kalshi_b: Some("K-PIT".into()), cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0) });
+        assert_eq!(ps.by_ticker.get("K-LAD").map(String::as_str), Some("aec-mlb-lad-pit-2026-06-16"));
+        assert_eq!(ps.by_ticker.get("K-PIT").map(String::as_str), Some("aec-mlb-lad-pit-2026-06-16"));
+        ps.remove("aec-mlb-lad-pit-2026-06-16");
+        assert!(!ps.by_ticker.contains_key("K-LAD") && !ps.by_ticker.contains_key("K-PIT"));
+        assert!(ps.by_slug.is_empty());
     }
 }

@@ -94,6 +94,61 @@ pub fn signal(pm: &Book, k: &Book) -> Signal {
     }
 }
 
+/// The 2-outcome GAME signal. Same shape as [`Signal`] (so the live loop treats both paths uniformly):
+/// `edge.net > 0` iff a real arb exists; `no_arb` is the booking-refuse flag; `crossed` flags a stale
+/// strictly-crossed pm book OR the C3 orientation guard tripping (both mean "do not trade this frame").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GameSignal {
+    pub edge: Edge,
+    pub no_arb: bool,
+    /// True when the pm book is strictly crossed OR the C3 guard tripped (a >40c same-team gap = flip).
+    pub crossed: bool,
+}
+
+/// 2-outcome CROSS-VENUE game edge. FAITHFUL port of `bot/monitor.py::game_edge` (lines ~157-179).
+///
+/// pmus lists the game as ONE market (YES = team A); Kalshi lists it as TWO single-team markets
+/// (`ka_ask` = "A wins" YES ask, `kb_ask` = "B wins" YES ask). Two cross-venue hedges:
+///   - **PK** = back A@pmus + B@Kalshi: cost = `pm_ask + kb_ask`; net = `(1-(pm_ask+kb_ask)) - pfee(pm_ask) - kfee(kb_ask)`.
+///   - **KP** = back A@Kalshi + B@pmus: `pm_backB = 1 - pm_bid`; net = `(1-(ka_ask+pm_backB)) - kfee(ka_ask) - pfee(pm_backB)`.
+///
+/// Best over the priceable opts; `arb = best.net > 0`. Python "PK"/"KP" -> [`Dir::PK`]/[`Dir::KP`].
+///
+/// C3 ORIENTATION GUARD (monitor.py 163-169, verbatim): a strictly-crossed pm book (`pm_bid>pm_ask`,
+/// both present) is stale -> reject; else `guard_pm = pm_ask` (fall back to `pm_bid` when no ask), and a
+/// `|guard_pm - ka_ask| > 0.40` gap on the SAME team (pm-YES=A and Kalshi-A) is a flip/mislabel, not edge.
+pub fn game_signal(pm_bid: Option<f64>, pm_ask: Option<f64>, ka_ask: Option<f64>, kb_ask: Option<f64>) -> GameSignal {
+    // strictly-crossed pm book -> stale (monitor.py 163-164).
+    if matches!((pm_bid, pm_ask), (Some(b), Some(a)) if b > a) {
+        return GameSignal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed: true };
+    }
+    // C3 orientation guard (monitor.py 165-169): one-sided pm book falls back to the bid for the guard.
+    let guard_pm = pm_ask.or(pm_bid);
+    if let (Some(g), Some(ka)) = (guard_pm, ka_ask) {
+        if (g - ka).abs() > 0.40 {
+            return GameSignal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed: true };
+        }
+    }
+    // opts: detection uses the at-scale MARGINAL fee (no ceil) on both venues — capture any arb +EV at size.
+    let mut opts: Vec<(Dir, f64)> = Vec::new();
+    if let (Some(pa), Some(kb)) = (pm_ask, kb_ask) {
+        // PK: back A@pmus (pay pm_ask) + B@Kalshi (pay kb_ask).
+        opts.push((Dir::PK, round4((1.0 - (pa + kb)) - pmus_marginal_fee(pa) - kalshi_marginal_fee(kb))));
+    }
+    if let (Some(ka), Some(pb)) = (ka_ask, pm_bid) {
+        // KP: back A@Kalshi (pay ka_ask) + B@pmus (pay NO = 1 - pm_bid).
+        let pm_backb = round4(1.0 - pb);
+        opts.push((Dir::KP, round4((1.0 - (ka + pm_backb)) - kalshi_marginal_fee(ka) - pmus_marginal_fee(pm_backb))));
+    }
+    if opts.is_empty() {
+        // nothing priceable. monitor.py returns None; the loop skips (no dir to act on). Default dir PK.
+        return GameSignal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed: false };
+    }
+    // max by net; ties resolve to the first-pushed (PK before KP), matching Python's `max(opts)` stability.
+    let best = opts.iter().copied().fold(opts[0], |acc, o| if o.1 > acc.1 { o } else { acc });
+    GameSignal { edge: Edge { net: best.1, dir: best.0 }, no_arb: best.1 <= 0.0, crossed: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +235,77 @@ mod tests {
         let s2 = signal(&bk(Some(0.59), Some(0.61)), &bk(None, Some(0.70)));
         assert_eq!(s2.edge.dir, Dir::KP);
         assert!(s2.no_arb && s2.edge.net <= 0.0);
+    }
+
+    // ---- GAME (2-outcome) signal: parity vs monitor.py::game_edge -------------------------------------
+
+    /// Hand-recompute monitor.py's `game_edge` net exactly the way Python does and compare bit-for-bit.
+    fn game_net_pk(pa: f64, kb: f64) -> f64 {
+        round4((1.0 - (pa + kb)) - (0.05 * pa * (1.0 - pa)) - (0.07 * kb * (1.0 - kb)))
+    }
+    fn game_net_kp(ka: f64, pm_bid: f64) -> f64 {
+        let pb = round4(1.0 - pm_bid);
+        round4((1.0 - (ka + pb)) - (0.07 * ka * (1.0 - ka)) - (0.05 * pb * (1.0 - pb)))
+    }
+
+    /// PK is the best config (back A@pmus + B@Kalshi) on a vector where the two single-team Kalshi YES
+    /// asks + pm YES ask sum to < $1. dir maps Python "PK" -> Dir::PK; net matches game_edge bit-for-bit.
+    #[test]
+    fn game_signal_pk_matches_game_edge() {
+        // pm: YES bid .50 / ask .52 ; Kalshi A .55, B .45. PK cost .52+.45=.97 -> thin +edge.
+        let g = game_signal(Some(0.50), Some(0.52), Some(0.55), Some(0.45));
+        assert_eq!(g.edge.dir, Dir::PK, "Python 'PK' must map to Dir::PK");
+        assert!(!g.no_arb && !g.crossed);
+        assert!((g.edge.net - game_net_pk(0.52, 0.45)).abs() < 1e-12, "net {} != {}", g.edge.net, game_net_pk(0.52, 0.45));
+        assert!(g.edge.net > 0.0);
+    }
+
+    /// KP is the best config (back A@Kalshi + B@pmus = NO@pmus) when Kalshi-A is the cheap way to back A.
+    /// pm_backB = 1 - pm_bid; net matches game_edge's KP branch bit-for-bit.
+    #[test]
+    fn game_signal_kp_matches_game_edge() {
+        // pm: YES bid .60 / ask .62 ; Kalshi A .33, B .70. KP: A@K .33 + NO@pmus (1-.60=.40) = .73 cost.
+        let g = game_signal(Some(0.60), Some(0.62), Some(0.33), Some(0.70));
+        assert_eq!(g.edge.dir, Dir::KP);
+        assert!(!g.no_arb && !g.crossed);
+        assert!((g.edge.net - game_net_kp(0.33, 0.60)).abs() < 1e-12, "net {} != {}", g.edge.net, game_net_kp(0.33, 0.60));
+        assert!(g.edge.net > 0.0);
+        // and PK here is NEGATIVE (pm_ask .62 + kB .70 = 1.32 > 1) -> KP strictly wins.
+        assert!(game_net_pk(0.62, 0.70) < 0.0);
+    }
+
+    /// The C3 orientation guard: a >40c gap between guard_pm and Kalshi-A (the SAME team) is a flip, not
+    /// edge -> no_arb + crossed, regardless of how fat the apparent gap looks (monitor.py 165-169).
+    #[test]
+    fn game_signal_c3_orientation_guard_rejects_flip() {
+        // pm YES(=A) .20 vs Kalshi-A .80 -> |.20-.80|=.60 > .40 -> guarded out (a mislabeled/flipped pair).
+        let g = game_signal(Some(0.18), Some(0.20), Some(0.80), Some(0.15));
+        assert!(g.no_arb && g.crossed, "C3: same-team >40c gap must reject");
+        // one-sided pm (no ask) falls back to the BID for the guard (still covers dir KP). bid .82 vs A .30.
+        let g2 = game_signal(Some(0.82), None, Some(0.30), Some(0.65));
+        assert!(g2.no_arb && g2.crossed);
+        // a SMALL same-team gap (<=40c) passes the guard (a real cross-venue arb is a few cents).
+        let g3 = game_signal(Some(0.50), Some(0.52), Some(0.55), Some(0.45));
+        assert!(!g3.crossed);
+    }
+
+    /// A strictly-crossed pm book (bid > ask, both present) is stale -> rejected (monitor.py 163-164).
+    #[test]
+    fn game_signal_crossed_pm_is_rejected() {
+        let g = game_signal(Some(0.60), Some(0.50), Some(0.55), Some(0.45));
+        assert!(g.no_arb && g.crossed);
+    }
+
+    /// One-sided Kalshi books: PK needs (pm_ask, kB), KP needs (kA, pm_bid). A missing quote drops only
+    /// the direction that needs it (monitor.py's per-direction opt construction).
+    #[test]
+    fn game_signal_one_sided_prices_valid_direction_only() {
+        // no kA_ask -> only PK is priceable (needs pm_ask + kB). guard is skipped (kA_ask None).
+        let g = game_signal(Some(0.50), Some(0.52), None, Some(0.45));
+        assert_eq!(g.edge.dir, Dir::PK);
+        assert!((g.edge.net - game_net_pk(0.52, 0.45)).abs() < 1e-12);
+        // no kB_ask AND no pm_bid -> nothing priceable -> no_arb, default dir PK.
+        let g2 = game_signal(None, Some(0.52), None, None);
+        assert!(g2.no_arb && !g2.crossed && g2.edge.dir == Dir::PK);
     }
 }

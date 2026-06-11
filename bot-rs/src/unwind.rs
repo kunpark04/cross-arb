@@ -30,30 +30,24 @@ pub fn should_unwind(p: &Postponement, kalshi_void_window_days: f64) -> bool {
         .map_or(true, |d| d > kalshi_void_window_days)
 }
 
-/// The two closing orders to flatten a held pair: SELL the YES leg and SELL the NO leg, each at the
-/// venue's marketable price (stage-2 supplies the live bid; the caller passes the target here).
-/// Idempotent `unwind-…` client_order_ids tag the close so a retry can't double-flatten.
-pub fn unwind_orders(pos: &Position, yes_exit_cents: u8, no_exit_cents: u8) -> [OrderIntent; 2] {
-    [
+/// The two closing orders to flatten a held pair: SELL each of the position's two legs with the EXACT
+/// (venue, venue-native market, side) it holds — correct for ALL categories, including a sports hedge
+/// whose two legs are two YES legs on two different Kalshi tickers (dir PK: YES@pmus + YES@Kalshi-B). The
+/// caller supplies a marketable exit price per leg (`exit_cents[i]` for `legs[i]`; stage-2 reads the live
+/// bids). Idempotent `unwind-…-{0,1}` client_order_ids tag the close so a retry can't double-flatten.
+pub fn unwind_orders(pos: &Position, exit_cents: [u8; 2]) -> [OrderIntent; 2] {
+    std::array::from_fn(|i| {
+        let leg = &pos.legs[i];
         OrderIntent {
-            venue: pos.yes_venue,
-            market: pos.market.clone(),
+            venue: leg.venue,
+            market: leg.market.clone(),
             action: Action::Sell,
-            side: Side::Yes,
-            price_cents: yes_exit_cents,
+            side: leg.side,
+            price_cents: exit_cents[i],
             qty: pos.size,
-            client_order_id: format!("unwind-{}-Y", pos.market),
-        },
-        OrderIntent {
-            venue: pos.no_venue,
-            market: pos.market.clone(),
-            action: Action::Sell,
-            side: Side::No,
-            price_cents: no_exit_cents,
-            qty: pos.size,
-            client_order_id: format!("unwind-{}-N", pos.market),
-        },
-    ]
+            client_order_id: format!("unwind-{}-{}", pos.market, i),
+        }
+    })
 }
 
 /// Scan held positions against detected postponements; return the unwind orders for every SPORTS
@@ -70,8 +64,8 @@ pub fn postponement_unwinds(
         }
         if let Some(p) = postponements.iter().find(|p| p.market == pos.market) {
             if should_unwind(p, kalshi_void_window_days) {
-                // exit "at market" — stage-2 supplies the live bids; 1c placeholder here.
-                out.push(unwind_orders(pos, 1, 1));
+                // exit "at market" — stage-2 supplies the live bids; 1c placeholders here.
+                out.push(unwind_orders(pos, [1, 1]));
             }
         }
     }
@@ -83,11 +77,15 @@ mod tests {
     use super::*;
 
     fn pos() -> Position {
+        // a SPORTS dir-PK hedge: leg0 = YES@pmus(slug), leg1 = YES@Kalshi-B(away-team ticker). Both legs
+        // are YES — the old yes_venue/no_venue model could not represent this (it assumed a YES + a NO).
         Position {
-            market: "aec-mlb-lad-pit-2026-06-14".into(),
+            market: "aec-mlb-lad-pit-2026-06-14".into(), // pair identity = the pmus slug
             cat: Cat::Sports,
-            yes_venue: Venue::Pmus,
-            no_venue: Venue::Kalshi,
+            legs: [
+                PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-14".into(), side: Side::Yes },
+                PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN14-PIT".into(), side: Side::Yes },
+            ],
             size: 10,
             cluster: "mlb-lad-pit-2026-06-14".into(),
         }
@@ -105,9 +103,14 @@ mod tests {
 
     #[test]
     fn unwind_orders_sell_both_legs() {
-        let o = unwind_orders(&pos(), 53, 45);
+        let o = unwind_orders(&pos(), [53, 45]);
+        // each leg is SOLD with the EXACT venue/market/side held — leg1 is YES@Kalshi-B (the away ticker),
+        // NOT a NO leg; the venue-native market id is the Kalshi TICKER, not the pmus slug.
         assert_eq!((o[0].action, o[0].side, o[0].venue), (Action::Sell, Side::Yes, Venue::Pmus));
-        assert_eq!((o[1].action, o[1].side, o[1].venue), (Action::Sell, Side::No, Venue::Kalshi));
+        assert_eq!(o[0].market, "aec-mlb-lad-pit-2026-06-14"); // pmus leg carries the slug
+        assert_eq!((o[1].action, o[1].side, o[1].venue), (Action::Sell, Side::Yes, Venue::Kalshi));
+        assert_eq!(o[1].market, "KXMLBGAME-26JUN14-PIT"); // Kalshi leg carries the TICKER (leg-market fix)
+        assert_eq!((o[0].price_cents, o[1].price_cents), (53, 45));
         assert!(o[0].qty == 10 && o[1].qty == 10);
     }
 

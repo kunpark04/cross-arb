@@ -272,6 +272,20 @@ pub fn depth_at_edge(k: &KalshiBook, pm: &PmusBook, dir: Dir) -> Depth {
     depth_curve(&a, &b)
 }
 
+/// SPORTS (2-outcome) cross-venue fillable depth on the SIGNALLED direction. Port of
+/// `MarketTracker._depth` (monitor.py 210-216 — the `GameTracker._depth` arm):
+///   - `Dir::PK` (back A@pmus + B@Kalshi): leg A = pmus YES-ask ladder; leg B = Kalshi-B YES-ask ladder.
+///   - `Dir::KP` (back A@Kalshi + B@pmus): leg A = Kalshi-A YES-ask ladder; leg B = `1 - pmus YES-bid`.
+///
+/// `ka`/`kb` are the two single-team Kalshi books (A = team pmus lists as YES, B = the other team).
+pub fn game_depth_at_edge(pm: &PmusBook, ka: &KalshiBook, kb: &KalshiBook, dir: Dir) -> Depth {
+    let (a, b) = match dir {
+        Dir::PK => (pm.yes_ask_ladder(), kb.yes_ask_ladder()),
+        Dir::KP => (ka.yes_ask_ladder(), no_ask_ladder(&pm.yes_bid_ladder())),
+    };
+    depth_curve(&a, &b)
+}
+
 /// The cheap venue's YES-ask ladder for a direction, exposed for sizing/leg-sequencing in stage-2.
 pub fn cheap_yes_ask_ladder(k: &KalshiBook, pm: &PmusBook, dir: Dir) -> Vec<(f64, f64)> {
     match dir.cheap_venue() {
@@ -366,6 +380,41 @@ mod tests {
         assert_eq!((d.c2, d.c1, d.c0), (8, 8, 8));
     }
 
+    /// GAME depth, dir PK (back A@pmus + B@Kalshi): leg A = pmus YES-asks, leg B = Kalshi-B YES-asks.
+    /// A Kalshi YES ask is read from the NO-bid side (yes_ask = 1 - no_bid), so Kalshi-B's NO bid .56@30
+    /// gives a YES ask .44@30. pmus A .50@8 -> min(8,30)=8 pairs (GameTracker vector).
+    #[test]
+    fn game_depth_pk_pairs_pmus_with_kalshi_b() {
+        let mut pm = PmusBook::new();
+        pm.apply_snapshot(&[(0.48, 10.0)], &[(0.50, 8.0)]); // pmus YES ask .50@8 (back A@pmus)
+        let ka = KalshiBook::new(); // unused in PK; present to prove it's NOT consulted
+        let mut kb = KalshiBook::new();
+        kb.apply_snapshot(&[], &[(0.56, 30.0)]); // Kalshi-B NO bid .56 -> YES ask 1-.56=.44 @30
+        let d = game_depth_at_edge(&pm, &ka, &kb, Dir::PK);
+        // leg A ask .50@8 ; leg B (Kalshi-B YES) ask .44@30. edge .06 step min(8,30)=8.
+        assert_eq!((d.c2, d.c1, d.c0), (8, 8, 8));
+    }
+
+    /// GAME depth, dir KP (back A@Kalshi + B@pmus): leg A = Kalshi-A YES-asks, leg B = pmus NO-asks
+    /// (= 1 - pmus YES-bid). Kalshi-A YES ask .55@12 ; pmus YES bid .42 -> NO ask .58@20 -> min(12,20)=12.
+    #[test]
+    fn game_depth_kp_pairs_kalshi_a_with_pmus_no() {
+        let mut pm = PmusBook::new();
+        pm.apply_snapshot(&[(0.42, 20.0)], &[(0.44, 99.0)]); // pmus YES bid .42 -> NO-ask leg .58@20
+        let mut ka = KalshiBook::new();
+        ka.apply_snapshot(&[(0.30, 5.0)], &[(0.45, 12.0)]); // Kalshi-A YES ask = 1 - NO bid .45 = .55 @12
+        let kb = KalshiBook::new(); // unused in KP
+        let d = game_depth_at_edge(&pm, &ka, &kb, Dir::KP);
+        // leg A (Kalshi-A) ask .55@12 ; leg B (pmus NO) ask .58@20. edge 1-.55-.58 = -.13 < 0 -> 0 depth.
+        assert_eq!((d.c2, d.c1, d.c0), (0, 0, 0));
+        // widen: make Kalshi-A cheaper (.40 ask) so the KP edge is positive and depth caps on leg A.
+        let mut ka2 = KalshiBook::new();
+        ka2.apply_snapshot(&[(0.30, 5.0)], &[(0.60, 12.0)]); // YES ask = 1 - .60 = .40 @12
+        let d2 = game_depth_at_edge(&pm, &ka2, &kb, Dir::KP);
+        // leg A .40@12 ; leg B (pmus NO) .58@20. edge 1-.40-.58=.02 step min(12,20)=12 -> c2(>=.02)=12.
+        assert_eq!((d2.c2, d2.c1, d2.c0), (12, 12, 12));
+    }
+
     /// Best is O(1) via map ends, not a scan; a deeper book doesn't change the touch.
     #[test]
     fn deep_book_best_is_top_of_book() {
@@ -408,6 +457,7 @@ mod tests {
             cat: Cat::Weather,
             pm: pm.touch(), // REAL age from last_update, not 0.0
             k: k.touch(),
+            k_b: None,
             depth: Depth { c2: 50, c1: 60, c0: 70 },
             settle_clean: true,
             cluster: "nychigh-2026-06-11".into(),
