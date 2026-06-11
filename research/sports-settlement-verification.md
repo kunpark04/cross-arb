@@ -59,3 +59,32 @@ per single-team market; pmus market `description`/rule fields), 10 co-listed lea
 (Global vs XLG), ATP (Hurkacz vs Fucsovics), WTA (Navarro vs McNally), ITF-M (Mridha vs Ferri), ITF-W
 (Price vs Candiotto). Full MLB rules text pulled directly to confirm the 2-day vs 2-week reschedule windows.
 NBA/NHL were not co-listed at run time (re-run in season).
+
+## Addendum 2026-06-11 — first OBSERVED void prints + payout-timing evidence (live API reads)
+
+Owner asked to verify the 2-week pmus sports hold against historical data (test case: Knicks–Spurs G4,
+played 2026-06-10). Live reads, raw objects via the shared `colisted_map.get`:
+
+- **NBA is NOT co-listed — the test game was never a pair.** pmus lists no NBA moneylines at all (only
+  `patc-nba-nyk-sas-…-attends-…` celebrity-attendance novelty markets); consistent with 0 NBA markets in
+  the monitor archive. The NBA row above ("not co-listed at run time") is now confirmed in-season:
+  it's structural, not seasonal.
+- **Kalshi settled tonight's game in MINUTES — and its own listings also carry a +14 d formal window.**
+  `KXNBAGAME-26JUN10SASNYK-NYK`: occurrence 03:30 Z → `close_time` 03:36:08 Z → **`settlement_ts`
+  03:36:46 Z** (38 s after close; result NYK yes), while `expiration_time` sits at 2026-06-25 (+14 d).
+  So BOTH venues list the same 2-week outer window — the lockup difference is **active early
+  determination (Kalshi `settlement_ts`) vs passive expiration (pmus `endDate`)**.
+- **The flagged postponed game `aec-mlb-tb-nyy-2026-05-23` (probe-program §7 watchlist) delivered the
+  first observed void prints on BOTH venues:** Kalshi voided to *"fair price"* **scalar 0.44/0.56 on
+  game day** (`settlement_ts` 2026-05-23T18:24 Z — 49 min after the 13:35 ET scheduled start; matches
+  the §7 47–90 min finding), pmus held to its `endDate` 2026-06-06 (+14 d) then settled **last-traded
+  0.44/0.56**. n=1: the two void bases produced **identical prices** (the books agreed at the void
+  moment) — the symmetric-void basis mismatch was $0.00 here; the realized cost was purely pmus's extra
+  2-week hold. The *material* 3–14 d-replay divergence (real-winner vs void) remains unobserved.
+  Completed-game specimens past `endDate` (`stl-cin` 05-22, `det-bal` 05-23) read cleanly graded 1/0,
+  `ep3Status=EXPIRED`, endDate = start+14 d exactly.
+- **pmus payment is contractually keyed to expiration, not game end:** the CFTC-filed rulebook (catalog
+  brief §sources) defines the *Settlement Amount* as paid on the *Settlement Date* **"if the Payout
+  Condition is satisfied at Expiration Time"** — grading appears early (interim object state) but the
+  payout condition evaluates at expiration. Direct fund-movement observation still requires a funded
+  position (post-gate); no payout timestamp exists on the public object.
