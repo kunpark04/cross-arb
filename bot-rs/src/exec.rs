@@ -191,6 +191,8 @@ mod tests {
             fat_edge_knee_cents: 6.0,
             fat_edge_size_factor: 0.5,
             skip_dear_led_weather: true,
+            assume_sports_settled: false,
+            sports_max_days_to_game: 2.0,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             kill_switch: false,

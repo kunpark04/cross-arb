@@ -90,6 +90,7 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         settle_clean: false,
         cluster: "u3-2026-07-02".into(),
         led_by: None,
+        days_to_game: None,
     };
     println!("[smoke] econ U-3 9c gap, settlement NOT yet verified:");
     report(cfg, &econ, Edge { net: 0.09, dir: Dir::PK }, 75, backend);
@@ -104,6 +105,7 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         settle_clean: true,
         cluster: "nychigh-2026-06-11".into(),
         led_by: Some(Venue::Pmus), // cheap venue (dir PK) led -> benign
+        days_to_game: None,
     };
     println!("[smoke] weather arb, verified, 3c edge, cheap-led (benign):");
     report(cfg, &wx, Edge { net: 0.03, dir: Dir::PK }, 7, backend);
@@ -113,6 +115,27 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
     wx_toxic.led_by = Some(Venue::Kalshi); // dear venue (dir PK) led -> ~79% toxic
     println!("[smoke] weather arb, verified, 3c edge, DEAR-led (toxic):");
     report(cfg, &wx_toxic, Edge { net: 0.03, dir: Dir::PK }, 7, backend);
+
+    // (4) SPORTS, owner-assumed reconciled: the game-proximity gate skips it 5 days out, takes it 1 day out.
+    let mut sc = cfg.clone();
+    sc.assume_sports_settled = true;
+    let sport = Quote {
+        market: "aec-mlb-lad-pit-2026-06-16".into(),
+        cat: Cat::Sports,
+        pm: Book { yes_bid: Some(0.54), yes_ask: Some(0.55), age_s: 0.3 },
+        k: Book { yes_bid: Some(0.58), yes_ask: Some(0.59), age_s: 0.0 },
+        depth: Depth { c2: 200, c1: 220, c0: 250 },
+        settle_clean: false, // not actually reconciled — assumed via config
+        cluster: "mlb-lad-pit-2026-06-16".into(),
+        led_by: None,
+        days_to_game: Some(5.0),
+    };
+    println!("[smoke] sports arb (assumed-settled), 5 days pre-game -> game-proximity gate:");
+    report(&sc, &sport, Edge { net: 0.03, dir: Dir::PK }, 55, backend);
+    let mut sport_soon = sport.clone();
+    sport_soon.days_to_game = Some(1.0);
+    println!("[smoke] sports arb (assumed-settled), 1 day pre-game -> within window:");
+    report(&sc, &sport_soon, Edge { net: 0.03, dir: Dir::PK }, 55, backend);
 }
 
 fn report(cfg: &Config, q: &Quote, edge: Edge, buy_price_cents: u8, backend: &mut dyn ExecutionBackend) {

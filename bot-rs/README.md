@@ -25,6 +25,8 @@ of least resistance, because the readiness audit + backtest concluded the edge i
 | Fat-edge haircut | `FAT_EDGE_SIZE_FACTOR` / `FAT_EDGE_KNEE_CENTS` | 0.5 / 6c | size **down** above the knee — fat edges are ~66% toxic & die ~0.5s (readiness audit + rust review); **set factor=1.0 to test** whether a sub-0.5s concurrent fill can capture them |
 | Econ twin divergence | `ECON_TWIN_MAX_DIVERGENCE_CENTS` | 15c | tighter divergence bound for settlement-identical econ twins (vs the 40c cross-category guard) — the 18c U-3 phantom must not sail through |
 | Toxicity-direction gate | `SKIP_DEAR_LED_WEATHER` | true | **H1** (the one tested strategy idea with a signal) — skip **dear-led weather** edges (~79% toxic vs ~17% cheap-led, Fisher p=2.7e-6); **weather-only** (sports null); dormant until stage-2 supplies `led_by` |
+| Assume sports settled | `ASSUME_SPORTS_SETTLED` | false | owner override: treat **sports** as settlement-reconciled (else gated until the ~June 23 recon). The residual void/postpone tail is handled by the (stage-2) unwind rule, not this flag |
+| Game-proximity gate | `SPORTS_MAX_DAYS_TO_GAME` | 2.0 | capital velocity — skip a **sports** arb more than this many days before the game (don't freeze capital early; monitoring is free). All sports; weather/econ exempt; dormant until stage-2 supplies `days_to_game`. `<=0` disables |
 | Settle-clean | `REQUIRE_SETTLE_CLEAN` | true | only trade settlement-verified pairs (weather; econ/sports per recon) |
 | Key path | `KALSHI_RW_KEY_PATH` | unset | external path to the read-write key — loaded at runtime, never copied into the repo |
 
@@ -35,7 +37,8 @@ after the 0014 confirmatory run passes on multi-week data and the naked-unwind c
 ## Edge cases enforced (pre-trade gates, `src/risk.rs`)
 
 Kill-switch · WS-reconnect/seq-gap pause (never trade a rebuilding book) · **settlement-identity**
-(invariant #1 — econ/sports must be empirically verified) · crossed/locked book (L12) · staleness (L13)
+(invariant #1 — econ/sports must be empirically verified, or sports via `ASSUME_SPORTS_SETTLED`) ·
+**game-proximity** (skip a sports arb >N days pre-game — capital velocity; all sports) · crossed/locked book (L12) · staleness (L13)
 · cross-venue **mid-divergence** (L1 bad-join/stale guard; **tighter category bound for econ twins**) ·
 non-positive edge (L11) · opt-in edge floor (L15) · **fat-edge toxicity haircut** (size down above the
 ~6c knee — fat edges are adversely-selected; knob to test speed-capture) · **toxicity-DIRECTION gate**

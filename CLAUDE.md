@@ -136,6 +136,16 @@ See [deploy/README.md](deploy/README.md).
   frozen) and econ (weeks-mo, outcome known only at the far release) are capital-locked** — the sports early-exit
   "rescue" is refuted. So weather = clean+fast+thin; sports = deep but capital-slow + void tail; econ = cleanest
   but slowest. **No category wins {clean settlement, fast capital, real depth}; weather comes closest on capital.**
+  **CORRECTION 2026-06-11 (owner, direct account observation):** the "sports/econ capital LOCKED ~15d to
+  endDate" claim was an **inference, not a measurement** — it conflated *can't-sell-early* (the book IS
+  frozen at resolution, measured) with *cash-locked* (assumed). The owner reports pmus credits the payout
+  to **cash at GRADE**, not at the +14d endDate (which is just the administrative expiration window for
+  contingencies). pmus exposes no balance endpoint to verify independently, and the one observed position
+  was a loss (clears at grade regardless), so the win-case isn't fully confirmed — but the "15-day capital
+  lock" should **not** be asserted: sports/econ appear to settle to cash ~at grade (fast), like weather.
+  This makes **sports a prime category once reconciled (June 23): deep books AND fast capital.** The
+  separable, smaller cost is the *pre-game* freeze (mitigated by the new game-proximity entry gate,
+  `bot-rs` `SPORTS_MAX_DAYS_TO_GAME`) + the void/postpone tail (the unwind rule).
 - **Clip-stage allocation — tested OOS + two phantoms fixed (2026-06-10, [0012](decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md) corrected by [0013](decisions/0013-econ-grid-step-twin-and-measurement-integrity.md), [research/allocation-policy-2026-06-10.md](research/allocation-policy-2026-06-10.md)).**
   `account_sim`'s FIFO-by-arrival is the worst rule when the bankroll binds (one deep clip eats the whole $500 →
   funds 1/217). The owner's "wait 1 s + sort the batch" captures only **~4%** of the FIFO→optimal gap (competing

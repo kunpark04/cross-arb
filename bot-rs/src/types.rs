@@ -98,6 +98,10 @@ pub struct Quote {
     /// sighting. For WEATHER, a DEAR-led edge is ~79% toxic vs ~17% cheap-led (H1, weather-only) — the
     /// toxicity-direction signal. Stage-2 populates this by diffing against the prior book snapshot.
     pub led_by: Option<Venue>,
+    /// Days until the game starts (sports only), for the game-proximity entry gate — don't lock
+    /// capital days before the game. `None` = unknown / N/A (weather/econ). Stage-2 computes it from
+    /// the game date in the market key.
+    pub days_to_game: Option<f64>,
 }
 
 /// A priced cross-venue edge, net of fees, per `$1` of payout.

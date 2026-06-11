@@ -12,6 +12,7 @@ pub enum Reject {
     KillSwitch,           // CROSSARB_KILL
     StreamPaused,         // WS reconnect / seq-gap: book is rebuilding -> do NOT trade it (0013)
     SettlementUnverified, // invariant #1: econ/sports pair not empirically settlement-clean
+    TooEarly,             // game-proximity gate: sports arb is too many days pre-game (capital velocity)
     CrossedBook(Venue),   // L12 — single-venue bid>ask phantom
     StaleBook(Venue),     // L13 — book older than max_book_age_s
     MidDivergence(f64),   // L1 — identical-settlement pair's mids disagree wildly (bad join/stale)
@@ -66,10 +67,26 @@ pub fn evaluate(
         return Err(Reject::StreamPaused); // never trade a half-rebuilt book
     }
 
-    // 1. settlement identity (invariant #1) — the catastrophic both-legs-loss axis.
-    //    Weather is empirically verified; econ/sports must carry settle_clean=true.
-    if cfg.require_settle_clean && !q.settle_clean && q.cat != Cat::Weather {
+    // 1. settlement identity (invariant #1) — the catastrophic both-legs-loss axis. Weather is
+    //    empirically verified; econ/sports need settle_clean=true, OR sports when the owner has
+    //    asserted reconciliation (assume_sports_settled). The residual sports VOID/postpone tail is
+    //    handled separately by the (stage-2) unwind rule, not this gate.
+    let settle_ok = q.settle_clean
+        || q.cat == Cat::Weather
+        || (q.cat == Cat::Sports && cfg.assume_sports_settled);
+    if cfg.require_settle_clean && !settle_ok {
         return Err(Reject::SettlementUnverified);
+    }
+
+    // 1b. GAME-PROXIMITY gate (capital velocity) — don't lock capital into a sports arb days before
+    //     the game; wait until it's near game-time so the pre-game freeze is minimal (monitoring is
+    //     free; capital only freezes on entry). All SPORTS; weather/econ exempt. `days_to_game` is
+    //     None until stage-2 computes it -> dormant. (sports_max_days_to_game <= 0 disables it.)
+    if cfg.sports_max_days_to_game > 0.0
+        && q.cat == Cat::Sports
+        && q.days_to_game.map_or(false, |d| d > cfg.sports_max_days_to_game)
+    {
+        return Err(Reject::TooEarly);
     }
 
     // 2. per-venue book sanity (L12 crossed, L13 stale)
@@ -198,6 +215,8 @@ mod tests {
             fat_edge_knee_cents: 6.0,
             fat_edge_size_factor: 0.5,
             skip_dear_led_weather: true,
+            assume_sports_settled: false,
+            sports_max_days_to_game: 2.0,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             kill_switch: false,
@@ -212,7 +231,8 @@ mod tests {
             depth: Depth { c2: 50, c1: 60, c0: 70 },
             settle_clean: true,
             cluster: "nychigh-2026-06-11".into(),
-            led_by: None, // unknown until stage-2 tracks the prior book snapshot
+            led_by: None,       // unknown until stage-2 tracks the prior book snapshot
+            days_to_game: None, // N/A for weather
         }
     }
     fn edge() -> Edge {
@@ -302,6 +322,44 @@ mod tests {
         w.pm = Book { yes_bid: Some(0.66), yes_ask: Some(0.69), age_s: 0.1 };
         w.k = Book { yes_bid: Some(0.85), yes_ask: Some(0.86), age_s: 0.0 };
         assert!(evaluate(&cfg(), &w, &edge(), &Exposure::new(), 1000).is_ok());
+    }
+
+    fn sports_quote(days_to_game: Option<f64>) -> Quote {
+        let mut q = quote();
+        q.market = "aec-mlb-lad-pit-2026-06-14".into();
+        q.cat = Cat::Sports;
+        q.cluster = "mlb-lad-pit-2026-06-14".into();
+        q.settle_clean = false; // not yet reconciled
+        q.days_to_game = days_to_game;
+        q
+    }
+
+    #[test]
+    fn sports_gated_until_settled_then_game_proximity_applies() {
+        let e = Edge { net: 0.03, dir: Dir::PK };
+        // default: sports settlement unverified -> rejected regardless of timing
+        assert_eq!(
+            evaluate(&cfg(), &sports_quote(Some(1.0)), &e, &Exposure::new(), 1000),
+            Err(Reject::SettlementUnverified)
+        );
+        // owner asserts sports reconciled -> now the game-proximity gate governs
+        let mut c = cfg();
+        c.assume_sports_settled = true;
+        c.sports_max_days_to_game = 2.0;
+        // 5 days before the game -> TOO EARLY (would freeze capital pre-game)
+        assert_eq!(
+            evaluate(&c, &sports_quote(Some(5.0)), &e, &Exposure::new(), 1000),
+            Err(Reject::TooEarly)
+        );
+        // 1 day before -> within the window -> approved
+        assert!(evaluate(&c, &sports_quote(Some(1.0)), &e, &Exposure::new(), 1000).is_ok());
+        // unknown game time (None) -> gate dormant, keeps it (stage-2 will populate days_to_game)
+        assert!(evaluate(&c, &sports_quote(None), &e, &Exposure::new(), 1000).is_ok());
+        // gate disabled (<=0) -> a 5-day-early sports arb is allowed
+        c.sports_max_days_to_game = 0.0;
+        assert!(evaluate(&c, &sports_quote(Some(5.0)), &e, &Exposure::new(), 1000).is_ok());
+        // weather is NEVER subject to the game-proximity gate (no days_to_game)
+        assert!(evaluate(&cfg(), &quote(), &e, &Exposure::new(), 1000).is_ok());
     }
 
     #[test]
