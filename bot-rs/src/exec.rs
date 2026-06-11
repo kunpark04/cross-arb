@@ -25,8 +25,27 @@ pub enum ExecError {
     RateLimited,
 }
 
+/// Result of firing a hedged PAIR — one ack per leg. A one-legged result is the naked-leg risk the
+/// (stage-2) unwind logic must handle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairAck {
+    pub a: Result<Ack, ExecError>,
+    pub b: Result<Ack, ExecError>,
+}
+impl PairAck {
+    pub fn both_filled(&self) -> bool {
+        self.a.is_ok() && self.b.is_ok()
+    }
+}
+
 pub trait ExecutionBackend {
-    fn submit(&mut self, intent: &OrderIntent) -> Result<Ack, ExecError>;
+    /// Fire BOTH legs of a hedged pair. The unit of execution is the PAIR — callers must NEVER
+    /// serialize the legs: serial legging ~doubles effective latency (measured serial floor p50 148 ms
+    /// vs ~86 ms concurrent). The LIVE backend fires them CONCURRENTLY over two warm, pre-authed
+    /// connections (stage-2, `tokio::join!`); the dry-run backend logs both. This pair-shaped signature
+    /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
+    /// highest-leverage latency item from the rust review, and the only latency lever the code controls.
+    fn submit_pair(&mut self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
     fn cancel(&mut self, client_order_id: &str) -> Result<(), ExecError>;
     fn label(&self) -> &'static str;
 }
@@ -34,8 +53,8 @@ pub trait ExecutionBackend {
 /// DEFAULT backend. Logs the intent, returns a simulated ack. NEVER sends.
 pub struct DryRunBackend;
 
-impl ExecutionBackend for DryRunBackend {
-    fn submit(&mut self, intent: &OrderIntent) -> Result<Ack, ExecError> {
+impl DryRunBackend {
+    fn log_leg(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
         println!(
             "[DRY-RUN] would submit: {:?} {:?} {}x @ {}c  market={}  coid={}",
             intent.venue, intent.side, intent.qty, intent.price_cents, intent.market, intent.client_order_id
@@ -45,6 +64,16 @@ impl ExecutionBackend for DryRunBackend {
             venue_order_id: "SIMULATED".into(),
             simulated: true,
         })
+    }
+}
+
+impl ExecutionBackend for DryRunBackend {
+    fn submit_pair(&mut self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
+        // both legs logged together — mirrors the concurrent live fire.
+        PairAck {
+            a: self.log_leg(a),
+            b: self.log_leg(b),
+        }
     }
     fn cancel(&mut self, _client_order_id: &str) -> Result<(), ExecError> {
         Ok(())
@@ -92,13 +121,18 @@ impl LiveBackend {
 }
 
 impl ExecutionBackend for LiveBackend {
-    fn submit(&mut self, intent: &OrderIntent) -> Result<Ack, ExecError> {
-        let _payload = self.build_kalshi_payload(intent);
-        // STAGE 2 (owner env): RSA-PSS sign "{ts}POST{path}{body}" with the read-write key at
-        // `kalshi_key_path`, HTTPS POST `_payload` to `{kalshi_base()}/portfolio/orders`, parse the
-        // ack. pmus uses the Ed25519 signing scheme + its own order endpoint. Claude's sandbox blocks
-        // real submission, so this is intentionally not executed here.
-        Err(ExecError::TransportNotWired)
+    fn submit_pair(&mut self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
+        let _payload_a = self.build_kalshi_payload(a);
+        let _payload_b = self.build_kalshi_payload(b);
+        // STAGE 2 (owner env): fire BOTH legs CONCURRENTLY — `tokio::join!(post(a), post(b))` — each
+        // RSA-PSS (Kalshi) / Ed25519 (pmus) signed over its own warm, pre-authed connection, returning
+        // when both ack. This concurrency is the one latency lever the code owns (serial 148 ms ->
+        // concurrent ~86 ms p50). Claude's sandbox blocks real submission, so both legs return
+        // TransportNotWired here by design.
+        PairAck {
+            a: Err(ExecError::TransportNotWired),
+            b: Err(ExecError::TransportNotWired),
+        }
     }
     fn cancel(&mut self, _client_order_id: &str) -> Result<(), ExecError> {
         Err(ExecError::TransportNotWired)
@@ -116,18 +150,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dry_run_never_errors_and_simulates() {
-        let mut b = DryRunBackend;
-        let intent = OrderIntent {
+    fn dry_run_fires_both_legs_simulated() {
+        let mut bk = DryRunBackend;
+        let a = OrderIntent {
             venue: Venue::Kalshi,
             market: "KXHIGHNY-26JUN11-T95".into(),
             side: Side::Yes,
             price_cents: 8,
             qty: 1,
-            client_order_id: "abc".into(),
+            client_order_id: "leg-a".into(),
         };
-        let ack = b.submit(&intent).unwrap();
-        assert!(ack.simulated);
+        let b = OrderIntent {
+            venue: Venue::Pmus,
+            market: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+            side: Side::No,
+            price_cents: 90,
+            qty: 1,
+            client_order_id: "leg-b".into(),
+        };
+        let r = bk.submit_pair(&a, &b);
+        assert!(r.both_filled() && r.a.unwrap().simulated);
     }
 
     #[test]
@@ -145,11 +187,14 @@ mod tests {
             max_concurrent_positions: 5,
             max_book_age_s: 5.0,
             mid_divergence_reject_cents: 40.0,
+            econ_twin_max_divergence_cents: 15.0,
+            fat_edge_knee_cents: 6.0,
+            fat_edge_size_factor: 0.5,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             kill_switch: false,
         };
-        let mut b = LiveBackend::new(&cfg);
+        let mut bk = LiveBackend::new(&cfg);
         let intent = OrderIntent {
             venue: Venue::Kalshi,
             market: "KXHIGHNY-26JUN11-T95".into(),
@@ -158,9 +203,11 @@ mod tests {
             qty: 1,
             client_order_id: "coid-1".into(),
         };
-        let body = b.build_kalshi_payload(&intent);
+        let body = bk.build_kalshi_payload(&intent);
         assert!(body.contains("\"side\":\"no\"") && body.contains("\"count\":1"));
-        assert!(b.kalshi_base().contains("demo")); // sandbox default
-        assert_eq!(b.submit(&intent), Err(ExecError::TransportNotWired)); // never sends here
+        assert!(bk.kalshi_base().contains("demo")); // sandbox default
+        let r = bk.submit_pair(&intent, &intent);
+        assert_eq!(r.a, Err(ExecError::TransportNotWired)); // never sends here
+        assert!(!r.both_filled());
     }
 }

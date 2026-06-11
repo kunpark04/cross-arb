@@ -56,13 +56,16 @@ impl Pnl {
         yes_fee_cents: u32,
         no_fee_cents: u32,
     ) -> f64 {
-        // outcome-independence check: whichever side wins, payout is $1/pair, cost is fixed.
-        let win_yes = 1.0 - cost_yes - cost_no;
-        let win_no = 1.0 - cost_no - cost_yes;
-        debug_assert!((win_yes - win_no).abs() < 1e-12, "hedge is not outcome-independent");
-
+        // Input sanity (the old `win_yes == win_no` assert was a tautology — both expressions are
+        // algebraically identical, so it could never fire; rust code review caught it). The real guard
+        // is that each leg cost is a valid probability; gross is then outcome-independent BY
+        // CONSTRUCTION (exactly one leg pays $1, total cost is fixed).
+        debug_assert!(
+            (0.0..=1.0).contains(&cost_yes) && (0.0..=1.0).contains(&cost_no),
+            "leg costs must be valid prices in [0,1]"
+        );
         let n = size as f64;
-        let gross = win_yes * n;
+        let gross = (1.0 - cost_yes - cost_no) * n;
         let fees = (yes_fee_cents + no_fee_cents) as f64 / 100.0;
         self.pairs += 1;
         self.gross += gross;

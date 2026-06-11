@@ -33,7 +33,10 @@ pub struct Config {
 
     // --- execution-time guards (the learned edge cases) ---
     pub max_book_age_s: f64,              // L13 staleness
-    pub mid_divergence_reject_cents: f64, // L1 bad-join / stale guard
+    pub mid_divergence_reject_cents: f64, // L1 bad-join / stale guard (cross-category)
+    pub econ_twin_max_divergence_cents: f64, // TIGHTER bound for settlement-identical econ twins
+    pub fat_edge_knee_cents: f64,         // edges above this are adversely-selected (~66% toxic, die ~0.5s)
+    pub fat_edge_size_factor: f64,        // size multiplier above the knee (1.0 = OFF, to test speed-capture)
     pub leg_fill_timeout_ms: u64,         // unwind leg A if leg B isn't filled in time
     pub require_settle_clean: bool,       // only trade settlement-verified pairs (econ/sports)
 
@@ -63,6 +66,9 @@ impl Config {
 
             max_book_age_s: env_f64("MAX_BOOK_AGE_S", 5.0),
             mid_divergence_reject_cents: env_f64("MID_DIVERGENCE_REJECT_CENTS", 40.0),
+            econ_twin_max_divergence_cents: env_f64("ECON_TWIN_MAX_DIVERGENCE_CENTS", 15.0),
+            fat_edge_knee_cents: env_f64("FAT_EDGE_KNEE_CENTS", 6.0),
+            fat_edge_size_factor: env_f64("FAT_EDGE_SIZE_FACTOR", 0.5),
             leg_fill_timeout_ms: env_u64("LEG_FILL_TIMEOUT_MS", 500),
             require_settle_clean: env_bool("REQUIRE_SETTLE_CLEAN", true),
 

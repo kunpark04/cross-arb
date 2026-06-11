@@ -85,11 +85,19 @@ pub fn evaluate(
         return Err(Reject::StaleBook(Venue::Pmus));
     }
 
-    // 3. cross-venue mid-divergence (L1): two settlement-identical legs should price close;
-    //    a huge gap is almost always a bad join or a stale quote, not free money.
+    // 3. cross-venue mid-divergence (L1): two settlement-identical legs should price close; a huge
+    //    gap is usually a bad join or a stale quote. Econ TWINS are *exactly* settlement-identical, so
+    //    they get a TIGHTER bound than the cross-category default — the 18¢ U-3 phantom sailed through
+    //    the 40¢ guard (audit + both rust-reviews). A divergence past the bound on a thin/pre-release
+    //    book is the stale/informed-book risk, not free money. (settle_clean still gates econ upstream.)
     if let (Some(km), Some(pm)) = (q.k.mid(), q.pm.mid()) {
         let dd_cents = (km - pm).abs() * 100.0;
-        if dd_cents > cfg.mid_divergence_reject_cents {
+        let ceiling = if q.cat == Cat::Econ {
+            cfg.econ_twin_max_divergence_cents
+        } else {
+            cfg.mid_divergence_reject_cents
+        };
+        if dd_cents > ceiling {
             return Err(Reject::MidDivergence(dd_cents));
         }
     }
@@ -135,6 +143,16 @@ pub fn evaluate(
     }
     size = size.min(pair_cap).min(clus_cap).min(tot_cap);
 
+    // FAT-EDGE TOXICITY (rust trading review GAP-1 / readiness audit): edges past the knee are
+    // adversely-selected (~66% toxic, die ~0.5s), so a bigger gap is NOT strictly better — size it
+    // DOWN (but never to 0: L15 says toxic = small size, not skip; some fat edges are benign line-lag
+    // and worth a probe). The stage-2 toxicity-DIRECTION gate (which venue led) replaces this blunt
+    // haircut with a real benign-vs-informed decision. FAT_EDGE_SIZE_FACTOR=1.0 disables it — set it
+    // to test whether a sub-0.5s concurrent two-leg fire can actually capture fat edges.
+    if edge.net * 100.0 >= cfg.fat_edge_knee_cents && cfg.fat_edge_size_factor < 1.0 {
+        size = ((size as f64) * cfg.fat_edge_size_factor).floor().max(1.0) as u32;
+    }
+
     if size < 1 {
         return Err(Reject::NoFillableSize); // a thin book is SMALL size, not no-trade (L15)
     }
@@ -164,6 +182,9 @@ mod tests {
             max_concurrent_positions: 5,
             max_book_age_s: 5.0,
             mid_divergence_reject_cents: 40.0,
+            econ_twin_max_divergence_cents: 15.0,
+            fat_edge_knee_cents: 6.0,
+            fat_edge_size_factor: 0.5,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             kill_switch: false,
@@ -247,5 +268,41 @@ mod tests {
         c.max_contracts_per_pair = 1; // staged-rollout default
         let r = evaluate(&c, &quote(), &edge(), &Exposure::new(), 1000).unwrap();
         assert_eq!(r.size, 1);
+    }
+
+    #[test]
+    fn econ_twin_gets_a_tighter_divergence_bound() {
+        // an 18c econ twin-mid divergence (the U-3 phantom) is REJECTED at the 15c econ bound,
+        // even though it would pass the 40c cross-category guard. settle_clean=true isolates the test.
+        let mut q = quote();
+        q.cat = Cat::Econ;
+        q.settle_clean = true;
+        q.pm = Book { yes_bid: Some(0.66), yes_ask: Some(0.69), age_s: 0.1 }; // mid 0.675
+        q.k = Book { yes_bid: Some(0.85), yes_ask: Some(0.86), age_s: 0.0 }; // mid 0.855 -> 18c apart
+        match evaluate(&cfg(), &q, &edge(), &Exposure::new(), 1000) {
+            Err(Reject::MidDivergence(d)) => assert!(d > 15.0),
+            other => panic!("expected MidDivergence, got {:?}", other),
+        }
+        // the same 18c gap on a WEATHER pair passes (cross-category bound is 40c)
+        let mut w = quote();
+        w.pm = Book { yes_bid: Some(0.66), yes_ask: Some(0.69), age_s: 0.1 };
+        w.k = Book { yes_bid: Some(0.85), yes_ask: Some(0.86), age_s: 0.0 };
+        assert!(evaluate(&cfg(), &w, &edge(), &Exposure::new(), 1000).is_ok());
+    }
+
+    #[test]
+    fn fat_edge_is_sized_down_but_not_skipped() {
+        let mut c = cfg();
+        c.max_contracts_per_pair = 100;
+        c.fat_edge_size_factor = 0.5;
+        // thin edge (3c, below the 6c knee): full size up to depth (50)
+        let thin = evaluate(&c, &quote(), &Edge { net: 0.03, dir: Dir::PK }, &Exposure::new(), 1000).unwrap();
+        // fat edge (10c, above the knee): same depth, but sized DOWN by the factor
+        let fat = evaluate(&c, &quote(), &Edge { net: 0.10, dir: Dir::PK }, &Exposure::new(), 1000).unwrap();
+        assert!(fat.size < thin.size && fat.size >= 1, "fat={} thin={}", fat.size, thin.size);
+        // factor=1.0 disables the haircut (speed-capture test mode)
+        c.fat_edge_size_factor = 1.0;
+        let chase = evaluate(&c, &quote(), &Edge { net: 0.10, dir: Dir::PK }, &Exposure::new(), 1000).unwrap();
+        assert_eq!(chase.size, thin.size);
     }
 }

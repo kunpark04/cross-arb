@@ -111,15 +111,22 @@ fn report(cfg: &Config, q: &Quote, edge: Edge, buy_price_cents: u8, backend: &mu
     match evaluate(cfg, q, &edge, &Exposure::new(), 1000) {
         Ok(a) => {
             println!("  APPROVED size={}  (edge {:.1}c, dir {:?})", a.size, edge.net * 100.0, edge.dir);
-            let intent = OrderIntent {
-                venue: Venue::Pmus,
-                market: q.market.clone(),
-                side: Side::Yes,
-                price_cents: buy_price_cents,
-                qty: a.size,
-                client_order_id: format!("smoke-{}", q.market),
+            // fire BOTH legs of the hedge as a PAIR: buy YES on the cheap venue, buy NO on the dear one.
+            let (yes_venue, no_venue) = match edge.dir {
+                Dir::PK => (Venue::Pmus, Venue::Kalshi),
+                Dir::KP => (Venue::Kalshi, Venue::Pmus),
             };
-            let _ = backend.submit(&intent);
+            let leg_yes = OrderIntent {
+                venue: yes_venue, market: q.market.clone(), side: Side::Yes,
+                price_cents: buy_price_cents, qty: a.size,
+                client_order_id: format!("smoke-{}-Y", q.market),
+            };
+            let leg_no = OrderIntent {
+                venue: no_venue, market: q.market.clone(), side: Side::No,
+                price_cents: 100u8.saturating_sub(buy_price_cents).max(1), qty: a.size,
+                client_order_id: format!("smoke-{}-N", q.market),
+            };
+            let _ = backend.submit_pair(&leg_yes, &leg_no);
         }
         Err(r) => println!("  REJECTED: {:?}", r),
     }
