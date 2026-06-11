@@ -367,3 +367,24 @@ never the bytes). To inspect a key file's *shape*, print line COUNT and field NA
 any value. If a secret is ever exposed: **say so immediately and unmistakably, and recommend rotation** —
 don't bury it or assume a slice was safely partial (base64 padding makes "partial" recoverable). Reading
 `.pem`/secret files with `ls` (sizes) is fine; `cat`/`head`/`grep`-context on them is not.
+
+## L26 — Verify the resulting STATE of a real-money action, never a response field; and learn the venue's order semantics before placing
+
+A "BUY_SHORT (buy NO) @ 1¢" probe on pmus, which I treated as a far-from-market resting order, **actually
+filled and opened a live short** — and I then told the owner the account was clean. Two compounding errors:
+(1) **pmus reports fills ASYNCHRONOUSLY** — the create response returned `"executions":[]` even though the
+order filled (the fill only appeared in `/portfolio/positions`), so I read `[]` as "no fill"; (2) **pmus
+runs `BUY_SHORT`/`SELL_SHORT` as a SELL/BUY of YES, priced in YES terms** — so "buy NO at 1¢" became "sell
+YES at 1¢", marketable against the ~54¢ YES bid, filled instantly. My `cancel` then hit an already-filled
+order (a no-op). The owner had to tell me twice it wasn't their bet before I traced the order id
+(`side=ORDER_SIDE_SELL, cumQuantity=1`) and admitted it was mine.
+
+**Rule:** after ANY outward-facing/stateful action (especially a real-money order), confirm the **resulting
+STATE** (positions / balance / the object itself), NOT the immediate response field — an ack/`executions:[]`
+/ a 200 cancel is not proof of the end state when fills are async. And before placing any order on a venue,
+**know its order model**: which internal side a directional intent maps to, and what the `price` field
+denominates — do NOT assume YES/NO symmetry. This was also a code bug: `exec.rs` priced NO legs with the NO
+price; pmus (and Kalshi) want the side-matching field (`1 − NO` in YES terms for pmus; `no_price` for
+Kalshi). Live-testing on REAL money is where these surface — size every such probe so a *wrong* assumption
+(unexpected fill, wrong side) is bounded to near-zero, and treat "it rested / I cancelled it" as a hypothesis
+to verify against positions, not a fact.

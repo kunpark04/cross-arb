@@ -192,35 +192,52 @@ impl LiveBackend {
             Action::Buy => "buy",
             Action::Sell => "sell", // an unwind closes the leg we hold
         };
-        serde_json::json!({
+        // Kalshi's CreateOrder takes `yes_price` OR `no_price` (cents) — the field MATCHING the order side.
+        // `build_legs` hands a NO leg the NO price, so a `side:no` order must use `no_price` (sending
+        // `yes_price` on a no-order is the same class of bug the pmus NO leg had — caught live). ⚠️ Only the
+        // YES path is live-verified (a 2026-06-11 placed/cancelled YES order); the `no_price` mapping is the
+        // documented parallel but NOT YET live-verified — confirm with a far-from-market NO order before relying.
+        let price_key = match intent.side {
+            Side::Yes => "yes_price",
+            Side::No => "no_price",
+        };
+        let mut body = serde_json::json!({
             "action": action,
             "side": side,
             "ticker": intent.market,
             "count": intent.qty,
             "type": "limit",
-            "yes_price": intent.price_cents,
             "client_order_id": intent.client_order_id,
-        })
-        .to_string()
+        });
+        body[price_key] = serde_json::json!(intent.price_cents);
+        body.to_string()
     }
 
-    /// Build a pmus CreateOrder body — the VERIFIED shape for `POST /v1/orders`
-    /// (docs.polymarket.us/api-reference/orders/create-order). LIVE-VERIFIED against the real venue
-    /// 2026-06-11: a 1¢ `BUY_LONG` and a 1¢ `BUY_SHORT` each placed (`[200] {"id":..}`) + cancelled.
-    /// (The prior `{slug,action,side,size,price}` @ `/v1/portfolio/orders` was a guess and 404'd.)
+    /// Build a pmus CreateOrder body for `POST /v1/orders`.
     /// `(action, side)` maps to the `OrderIntent` enum on the SAME `marketSlug`: Buy-YES=`BUY_LONG`,
-    /// Buy-NO=`BUY_SHORT` (both live-verified — the bot's two ENTRY directions); Sell-YES=`SELL_LONG`,
-    /// Sell-NO=`SELL_SHORT` (doc-derived, used only by the unwind path — verify before relying on them).
+    /// Buy-NO=`BUY_SHORT`, Sell-YES=`SELL_LONG`, Sell-NO=`SELL_SHORT`.
+    ///
+    /// ⚠️ PRICE IS ALWAYS IN **YES** TERMS — the critical thing live-testing caught (2026-06-11): pmus
+    /// runs `BUY_SHORT`/`SELL_SHORT` as a SELL/BUY of YES under the hood (`order.side = ORDER_SIDE_SELL`
+    /// for a `BUY_SHORT`), and the `price` is the YES price. A probe "buy NO @ 1¢" was executed as a
+    /// marketable "sell YES @ 1¢", filled at the ~54¢ YES bid, and opened an unintended short. So a NO
+    /// leg's price must be the YES-EQUIVALENT = `1 − (NO price)`; sending the raw NO price fills at the
+    /// wrong price/side. `build_legs` hands a NO leg the NO price (1 − book YES bid), so convert here.
     /// Built with `serde_json` (never `format!`) so a `"`/`\` in the venue slug/coid is escaped, not spliced.
     pub fn build_pmus_payload(&self, intent: &OrderIntent) -> String {
         let order_intent = match (intent.action, intent.side) {
-            (Action::Buy, Side::Yes) => "ORDER_INTENT_BUY_LONG",   // live-verified
-            (Action::Buy, Side::No) => "ORDER_INTENT_BUY_SHORT",   // live-verified
-            (Action::Sell, Side::Yes) => "ORDER_INTENT_SELL_LONG", // doc-derived (unwind only)
-            (Action::Sell, Side::No) => "ORDER_INTENT_SELL_SHORT", // doc-derived (unwind only)
+            (Action::Buy, Side::Yes) => "ORDER_INTENT_BUY_LONG",
+            (Action::Buy, Side::No) => "ORDER_INTENT_BUY_SHORT",
+            (Action::Sell, Side::Yes) => "ORDER_INTENT_SELL_LONG",
+            (Action::Sell, Side::No) => "ORDER_INTENT_SELL_SHORT",
         };
-        // price is a 2dp dollar STRING inside the {value,currency} Amount object; quantity a bare number.
-        let value = format!("{:.2}", (intent.price_cents as f64) / 100.0);
+        // YES-denominated price: a YES leg's price_cents is already YES; a NO leg's price_cents is the NO
+        // price, whose YES equivalent is 100 − price_cents. (Tick is 0.001; cent granularity is within it.)
+        let yes_cents = match intent.side {
+            Side::Yes => intent.price_cents,
+            Side::No => 100u8.saturating_sub(intent.price_cents),
+        };
+        let value = format!("{:.2}", (yes_cents as f64) / 100.0);
         serde_json::json!({
             "marketSlug": intent.market,
             "intent": order_intent,
@@ -430,6 +447,8 @@ mod tests {
         };
         let body = bk.build_kalshi_payload(&intent);
         assert!(body.contains("\"action\":\"buy\"") && body.contains("\"side\":\"no\"") && body.contains("\"count\":1"));
+        // a NO leg prices via `no_price` (its own side), NOT `yes_price` — the pmus-class side-pricing fix.
+        assert!(body.contains("\"no_price\":14") && !body.contains("yes_price"), "NO leg must use no_price: {body}");
         assert!(bk.kalshi_base().contains("demo")); // sandbox default
         // no signing keys loaded in the sandbox (KALSHI_RW_KEY_PATH empty) -> both legs refuse to send.
         let r = bk.submit_pair(&intent, &intent);
@@ -483,13 +502,21 @@ mod tests {
         assert_eq!(v["intent"], "ORDER_INTENT_BUY_LONG"); // Buy+Yes
         assert_eq!(v["type"], "ORDER_TYPE_LIMIT");
         assert_eq!(v["quantity"], 2);
-        assert_eq!(v["price"]["value"], "0.07");
+        assert_eq!(v["price"]["value"], "0.07"); // YES leg: price is the YES price as-is
         assert_eq!(v["price"]["currency"], "USD");
-        // Buy+No maps to BUY_SHORT (the other live-verified ENTRY direction); Sell maps to the SELL_* intents.
+        // Buy+No -> BUY_SHORT, and CRITICALLY the price is the YES-EQUIVALENT (1 - NO price): a NO leg with
+        // price_cents=7 (buy NO at 7c) must send YES price 0.93, NOT 0.07. Sending 0.07 was the bug that
+        // executed as a marketable sell-YES @ 7c and opened an unintended short live (2026-06-11).
         let no = OrderIntent { side: Side::No, ..intent.clone() };
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&bk.build_pmus_payload(&no)).unwrap()["intent"], "ORDER_INTENT_BUY_SHORT");
+        let nv: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&no)).unwrap();
+        assert_eq!(nv["intent"], "ORDER_INTENT_BUY_SHORT");
+        assert_eq!(nv["price"]["value"], "0.93"); // 1 - 0.07 (YES-denominated) — the fix
         let sell = OrderIntent { action: Action::Sell, side: Side::Yes, ..intent.clone() };
         assert_eq!(serde_json::from_str::<serde_json::Value>(&bk.build_pmus_payload(&sell)).unwrap()["intent"], "ORDER_INTENT_SELL_LONG");
+        // Sell+No (SELL_SHORT) is also YES-denominated: a NO sell at price_cents=7 -> YES 0.93.
+        let sn = OrderIntent { action: Action::Sell, side: Side::No, ..intent.clone() };
+        let snv: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&sn)).unwrap();
+        assert_eq!((snv["intent"].as_str(), snv["price"]["value"].as_str()), (Some("ORDER_INTENT_SELL_SHORT"), Some("0.93")));
     }
 
     /// CRITICAL C2 regression: a venue-supplied `market`/`coid` containing a `"` (or `\`) must NOT malform
