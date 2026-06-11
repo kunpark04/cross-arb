@@ -6,10 +6,11 @@ of least resistance, because the readiness audit + backtest concluded the edge i
 ([deployment-readiness](../research/deployment-readiness-2026-06-11.md) ·
 [backtest](../research/backtest-2026-06-11.md)).
 
-> **Live order submission runs in the OWNER's environment, with the OWNER's read-write key.** Claude's
-> sandbox blocks real-money order submission (it blocked a read-only balance check this session), so
-> Claude builds + dry-run-tests only. This is also good practice: trade execution should never be gated
-> behind a sandbox.
+> **Live order submission is a deliberate OWNER action.** Correction (2026-06-11): the environment does
+> **NOT** block venue I/O — live verification reached both venues with auth (Kalshi demo+prod signed reads;
+> a 1¢ pmus `BUY_LONG`/`BUY_SHORT` placed+cancelled on the real venue). So the guardrail is the **code's
+> safe-by-default** (dry-run default, prod-consent, the pmus gate), not a sandbox wall — which is the right
+> place for it: execution should never be gated behind an external block that might not be there.
 
 ## Safety model (defaults)
 
@@ -109,11 +110,17 @@ the concurrency core, the gates, and the transport — see `tasks/_agent_bus/202
   both legs at book-derived exits before Kalshi voids). **Reduce-only** (fires under the kill-switch; dry-run
   logs only; `CROSSARB_NO_AUTO_UNWIND=1` disables). The live statsapi poll is the owner/droplet step.
 
-**Remains — inherently the owner's environment (sandbox blocks auth'd venue I/O), or deferred features:**
-- **Demo-sandbox session** (owner): confirm WS sid-capture, `update_subscription` acceptance, the live
-  catalog HTTP shapes, and a clean dry→demo round-trip.
-- **pmus POST-body signing** (owner): the order POST signs `{ts}{METHOD}{path}` only — verify live whether
-  pmus folds the body into the canonical string (typed error until confirmed; never a silent guess).
+**Live auth VERIFIED (2026-06-11) — both venues, against the real endpoints:**
+- **Kalshi signing** ✅ (RSA-PSS demo read `[200]`) + **order path** ✅ (demo `POST /portfolio/orders` →
+  `[400] insufficient_balance`, i.e. signature + the exact `build_kalshi_payload` shape + endpoint all
+  accepted; a full rest+cancel just needs you to fund the demo account in the Kalshi demo UI).
+- **pmus full order lifecycle** ✅ — signing (body-less `{ts}POST{path}`, proven by a bad-vs-good-sig
+  control), **create** `POST /v1/orders` + **cancel** `POST /v1/order/{id}/cancel`, with a 1¢ `BUY_LONG`
+  **and** `BUY_SHORT` each placed + cancelled live. This **corrected a real bug** (`exec.rs` had the wrong
+  pmus endpoint+shape). Remaining: the `SELL_*` unwind intents are doc-derived (not live-placed).
+
+**Still remains (owner / deferred):**
+- **Funded demo round-trip** (owner): top up the Kalshi demo balance, then a clean place→rest→cancel.
 - **Sports postponement unwind — live `/teams` smoke** (owner): the trigger is BUILT + parity-verified
   (detection + tracking + firing); the one residual is a one-time live `statsapi /teams` check — the join
   matches the Kalshi-ticker team suffix to the `/teams` abbreviation, so a club whose two diverge is a MISSED

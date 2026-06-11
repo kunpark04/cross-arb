@@ -6,6 +6,39 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, latest+3) — LIVE auth verified on BOTH venues; pmus order endpoint corrected; a secret-leak incident (L25)
+
+Owner directed: stop deferring, verify what can be verified now. Outcome — the sandbox-can't-reach-venues
+assumption was **wrong**; both venues are reachable with auth, so the auth/signing layer (a real open
+unknown) is now **verified live**, and the testing surfaced + fixed a real pmus bug. Commits `6fd8dbf` (fix)
++ docs.
+
+- **⚠️ Security incident (L25):** a one-liner meant to *mask* values printed the pmus Ed25519 secret to the
+  terminal — a base64 `=` padding char defeated a `split('=')` mask, so the line "without `=`" branch never
+  ran. Surfaced immediately; **owner chose NOT to rotate** (accepts the risk, key retained). Rule added:
+  never route secret material through stdout at all (load file→env, print only a status / "wrote X").
+- **Sandbox framing corrected:** this environment CAN reach `demo-api.kalshi.co`, `api.elections.kalshi.com`,
+  and `api.polymarket.us` with auth. The repeated "Claude's sandbox blocks real-money submission" claim was
+  false; corrected in `exec.rs` + `bot-rs/README`. The guardrail is the **safe-by-default code** (dry-run
+  default, prod-consent, the pmus gate), not an external wall — which is the correct place for it.
+- **Kalshi (demo) VERIFIED:** RSA-PSS signed balance read `[200]`; a demo `POST /portfolio/orders` →
+  `[400] insufficient_balance` (NOT 401) — signature + the exact `build_kalshi_payload` shape + the orders
+  endpoint all accepted; a full rest+cancel just needs demo funds (a UI step). `build_kalshi_payload` is right.
+- **pmus VERIFIED end-to-end** (read-only signing + ≤1¢ probe orders, owner-authorised): a bad-sig-vs-good-sig
+  control proved pmus authenticates BEFORE routing and accepts the **body-less** `{ts}POST{path}` signature on
+  POSTs (the long-open POST-body question — settled, body NOT signed). Then the **real order lifecycle**: a 1¢
+  `BUY_LONG` and a 1¢ `BUY_SHORT` each **placed** (`POST /v1/orders` → `[200] {"id":..}`) and **cancelled**
+  (`POST /v1/order/{id}/cancel` → `[200] {}`). Net spend $0; nothing rested.
+- **Real bug fixed (`exec.rs`):** the pmus order path was a guess — `/v1/portfolio/orders` with
+  `{slug,action,side,size,price}` → **404**. Corrected to the verified `POST /v1/orders` +
+  `{marketSlug, intent, type, price:{value,currency}, quantity, tif}`; intent map Buy-YES=`BUY_LONG`,
+  Buy-NO=`BUY_SHORT` (live-verified entry dirs), Sell-*=`SELL_*` (doc-derived). 112 tests stay green.
+
+**Net:** auth/signing — a genuine blocker — is now retired on both venues, and a latent pmus order bug is fixed.
+Still gating live: a funded demo round-trip, the `SELL_*` intents, and the dominant gate — the **unvalidated edge**.
+
+---
+
 ## 2026-06-11 (UTC, latest+2) — `bot-rs`: full-engine adversarial review → 9 CRITICAL + ~17 WARN fixed (112 tests, clippy clean)
 
 Holistic adversarial review of the WHOLE live engine (5,735 lines / 14 modules) — the incremental builds
