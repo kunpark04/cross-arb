@@ -84,8 +84,8 @@ mod tests {
             market: "aec-mlb-lad-pit-2026-06-14".into(), // pair identity = the pmus slug
             cat: Cat::Sports,
             legs: [
-                PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-14".into(), side: Side::Yes },
-                PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN14-PIT".into(), side: Side::Yes },
+                PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-14".into(), side: Side::Yes, ..Default::default() },
+                PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN14-PIT".into(), side: Side::Yes, ..Default::default() },
             ],
             size: 10,
             cluster: "mlb-lad-pit-2026-06-14".into(),

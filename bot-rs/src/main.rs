@@ -668,7 +668,14 @@ fn apply_outcome(
         SubmitKind::Entry => {
             pending_entries.remove(&out.slug);
             if both {
-                if let (Some(pos), Some(pair)) = (out.position, out.pair) {
+                if let (Some(mut pos), Some(pair)) = (out.position, out.pair) {
+                    // persist each leg's exchange order id from its fill ack (positional: ack.a <-> legs[0],
+                    // ack.b <-> legs[1]) so a later cancel/unwind can reach the right venue endpoint (FIX 3).
+                    for (leg, ack) in pos.legs.iter_mut().zip([&out.ack.a, &out.ack.b]) {
+                        if let Ok(a) = ack {
+                            leg.venue_order_id = a.venue_order_id.clone();
+                        }
+                    }
                     track_position(positions, &pair, pos); // exposure stays RESERVED (keep it)
                 }
             } else {
@@ -694,14 +701,17 @@ fn apply_outcome(
     }
 }
 
-/// W14 FAIL-CLOSE: a non-both-filled outcome where exactly one leg actually filled AND the ack is LIVE (not
-/// a simulated dry-run ack) is a naked directional position — the catastrophic case the hedge exists to
-/// prevent. Log CRITICAL, ENGAGE the runtime halt (blocks all new entries), and keep the filled leg visible.
-/// Dry-run acks are simulated -> `both_filled` is always true there, so this never trips in dry-run.
+/// W14 FAIL-CLOSE: a non-both-filled outcome where exactly one leg actually FILLED LIVE (not a simulated
+/// dry-run ack) while the OTHER did not FILL is a naked directional position — the catastrophic case the
+/// hedge exists to prevent. Log CRITICAL, ENGAGE the runtime halt (blocks all new entries), keep the filled
+/// leg visible. "The other did not fill" includes an `Err` AND an `Ok`-but-resting (accepted, not filled)
+/// leg — a resting leg leaves the filled leg naked just as much as an errored one. Dry-run acks are
+/// simulated + filled -> `both_filled` is always true there, so this never trips in dry-run.
 fn naked_leg_failclose(slug: &str, kind: SubmitKind, ack: &exec::PairAck, halt: &std::sync::atomic::AtomicBool) {
-    let leg_live_filled = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Ok(a) if !a.simulated);
-    let a_naked = leg_live_filled(&ack.a) && ack.b.is_err();
-    let b_naked = leg_live_filled(&ack.b) && ack.a.is_err();
+    let leg_live_filled = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Ok(a) if a.filled && !a.simulated);
+    let leg_not_filled = |r: &Result<exec::Ack, exec::ExecError>| !matches!(r, Ok(a) if a.filled);
+    let a_naked = leg_live_filled(&ack.a) && leg_not_filled(&ack.b);
+    let b_naked = leg_live_filled(&ack.b) && leg_not_filled(&ack.a);
     if a_naked || b_naked {
         let filled = if a_naked { &ack.a } else { &ack.b };
         halt.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1142,6 +1152,7 @@ fn position_from_intents(slug: &str, cat: Cat, cluster: &str, legs: &[OrderInten
             venue: legs[i].venue,
             market: legs[i].market.clone(),
             side: legs[i].side,
+            venue_order_id: String::new(), // filled from the fill ack in `apply_outcome` before tracking
         }),
         size: legs[0].qty,
         cluster: cluster.to_string(),
@@ -1264,8 +1275,8 @@ fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
     let held = types::Position {
         market: "aec-mlb-lad-pit-2026-06-16".into(), cat: Cat::Sports,
         legs: [
-            types::PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), side: Side::Yes },
-            types::PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), side: Side::Yes },
+            types::PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), side: Side::Yes, ..Default::default() },
+            types::PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), side: Side::Yes, ..Default::default() },
         ],
         size: 10,
         cluster: "mlb-2026-06-16".into(),
@@ -1494,8 +1505,8 @@ mod tests {
         assert_eq!(pos.market, "aec-mlb-lad-pit-2026-06-16"); // pair identity = the pmus slug
         assert_eq!(pos.size, 7);
         assert_eq!(pos.cluster, "mlb-2026-06-16");
-        assert_eq!(pos.legs[0], PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), side: Side::Yes });
-        assert_eq!(pos.legs[1], PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), side: Side::Yes });
+        assert_eq!(pos.legs[0], PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), side: Side::Yes, ..Default::default() });
+        assert_eq!(pos.legs[1], PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), side: Side::Yes, ..Default::default() });
         // the unwind SELLs back the EXACT legs (venue/market/side), priced at the supplied exit cents.
         let u = unwind::unwind_orders(&pos, [98, 55]);
         assert_eq!((u[0].action, u[0].venue, u[0].side, u[0].market.as_str()), (Action::Sell, Venue::Pmus, Side::Yes, "aec-mlb-lad-pit-2026-06-16"));
@@ -1507,8 +1518,8 @@ mod tests {
     /// book) so `unwind_exit_cents` declines to price the pair and the caller holds.
     #[test]
     fn exit_pricing_yes_takes_bid_no_takes_one_minus_ask() {
-        let yes_leg = PositionLeg { venue: Venue::Pmus, market: "s".into(), side: Side::Yes };
-        let no_leg = PositionLeg { venue: Venue::Kalshi, market: "K".into(), side: Side::No };
+        let yes_leg = PositionLeg { venue: Venue::Pmus, market: "s".into(), side: Side::Yes, ..Default::default() };
+        let no_leg = PositionLeg { venue: Venue::Kalshi, market: "K".into(), side: Side::No, ..Default::default() };
         let book = Book { yes_bid: Some(0.98), yes_ask: Some(0.99), age_s: 0.0 };
         assert_eq!(exit_price(&yes_leg, &book), Some(0.98)); // SELL YES -> hit the YES bid
         assert_eq!(exit_price(&no_leg, &book), Some(1.0 - 0.99)); // SELL NO -> 1 - YES ask = 0.01
@@ -1637,10 +1648,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn sim_ack(coid: &str) -> Result<exec::Ack, exec::ExecError> {
-        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "SIMULATED".into(), simulated: true })
+        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "SIMULATED".into(), filled: true, simulated: true })
     }
     fn live_ack(coid: &str) -> Result<exec::Ack, exec::ExecError> {
-        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "v1".into(), simulated: false })
+        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "v1".into(), filled: true, simulated: false })
     }
     fn wx_entry_pair() -> (LivePair, Position, f64) {
         let pair = LivePair {
@@ -1749,5 +1760,59 @@ mod tests {
         assert!(!positions.lock().unwrap().contains_key(&slug), "position removed on flatten");
         assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "exposure decremented on flatten");
         assert!(!flat.contains(&slug), "flattening marker cleared");
+    }
+
+    /// FIX 3: a both-filled entry PERSISTS each leg's exchange order id (from its fill ack, positionally:
+    /// ack.a -> legs[0], ack.b -> legs[1]) onto the tracked position, so a later cancel/unwind can build a
+    /// `CancelTarget` and reach the right venue endpoint. Pre-fix the id was parsed then dropped.
+    #[test]
+    fn outcome_entry_persists_venue_order_ids_on_legs() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // both legs filled live with DISTINCT venue order ids.
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-ORD-1".into(), filled: true, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-ORD-2".into(), filled: true, simulated: false });
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        apply_outcome(&positions, &mut exp, &mut pending, &mut flat, &halt, out);
+        let hp = positions.lock().unwrap().get(&slug).cloned().expect("position recorded");
+        // leg 0 = pmus (PM-ORD-1), leg 1 = Kalshi (K-ORD-2) — ids persisted onto the held legs.
+        assert_eq!(hp.pos.legs[0].venue_order_id, "PM-ORD-1");
+        assert_eq!(hp.pos.legs[1].venue_order_id, "K-ORD-2");
+        assert!(!halt.load(Ordering::Relaxed), "a clean both-filled live entry does not halt");
+    }
+
+    /// FIX 1 end-to-end: an entry where one leg FILLED live and the other came back `Ok` but RESTING
+    /// (accepted, not filled) is NOT a hedge — `apply_outcome` must NOT record a position, must release the
+    /// reservation, and must engage the naked-leg halt (the resting leg leaves the filled leg directional).
+    /// This is the exact case the pre-fix `is_ok()`-only `both_filled` mis-recorded as a held hedge.
+    #[test]
+    fn outcome_entry_one_resting_leg_is_naked_not_a_hedge() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // leg A filled live; leg B ACCEPTED but resting (Ok, filled:false) -> not both-filled -> naked.
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "K-1".into(), filled: true, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "PM-2".into(), filled: false, simulated: false });
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        apply_outcome(&positions, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!(!positions.lock().unwrap().contains_key(&slug), "a one-resting-leg entry is NOT recorded as a hedge");
+        assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "reservation released");
+        assert!(halt.load(Ordering::Relaxed), "the filled leg is naked -> halt engaged");
+        assert!(!pending.contains(&slug));
     }
 }

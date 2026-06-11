@@ -25,6 +25,12 @@ use crate::types::*;
 pub struct Ack {
     pub client_order_id: String,
     pub venue_order_id: String,
+    /// TRUE iff the FULL requested qty actually FILLED — a 2xx create is acceptance, NOT a fill. Set by
+    /// parsing the venue body (`post_leg`): Kalshi reports fill synchronously (order `status`=executed +
+    /// fill count >= count); pmus needs `synchronousExecution` and reports fills/`executions[]`. A
+    /// resting/working/0-fill leg is `false` — it is NOT a completed hedge leg. Simulated (dry-run) acks
+    /// are `true` (treated as filled, unchanged).
+    pub filled: bool,
     pub simulated: bool,
 }
 
@@ -37,6 +43,16 @@ pub enum ExecError {
     RateLimited,
 }
 
+/// What `cancel` needs to reach the right venue endpoint for a resting order: the venue, its
+/// exchange-assigned order id (persisted from the ack), and — for pmus — the market slug its cancel body
+/// requires. Kalshi cancels by order id in the URL path; pmus needs `{marketSlug}` in the body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CancelTarget {
+    pub venue: Venue,
+    pub venue_order_id: String,
+    pub market: String, // pmus: the marketSlug (required in the cancel body); Kalshi: unused
+}
+
 /// Result of firing a hedged PAIR — one ack per leg. A one-legged result is the naked-leg risk the
 /// (stage-2) unwind logic must handle.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,8 +61,13 @@ pub struct PairAck {
     pub b: Result<Ack, ExecError>,
 }
 impl PairAck {
+    /// A COMPLETE hedge requires BOTH legs to be `Ok` AND actually FILLED — an accepted-but-resting
+    /// (working) leg is `Ok` yet `filled:false` and is NOT a hedge (one filled + one resting = a naked
+    /// directional position once the resting leg is cancelled / never fills). The old `is_ok()`-only
+    /// check treated an order-create 2xx as proof of fill — the core bug this fixes.
     pub fn both_filled(&self) -> bool {
-        self.a.is_ok() && self.b.is_ok()
+        let leg_filled = |r: &Result<Ack, ExecError>| matches!(r, Ok(a) if a.filled);
+        leg_filled(&self.a) && leg_filled(&self.b)
     }
 }
 
@@ -63,7 +84,10 @@ pub trait ExecutionBackend: Send + Sync {
     /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
     /// highest-leverage latency item from the rust review, and the only latency lever the code controls.
     fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
-    fn cancel(&self, client_order_id: &str) -> Result<(), ExecError>;
+    /// Cancel a resting order by its persisted venue order id (Kalshi `DELETE /portfolio/orders/{id}`;
+    /// pmus `POST /v1/order/{id}/cancel` with a `{marketSlug}` body). Needs the `CancelTarget` (venue + id
+    /// + slug) the ack persisted — a `client_order_id` alone can't reach either endpoint.
+    fn cancel(&self, target: &CancelTarget) -> Result<(), ExecError>;
     fn label(&self) -> &'static str;
 }
 
@@ -79,6 +103,7 @@ impl DryRunBackend {
         Ok(Ack {
             client_order_id: intent.client_order_id.clone(),
             venue_order_id: "SIMULATED".into(),
+            filled: true, // dry-run treats every simulated leg as filled (unchanged behaviour)
             simulated: true,
         })
     }
@@ -92,7 +117,8 @@ impl ExecutionBackend for DryRunBackend {
             b: self.log_leg(b),
         }
     }
-    fn cancel(&self, _client_order_id: &str) -> Result<(), ExecError> {
+    fn cancel(&self, target: &CancelTarget) -> Result<(), ExecError> {
+        println!("[DRY-RUN] would cancel: {:?} order_id={} market={}", target.venue, target.venue_order_id, target.market);
         Ok(())
     }
     fn label(&self) -> &'static str {
@@ -107,6 +133,9 @@ impl ExecutionBackend for DryRunBackend {
 pub struct LiveBackend {
     pub venue_env: VenueEnv,
     pub kalshi_key_path: String,
+    /// pmus `maxBlockTime` (seconds, min 1) for `synchronousExecution` — derived from `leg_fill_timeout_ms`
+    /// so the create call blocks until the order resolves and the response can report a real fill state.
+    pmus_max_block_s: u64,
     keys: Option<TransportKeys>,
     http: reqwest::Client,
 }
@@ -132,12 +161,102 @@ fn pmus_post_signing_verified() -> bool {
     )
 }
 
+/// Read a numeric JSON value that the venue may encode as a number OR a string (Kalshi returned
+/// `fill_count` as the STRING `"0.00"` live; pmus shares are strings). `None` if absent/unparseable.
+fn num_or_str(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Did the KALSHI order FILL the full requested `qty`? Kalshi reports fills SYNCHRONOUSLY in the create
+/// response (live-verified shape: `{"order":{"status":"resting","fill_count":"0.00",...}}`). FILLED iff the
+/// order `status` is an executed/filled terminal state (NOT `resting`/`canceled`/`pending`) AND the fill
+/// count >= `qty`. A `resting` (marketable-miss) order is acceptance only -> `false` (the live `[201] resting,
+/// fill_count 0` case the bot must NOT treat as a hedge leg). Conservative on an unrecognized body: not filled.
+fn kalshi_order_filled(v: &serde_json::Value, qty: u32) -> bool {
+    let order = v.get("order").unwrap_or(v); // tolerate both {order:{..}} and a flat {..}
+    let status = order
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let status_executed = matches!(status.as_str(), "executed" | "filled");
+    let fill_count = order
+        .get("fill_count")
+        .or_else(|| order.get("filled_count"))
+        .and_then(num_or_str)
+        .unwrap_or(0.0);
+    status_executed && fill_count >= qty as f64
+}
+
+/// Did the PMUS order FILL the full requested `qty`? With `synchronousExecution` (set in
+/// `build_pmus_payload`) the create blocks until the order resolves. A bare 2xx WITHOUT fill evidence is
+/// acceptance only ("accepted" != "filled"). FILLED iff the cumulative filled qty >= `qty`, read from
+/// whichever fill field the synchronous body carries: `cumQuantity`, or `quantity - remainingQty`, or the
+/// summed `executions[].{shares,lastShares,quantity}`, or a terminal `FILL` status. ANY of those proving a
+/// full fill -> true; otherwise (the documented `{orderId,intent,...}` accept-only body) -> false.
+///
+/// DOC NOTE (context7 /websites/polymarket_us, 2026-06-11): the *documented* single-create success body is
+/// `{orderId,intent,outcomeSide,action}` with NO inline `executions[]`; per-order fill/accept/reject events
+/// are authoritatively delivered on the ORDER STREAM (`orderSubscriptionUpdate.execution`, field
+/// `lastShares`; execution `type` FILL/PARTIAL_FILL). Treating absence-of-fill-evidence as `false` is the
+/// SAFE reading either way. TODO(stage-2): reconcile the authoritative fill via the order-stream/positions
+/// endpoint rather than the synchronous create body alone before scaling past 1 contract.
+fn pmus_order_filled(v: &serde_json::Value, qty: u32) -> bool {
+    let q = qty as f64;
+    // 1) explicit cumulative filled qty.
+    if let Some(cum) = v.get("cumQuantity").and_then(num_or_str) {
+        if cum >= q {
+            return true;
+        }
+    }
+    // 2) quantity - remainingQty (fully filled when nothing remains of the requested qty).
+    if let Some(rem) = v.get("remainingQty").and_then(num_or_str) {
+        let req = v.get("quantity").and_then(num_or_str).unwrap_or(q);
+        if rem <= 0.0 && req >= q {
+            return true;
+        }
+    }
+    // 3) sum the executions' shares (the task-named array; tolerate share-field aliases, string or number).
+    if let Some(execs) = v.get("executions").and_then(|e| e.as_array()) {
+        if !execs.is_empty() {
+            let total: f64 = execs
+                .iter()
+                .filter_map(|e| {
+                    e.get("shares")
+                        .or_else(|| e.get("lastShares"))
+                        .or_else(|| e.get("quantity"))
+                        .and_then(num_or_str)
+                })
+                .sum();
+            if total >= q {
+                return true;
+            }
+        }
+    }
+    // 4) a terminal FILL status string, if the body carries one.
+    let status = v
+        .get("orderStatus")
+        .or_else(|| v.get("status"))
+        .or_else(|| v.get("executionType"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    status.contains("FILL") && !status.contains("PARTIAL")
+}
+
 impl LiveBackend {
     pub fn new(cfg: &Config) -> Self {
         let keys = Self::load_keys(cfg); // None when env/keys absent -> live POST returns a typed error
         LiveBackend {
             venue_env: cfg.venue_env,
             kalshi_key_path: cfg.kalshi_key_path.clone(),
+            // ms -> whole seconds, floor, min 1s: a sub-second timeout would round to 0 and tell pmus not
+            // to block at all (defeating synchronousExecution); 1s is the documented minimum useful block.
+            pmus_max_block_s: (cfg.leg_fill_timeout_ms / 1000).max(1),
             keys,
             http: reqwest::Client::builder()
                 .use_rustls_tls()
@@ -178,8 +297,9 @@ impl LiveBackend {
         "https://api.polymarket.us"
     }
 
-    /// Build the venue-native CreateOrder body (real). A limit order; the venue dedupes on
-    /// `client_order_id` so a transport retry can't double-fire (idempotency). Built with `serde_json`
+    /// Build the Kalshi CreateOrder body (real). A limit order; Kalshi dedupes on `client_order_id` (a
+    /// REAL idempotency token — a transport retry can't double-fire this leg). (pmus has NO such token —
+    /// see `build_pmus_payload`.) Built with `serde_json`
     /// (never `format!`) so a `"`/`\`/control char in the venue-supplied `market`/`client_order_id` is
     /// escaped, not spliced raw into the body — a malformed/injected order would otherwise 400 (naked leg)
     /// or alter `count`/price. Numbers stay numbers (`json!` preserves the bare `count`/`yes_price`).
@@ -217,6 +337,16 @@ impl LiveBackend {
     /// `(action, side)` maps to the `OrderIntent` enum on the SAME `marketSlug`: Buy-YES=`BUY_LONG`,
     /// Buy-NO=`BUY_SHORT`, Sell-YES=`SELL_LONG`, Sell-NO=`SELL_SHORT`.
     ///
+    /// ⚠️ NO IDEMPOTENCY KEY — pmus's CreateOrder has no `clientOrderId` field (it is silently dropped),
+    /// and pmus order creation is NOT idempotent. So we DON'T send one (it would be dead weight that
+    /// falsely implies dedupe), and a pmus timeout/RateLimited is "unknown" — reconcile via
+    /// positions/open-orders before any resend, never blindly retry. (Kalshi's `client_order_id` IS real.)
+    ///
+    /// ⚠️ SYNCHRONOUS EXECUTION — `synchronousExecution:true` + `maxBlockTime` make the create BLOCK until
+    /// the order fills/rejects/cancels/expires, so `post_leg` can judge a real fill from the response
+    /// rather than treating bare acceptance as a fill (a 2xx without `synchronousExecution` returns only
+    /// `{id}` and the fill arrives later on the order stream — "accepted" != "filled").
+    ///
     /// ⚠️ PRICE IS ALWAYS IN **YES** TERMS — the critical thing live-testing caught (2026-06-11): pmus
     /// runs `BUY_SHORT`/`SELL_SHORT` as a SELL/BUY of YES under the hood (`order.side = ORDER_SIDE_SELL`
     /// for a `BUY_SHORT`), and the `price` is the YES price. A probe "buy NO @ 1¢" was executed as a
@@ -245,7 +375,10 @@ impl LiveBackend {
             "price": {"value": value, "currency": "USD"},
             "quantity": intent.qty,
             "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-            "clientOrderId": intent.client_order_id,
+            // block until the order resolves so the response carries a real fill state (no clientOrderId:
+            // pmus has no idempotency token — see the doc above). maxBlockTime is a STRING per the schema.
+            "synchronousExecution": true,
+            "maxBlockTime": self.pmus_max_block_s.to_string(),
         })
         .to_string()
     }
@@ -279,8 +412,8 @@ impl LiveBackend {
                         "pmus live leg gated — set PMUS_POST_SIGNING_VERIFIED=yes to arm (signing+endpoint verified 2026-06-11)".into(),
                     ));
                 }
-                // VERIFIED endpoint (was the guessed `/v1/portfolio/orders`, which 404'd). Cancel (stage-2
-                // wiring) is POST `/v1/order/{orderId}/cancel` with a `{marketSlug}` body (also verified).
+                // VERIFIED endpoint (was the guessed `/v1/portfolio/orders`, which 404'd). Cancel is POST
+                // `/v1/order/{orderId}/cancel` with a `{marketSlug}` body (also verified) — see `cancel_one`.
                 let path = "/v1/orders";
                 let h = crate::auth::pmus_headers(&keys.pmus_ed25519, &keys.pmus_access_key, ts, "POST", path);
                 (format!("{}{}", self.pmus_base(), path), self.build_pmus_payload(intent), h)
@@ -316,9 +449,18 @@ impl LiveBackend {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
+        // FILLED vs merely ACCEPTED: a 2xx create is acceptance, not a fill (the core real-money bug). Read
+        // the venue body for the FULL requested qty actually filling — Kalshi reports it synchronously; pmus
+        // only with `synchronousExecution` (set in build_pmus_payload). A non-fill (resting/0-exec) is NOT a
+        // hedge leg -> `filled:false` -> the loop routes it down the naked-leg path, never records a hedge.
+        let filled = match intent.venue {
+            Venue::Kalshi => kalshi_order_filled(&v, intent.qty),
+            Venue::Pmus => pmus_order_filled(&v, intent.qty),
+        };
         Ok(Ack {
             client_order_id: intent.client_order_id.clone(),
             venue_order_id,
+            filled,
             simulated: false,
         })
     }
@@ -343,6 +485,82 @@ impl LiveBackend {
             },
         }
     }
+
+    /// The cancel HTTP request line + body for `target` — PURE (no signing, no I/O) so it is unit-testable
+    /// without keys. Kalshi: `DELETE /trade-api/v2/portfolio/orders/{id}`, empty body. pmus: `POST
+    /// /v1/order/{id}/cancel` with a `{"marketSlug":..}` body (the marketSlug is REQUIRED by the schema and
+    /// escaped by `serde_json`). Returns the signing `path` too (Kalshi signs the id-in-path; pmus signs
+    /// POST+path, body-less, same scheme as create). Venue order ids are opaque tokens without `/`/`?`.
+    fn cancel_request(&self, target: &CancelTarget) -> (reqwest::Method, String, String, String) {
+        match target.venue {
+            Venue::Kalshi => {
+                let path = format!("{KALSHI_ORDERS_PATH}/{}", target.venue_order_id);
+                let url = format!("{}/portfolio/orders/{}", self.kalshi_base(), target.venue_order_id);
+                (reqwest::Method::DELETE, url, String::new(), path)
+            }
+            Venue::Pmus => {
+                let path = format!("/v1/order/{}/cancel", target.venue_order_id);
+                let url = format!("{}{}", self.pmus_base(), path);
+                let body = serde_json::json!({ "marketSlug": target.market }).to_string();
+                (reqwest::Method::POST, url, body, path)
+            }
+        }
+    }
+
+    /// Sign the cancel request for `target` -> (METHOD, url, body, headers). Wraps `cancel_request` with the
+    /// per-venue signature over `{ts}{METHOD}{path}` (RSA-PSS for Kalshi, Ed25519 for pmus).
+    fn build_cancel(&self, keys: &TransportKeys, target: &CancelTarget)
+        -> (reqwest::Method, String, String, [(&'static str, String); 3])
+    {
+        let ts = crate::auth::now_ms_for_sign();
+        let (method, url, body, path) = self.cancel_request(target);
+        let hdrs = match target.venue {
+            Venue::Kalshi => crate::auth::kalshi_headers(&keys.kalshi_rsa, &keys.kalshi_access_key, ts, method.as_str(), &path),
+            Venue::Pmus => crate::auth::pmus_headers(&keys.pmus_ed25519, &keys.pmus_access_key, ts, method.as_str(), &path),
+        };
+        (method, url, body, hdrs)
+    }
+
+    /// Send ONE signed cancel and map the status to a result (2xx => Ok). pmus's cancel response is empty
+    /// on success; Kalshi returns the canceled order — we only need the HTTP status either way.
+    async fn cancel_one(&self, target: &CancelTarget) -> Result<(), ExecError> {
+        let keys = self.keys.as_ref().ok_or(ExecError::KeysUnavailable)?;
+        if target.venue == Venue::Pmus && !pmus_post_signing_verified() {
+            return Err(ExecError::Rejected("pmus cancel gated — set PMUS_POST_SIGNING_VERIFIED=yes to arm".into()));
+        }
+        if target.venue_order_id.is_empty() {
+            return Err(ExecError::Rejected("cancel: no venue order id persisted for this leg".into()));
+        }
+        let (method, url, body, hdrs) = self.build_cancel(keys, target);
+        let mut req = self.http.request(method, &url).header("Content-Type", "application/json");
+        for (k, v) in hdrs {
+            req = req.header(k, v);
+        }
+        let resp = req.body(body).send().await.map_err(|e| {
+            if e.is_timeout() { ExecError::RateLimited } else { ExecError::Rejected(format!("transport: {e}")) }
+        })?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ExecError::RateLimited);
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ExecError::Rejected(format!("{} {}", status.as_u16(), text.chars().take(160).collect::<String>())));
+        }
+        Ok(())
+    }
+
+    /// Drive one cancel to completion off the ambient runtime (same dyn-compat pattern as `run_pair`).
+    fn run_cancel(&self, target: &CancelTarget) -> Result<(), ExecError> {
+        let fut = self.cancel_one(target);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt.block_on(fut),
+                Err(_) => Err(ExecError::TransportNotWired),
+            },
+        }
+    }
 }
 
 impl ExecutionBackend for LiveBackend {
@@ -360,13 +578,18 @@ impl ExecutionBackend for LiveBackend {
         }
         self.run_pair(a, b)
     }
-    fn cancel(&self, client_order_id: &str) -> Result<(), ExecError> {
+    fn cancel(&self, target: &CancelTarget) -> Result<(), ExecError> {
         // Cancel endpoints VERIFIED live 2026-06-11: Kalshi `DELETE /trade-api/v2/portfolio/orders/{order_id}`
-        // (200) and pmus `POST /v1/order/{orderId}/cancel` with a `{marketSlug}` body (200). What's still
-        // unbuilt is the venue-order-id TRACKING (the ack's id isn't yet stored per position), so this
-        // refuses loudly rather than pretend — wiring the id store is the remaining cancel work.
-        let _ = client_order_id;
-        Err(ExecError::Rejected("cancel needs venue order_id (stage-2 leg tracking)".into()))
+        // (200) and pmus `POST /v1/order/{orderId}/cancel` with a `{marketSlug}` body (200). The venue order
+        // id is now PERSISTED on the held position's legs (`PositionLeg::venue_order_id`, set in
+        // `main::apply_outcome`), so this is functional given a `CancelTarget`. KeysUnavailable when keys
+        // aren't loaded (dry-run/no-creds build). TODO(stage-2 loop wiring): the leg-fill-timeout that fires
+        // this on a resting leg — cancel the resting leg, then unwind/flatten the filled one — is NOT yet in
+        // the event loop (a naked live leg still fail-closes + halts in `apply_outcome`); see `naked_leg_failclose`.
+        if self.keys.is_none() {
+            return Err(ExecError::KeysUnavailable);
+        }
+        self.run_cancel(target)
     }
     fn label(&self) -> &'static str {
         match self.venue_env {
@@ -502,6 +725,12 @@ mod tests {
         assert_eq!(v["intent"], "ORDER_INTENT_BUY_LONG"); // Buy+Yes
         assert_eq!(v["type"], "ORDER_TYPE_LIMIT");
         assert_eq!(v["quantity"], 2);
+        // FIX 1: synchronousExecution makes the create BLOCK so the response can report a real fill state.
+        assert_eq!(v["synchronousExecution"], true, "pmus create must request synchronous execution");
+        // maxBlockTime is a STRING per the schema; leg_fill_timeout_ms=500 -> floor to 0s -> min 1s.
+        assert_eq!(v["maxBlockTime"], "1", "sub-1s timeout floors up to the 1s minimum block");
+        // FIX 2: pmus has NO idempotency key — the payload must NOT carry a clientOrderId (silently dropped).
+        assert!(v.get("clientOrderId").is_none(), "pmus payload must not send a clientOrderId: {v}");
         assert_eq!(v["price"]["value"], "0.07"); // YES leg: price is the YES price as-is
         assert_eq!(v["price"]["currency"], "USD");
         // Buy+No -> BUY_SHORT, and CRITICALLY the price is the YES-EQUIVALENT (1 - NO price): a NO leg with
@@ -598,5 +827,92 @@ mod tests {
             Some(v) => std::env::set_var("PMUS_POST_SIGNING_VERIFIED", v),
             None => std::env::remove_var("PMUS_POST_SIGNING_VERIFIED"),
         }
+    }
+
+    fn ack(filled: bool, simulated: bool) -> Result<Ack, ExecError> {
+        Ok(Ack { client_order_id: "c".into(), venue_order_id: "v".into(), filled, simulated })
+    }
+
+    /// FIX 1: a Kalshi `resting` (marketable-miss) order is ACCEPTED, not filled -> `filled:false`; an
+    /// `executed` order with fill_count >= count is `filled:true`. fill_count comes back as a STRING live
+    /// (`"0.00"`), so the parser must read number-or-string. A 0-fill executed body is still not-filled.
+    #[test]
+    fn kalshi_resting_is_not_filled_executed_is() {
+        // the live-verified resting shape: {"order":{"status":"resting","fill_count":"0.00"}} -> not filled.
+        let resting: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"resting","fill_count":"0.00"}}"#).unwrap();
+        assert!(!kalshi_order_filled(&resting, 1), "a resting order is acceptance, not a fill");
+        // executed with a full fill_count (string) -> filled.
+        let executed: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"executed","fill_count":"1"}}"#).unwrap();
+        assert!(kalshi_order_filled(&executed, 1), "executed + full fill_count is a fill");
+        // executed but fill_count < requested count (partial) -> NOT a full fill.
+        let partial: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"executed","fill_count":"1"}}"#).unwrap();
+        assert!(!kalshi_order_filled(&partial, 3), "a partial fill is not the full requested qty");
+        // a numeric fill_count is also accepted (not only string); flat (no {order:..}) body tolerated.
+        let flat: serde_json::Value = serde_json::from_str(r#"{"status":"executed","fill_count":2}"#).unwrap();
+        assert!(kalshi_order_filled(&flat, 2));
+    }
+
+    /// FIX 1: a pmus create that returns ONLY an accept body (`{orderId,intent,..}` — no executions/cum
+    /// qty) parses to `filled:false` ("accepted" != "filled"). Bodies that DO prove a full fill (cumQuantity,
+    /// remainingQty==0, summed executions shares, or a terminal FILL status) parse to `filled:true`.
+    #[test]
+    fn pmus_accepted_without_executions_is_not_filled() {
+        // the documented accept-only success body — no fill evidence -> not filled (the core bug guard).
+        let accepted: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","intent":"ORDER_INTENT_BUY_LONG","outcomeSide":"OUTCOME_SIDE_YES","action":"ORDER_ACTION_BUY"}"#).unwrap();
+        assert!(!pmus_order_filled(&accepted, 2), "a bare accept body is not a fill");
+        // an explicitly empty executions array is also not a fill.
+        let empty_exec: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","executions":[]}"#).unwrap();
+        assert!(!pmus_order_filled(&empty_exec, 1), "empty executions[] is not a fill");
+        // cumQuantity >= requested -> filled.
+        let cum: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","cumQuantity":"2"}"#).unwrap();
+        assert!(pmus_order_filled(&cum, 2));
+        assert!(!pmus_order_filled(&cum, 3), "cumQuantity below requested is a partial, not full");
+        // quantity - remainingQty: nothing remains of the requested qty -> filled.
+        let rem: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","quantity":2,"remainingQty":0}"#).unwrap();
+        assert!(pmus_order_filled(&rem, 2));
+        // summed executions shares (the task-named array) >= requested -> filled.
+        let execs: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","executions":[{"shares":"1"},{"shares":"1"}]}"#).unwrap();
+        assert!(pmus_order_filled(&execs, 2));
+        // a terminal FILL status -> filled; PARTIAL_FILL -> not a full fill.
+        let fill: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","orderStatus":"ORDER_STATUS_FILLED"}"#).unwrap();
+        assert!(pmus_order_filled(&fill, 5));
+        let partial: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","executionType":"EXECUTION_TYPE_PARTIAL_FILL"}"#).unwrap();
+        assert!(!pmus_order_filled(&partial, 5), "a partial fill is not the full requested qty");
+    }
+
+    /// FIX 1: `both_filled()` requires BOTH legs Ok AND filled. One Ok-but-resting (accepted, not filled)
+    /// leg means NOT both-filled — the old `is_ok()`-only check wrongly called this a complete hedge.
+    #[test]
+    fn both_filled_requires_both_legs_actually_filled() {
+        assert!(PairAck { a: ack(true, false), b: ack(true, false) }.both_filled(), "both filled -> hedge");
+        assert!(!PairAck { a: ack(true, false), b: ack(false, false) }.both_filled(), "one resting leg -> NOT a hedge");
+        assert!(!PairAck { a: ack(false, false), b: ack(false, false) }.both_filled(), "both resting -> not filled");
+        assert!(!PairAck { a: ack(true, false), b: Err(ExecError::RateLimited) }.both_filled(), "one errored leg -> not filled");
+    }
+
+    /// FIX 3: `cancel` builds the right per-venue request — Kalshi DELETEs the order by id in the URL path
+    /// (empty body); pmus POSTs `/v1/order/{id}/cancel` with the REQUIRED `{marketSlug}` body. The signing
+    /// path mirrors the URL path so the signature covers the real request line.
+    #[test]
+    fn cancel_builds_correct_per_venue_request() {
+        let bk = LiveBackend::new(&crate::config::Config::test_default()); // Demo, no keys
+        // Kalshi: DELETE …/portfolio/orders/{id}, no body; signing path carries the id.
+        let kt = CancelTarget { venue: Venue::Kalshi, venue_order_id: "ORD-123".into(), market: String::new() };
+        let (m, url, body, path) = bk.cancel_request(&kt);
+        assert_eq!(m, reqwest::Method::DELETE);
+        assert!(url.ends_with("/portfolio/orders/ORD-123"), "Kalshi cancels by id in the URL path: {url}");
+        assert!(url.contains("demo"), "uses the configured (demo) venue base");
+        assert!(body.is_empty(), "Kalshi cancel has no body");
+        assert_eq!(path, "/trade-api/v2/portfolio/orders/ORD-123");
+        // pmus: POST /v1/order/{id}/cancel with the marketSlug body required by the schema.
+        let pt = CancelTarget { venue: Venue::Pmus, venue_order_id: "pm-9".into(), market: "tc-temp-nychigh-2026-06-11-gte95f".into() };
+        let (m, url, body, path) = bk.cancel_request(&pt);
+        assert_eq!(m, reqwest::Method::POST);
+        assert!(url.ends_with("/v1/order/pm-9/cancel"), "pmus cancel endpoint: {url}");
+        let bv: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(bv["marketSlug"], "tc-temp-nychigh-2026-06-11-gte95f", "pmus cancel body must carry the marketSlug");
+        assert_eq!(path, "/v1/order/pm-9/cancel");
+        // no keys loaded in the sandbox -> the actual cancel refuses to send (never silently no-ops).
+        assert_eq!(bk.cancel(&kt), Err(ExecError::KeysUnavailable));
     }
 }

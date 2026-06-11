@@ -1,13 +1,15 @@
 //! Core domain types for the cross-arb live bot. Pure data; no I/O, no network.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Venue {
+    #[default]
     Kalshi,
     Pmus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Side {
+    #[default]
     Yes,
     No,
 }
@@ -132,7 +134,10 @@ pub struct OrderIntent {
     pub side: Side,
     pub price_cents: u8, // 1..=99
     pub qty: u32,
-    /// Idempotency key — the venue dedupes on this, so a retry can't double-fire a leg.
+    /// Idempotency key. **Kalshi ONLY** dedupes on this (`client_order_id` is a real idempotency token).
+    /// **pmus does NOT** — its CreateOrder has no `clientOrderId` field (silently dropped) and order
+    /// creation is NOT idempotent, so a pmus timeout/RateLimited is "unknown" and must be reconciled via
+    /// positions/open-orders before any resend, never blindly retried on this key.
     pub client_order_id: String,
 }
 
@@ -140,11 +145,14 @@ pub struct OrderIntent {
 /// old yes_venue/no_venue pair so a SPORTS hedge — whose two legs can be two YES legs on two different
 /// Kalshi tickers (dir PK: YES@pmus + YES@Kalshi-B) — is represented faithfully, not forced into a
 /// yes-leg/no-leg shape. The unwind SELLs each leg with this exact (venue, market, side).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PositionLeg {
     pub venue: Venue,
     pub market: String, // venue-native id: Kalshi ticker for a Kalshi leg, pmus slug for a pmus leg
     pub side: Side,
+    /// The exchange-assigned order id from this leg's fill ack, persisted so the leg can be CANCELLED
+    /// (Kalshi by id-in-path; pmus by id + `market`). Empty until the entry acks (set in `apply_outcome`).
+    pub venue_order_id: String,
 }
 
 /// A held, hedged cross-arb position — the two legs we own. Used by the unwind logic to close out
