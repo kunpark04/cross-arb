@@ -134,7 +134,10 @@ no release in window). `scripts/shadow_fill.py` extended: sub-second grid + `--p
   out to T+11.6 d. Kalshi settles weather ~8:02 AM ET D+1; pmus weather close = **1 AM local** D+1
   (corrects the "~2 AM ET" in CLAUDE.md).
 - **Unlock calendar:** sports finalized recon ~**06-23/25** (post-endDate); econ: FOMC settles
-  **06-17** → run 06-18 (cleanest first econ datapoint); U-3/NFP print **07-02** → run 07-03.
+  **06-17** → run 06-18 (fresh categorical event); U-3/NFP print **07-02** → run 07-03 (first
+  cumulative-`≥`-twin settlement). NOTE: econ source-identity was already reconciled **2026-06-11** on
+  PAST recurring releases (CPI Apr/May + FOMC Apr = 5 rows, 0 diverge) — see [L24]; these dates now
+  *add* events rather than being the first.
 
 ## 5. Adverse-selection direction gate
 
@@ -246,7 +249,7 @@ half. Droplet half rides the next gated redeploy with #3 + #1's logging.
 | When | What |
 |---|---|
 | post-redeploy +~1 wk | shadow_fill sub-second re-read (econ included); weather sequencing-gate confirmation cells (n≈150–250); maker study as *measurement* (trades+ladders) |
-| 2026-06-17 → 06-18 | FOMC settles → first econ settlement recon (`settle_recon.py`) |
+| ~~2026-06-17 → 06-18~~ DONE 06-11 | econ source-identity reconciled early on PAST releases (CPI Apr/May + FOMC Apr = 5 rows, 0 diverge, `settle_recon.py --econ-only`); FOMC 06-17 adds a fresh categorical event |
 | ~2026-06-23/25 | sports pmus endDates pass → first finalized sports recon |
 | 2026-07-02 → 07-03 | U-3/NFP print → econ recon batch 2 |
 | ~+3 wks of `cli.jsonl` | P(downward flip) resolves vs the 2% maker-exit breakeven (#6) |

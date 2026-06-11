@@ -326,3 +326,27 @@ coinciding cases is zero evidence (L17). Build **impossibility tripwires** (e.g.
 exclusive bucket set) into every reconciliation reader — they convert parse bugs into loud errors before
 they become "findings". And retraction discipline: when a published finding dies, retract it at every
 place it was stated (briefs, CLAUDE.md, README indexes), not just where it was born.
+
+## L24 — RECURRING markets reconcile on PAST cycles (don't wait for the next print); and honor the parsed inequality, never re-assume orientation in a throwaway
+
+**Pattern:** two errors, one session, both about econ settlement. (1) We kept saying "econ settlement is
+unverified — wait for the FOMC/U-3 release," which conflated "*this* cycle hasn't settled" with "*none
+ever* has." Econ releases **recur**: past CPI (Apr/May) and FOMC (Apr) markets were already settled on
+**both** venues and reconciled **immediately** when the owner pushed back — CPI print-identity (both
+venues' ladders imply the same 3.8 / 4.2) + FOMC categorical (both "maintains") = 5 rows, **0 diverge**,
+empirically confirming the same-government-number basis weeks before the next print. (2) A throwaway
+reconciliation script treated **every** pmus econ bucket as cumulative `≥` and manufactured **10 phantom
+"divergences"** on CPI — because it **ignored the `ineq` field `econ_parse` already returns**. pmus
+structures CPI as **exact-value buckets** ("CPI YoY = X.X%", one wins) while U-3/NFP are cumulative `≥`;
+`econ_parse` tags these `==` vs `>=`, and `econ_colisted` correctly **skips** the `==` ones
+(`point_bucket`). The production matcher was *right*; the throwaway re-derived a wrong assumption the real
+code never made, and for a moment it looked like a catastrophic settlement divergence.
+
+**Rule:** for any **recurring** market (econ prints, monthly/quarterly releases), reconcile the **most
+recent settled cycle now** rather than waiting — "not yet settled this cycle" is not "never reconciled."
+And never re-derive in an analysis script a parse that a shared module already performs: call
+`econ_parse` and **honor its `ineq`** (`>=` twin-join vs `==` exact-bucket vs `cat`), don't assume
+orientation (L21 applied to *analysis*, not just the matcher). When a quick script disagrees with
+production, **suspect the script first** — here all 10 "divergences" were the script's `≥` assumption, 0
+were real. Interrogate the raw object before believing a divergence (L3/L18/L21/L23 — the reflex held: the
+single-YES-bucket pattern indicted the parse, not the venues).

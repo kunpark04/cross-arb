@@ -116,7 +116,10 @@ See [deploy/README.md](deploy/README.md).
   outcomes unreliable — one verified wrong" claim is **retracted: it was our own parse bug** — pmus `outcomes[]`/
   `outcomePrices[]` are **not index-aligned**; `marketSides` is the authoritative winner encoding ([L23]; under
   the fix, sports interim reads are 56/56 == Kalshi, though pre-`endDate` sports reads stay interim-by-policy).
-  Sports/econ finalized recon pending (sports endDates ~06-23/25; FOMC 06-17; U-3/NFP 07-02). **None of this
+  **Econ source-identity empirically reconciled on PAST recurring releases (2026-06-11): CPI Apr/May
+  print-identity + FOMC Apr categorical = 5 rows, 0 diverge — both venues settle off the identical
+  government number (`settle_recon.py --econ-only`, [L24]); the U-3/NFP cumulative-twin instrument (the
+  live arb mechanism) settles first 07-02.** Sports finalized recon pending (endDates ~06-23/25). **None of this
   needs capital — it needs the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*,
   not yet a go.
 - **Capital velocity — MEASURED (2026-06-09, `scripts/exit_liquidity.py` + `capital_velocity.py`).** Velocity,

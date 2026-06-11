@@ -6,6 +6,31 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, late) — Deployment-readiness audit + live econ settlement reconciliation
+
+Owner pushed toward live deployment; reframed to "test everything, find blindspots." 7 parallel
+adversarial audits ([research/deployment-readiness-2026-06-11.md](../research/deployment-readiness-2026-06-11.md)):
+verdict **NOT READY** — effective n≈1 day (91% of edge on 06-10), ~71% of apparent edge is phantom,
+85% sub-1¢ (uncapturable at the 1¢ tick), the median arb is friction-negative, the fattest edges are
+the most adversely-selected (≥8¢ = 66% toxic, die fastest), and the decisive naked-unwind cost is
+unmeasurable read-only. Foundations solid (weather settlement, matcher integrity, no false-positive
+joins). Corrected a census double-count (62.6k→33.5k post-epoch; my late-append fix shadowed the .gz).
+
+- **Live U-3 ≥4.2 "edge" investigated** (owner: "isn't that a good arb?"): the buckets DO line up
+  (≥4.2 ↔ Above-4.1, post-0013); pmus YES 0.75 ask (7,392 deep) vs Kalshi YES 0.86 bid = a **real
+  ~9¢ crossable lock**, not a phantom — corrected the audit's over-dismissal. Real catch = 3-week
+  capital lock to the 07-02 print + the (then-)unverified econ settlement + n=1.
+- **Econ settlement reconciled NOW** (owner: "reconcile now instead of saying it hasn't been"):
+  econ releases RECUR, so PAST settlements reconcile immediately. Built `recon_econ` into
+  `settle_recon.py` (`--econ-only`; cumulative-`≥`-twin, exact-bucket print-identity, FOMC
+  categorical; selftested). Result: **CPI Apr + CPI May + FOMC Apr = 5 rows, 0 diverge** — both
+  venues settle off the identical government number. **Structural discovery:** pmus lists CPI as
+  exact-value buckets (not a tradeable twin; `econ_colisted` correctly skips them) while U-3/NFP are
+  cumulative `≥`. Lesson **[L24]** (reconcile recurring markets on past cycles; honor the parsed
+  `ineq`; a throwaway script's 10 "divergences" were all its own `≥`-assumption). selftest 19/19.
+  Docs corrected (the "econ — zero reconciliations" claim was retracted across CLAUDE.md + the
+  readiness/probe briefs + scripts/README).
+
 ## 2026-06-11 (UTC) — Probe program: all 10 ranked next-steps probed in one parallel read-only pass
 
 Owner: "probe these" (the 10-item ranked list from session close). 7 parallel probe agents + 1 coding

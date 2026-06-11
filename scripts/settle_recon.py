@@ -68,7 +68,8 @@ except Exception: pass
 
 # --- reuse the validated, identity-correct join helpers (do NOT duplicate) ---
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bot"))
-from colisted_map import (get, KAL, PM, pm_bounds, kbounds, pick_game, surname, ktok_iso, wcity)  # noqa: E402
+from colisted_map import (get, KAL, PM, pm_bounds, kbounds, pick_game, surname, ktok_iso, wcity,  # noqa: E402
+                          ECON, econ_parse, econ_twin, _FEDLBL)                                   # noqa: E402
 from monitor import parse_cli  # NWS CLI text-product parser (single source of truth)             # noqa: E402
 
 ARCHIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "cross-arb")
@@ -594,6 +595,104 @@ def recon_sports(slugs, max_pairs, log=print):
 
 
 # ============================================================================================
+# ECON reconciliation (2026-06-11) — econ releases RECUR, so PAST settlements reconcile NOW
+# (no need to wait for the next print). Three structures, discovered live on settled markets:
+#   (1) urc/nfpc/gdpc = CUMULATIVE ">= T"  -> tradeable twin vs Kalshi "Above T-step" (econ_twin).
+#   (2) cpic = EXACT-VALUE buckets ("CPI YoY = X.X%"), only one wins -> NOT a tradeable twin
+#       (econ_colisted skips them, point_bucket); reconciled at the PRINT level instead: the pmus
+#       winning bucket value must equal Kalshi's implied print = a settlement-SOURCE identity check.
+#   (3) rdc/FOMC = CATEGORICAL -> tradeable twin via _FEDLBL (decision-bucket match).
+# ============================================================================================
+def kal_implied_print(kmkts):
+    """Kalshi cumulative 'Above floor' settled ladder -> implied print. On a 1-grid-step ladder the
+    print equals the lowest NO floor ('Above fn' NO => print<=fn; 'Above fn-step' YES => print>=fn).
+    Returns (print_or_None, last_yes_floor, first_no_floor)."""
+    yes = [round(float(m["floor_strike"]), 6) for m in kmkts
+           if m.get("floor_strike") is not None and kal_result(m) == "yes"]
+    no = [round(float(m["floor_strike"]), 6) for m in kmkts
+          if m.get("floor_strike") is not None and kal_result(m) == "no"]
+    fn = min(no) if no else None
+    return (fn, max(yes) if yes else None, fn)
+
+def econ_reconcile(pre, step, pm_mkts, kfloor_mkt, klabel_mkt):
+    """PURE reconciliation of ONE settled econ event (selftest-able with synthetic dicts).
+    kfloor_mkt = {rounded_floor: kalshi_market}; klabel_mkt = {lower_sub_title: kalshi_market}.
+    Returns row dicts {kind, key, pm, kal, status in agree|DIVERGE|pm_pending|no_twin}."""
+    rows = []
+    if pre == "rdc":                                            # categorical
+        kwin = next((lbl for lbl, m in klabel_mkt.items() if kal_result(m) == "yes"), None)
+        for m in pm_mkts:
+            p = econ_parse(m.get("slug"))
+            if not p or p.get("ineq") != "cat": continue
+            if str(pm_winner(m)[0]).lower() == "yes":
+                klbl = _FEDLBL.get(p["label"])
+                st = "agree" if (kwin and klbl == kwin) else ("DIVERGE" if kwin else "pm_pending")
+                rows.append({"kind": "cat", "key": p["label"], "pm": p["label"], "kal": kwin, "status": st})
+        return rows
+    eq = []                                                     # threshold families
+    for m in pm_mkts:
+        p = econ_parse(m.get("slug"))
+        if not p or p.get("thr") is None: continue
+        pmw = pm_winner(m)[0]; pm_side = "yes" if str(pmw).lower() == "yes" else ("no" if pmw is not None else None)
+        if p["ineq"] == ">=":                                   # tradeable twin: pmus >=T <-> Kalshi Above T-step
+            km = kfloor_mkt.get(round(econ_twin(p["thr"], step), 6)); kres = kal_result(km) if km else None
+            st = "no_twin" if not km else ("pm_pending" if pm_side is None else ("agree" if pm_side == kres else "DIVERGE"))
+            rows.append({"kind": "ge_twin", "key": p["thr"], "pm": pm_side, "kal": kres, "status": st})
+        elif p["ineq"] == "==":                                 # exact bucket -> print-identity, collapsed below
+            eq.append((p["thr"], pm_side))
+    if eq:                                                      # one print-match row per event
+        imp = kal_implied_print(list(kfloor_mkt.values()))[0]
+        pm_win_val = next((thr for thr, side in eq if side == "yes"), None)
+        st = ("agree" if (imp is not None and pm_win_val is not None and round(imp, 6) == round(pm_win_val, 6))
+              else ("DIVERGE" if (imp is not None and pm_win_val is not None) else "pm_pending"))
+        rows.append({"kind": "eq_print", "key": "print", "pm": pm_win_val, "kal": imp, "status": st})
+    return rows
+
+def recon_econ(log=print):
+    """Fetch settled econ on both venues and reconcile per event. Read-only. Returns {(fam,period): rows}."""
+    macro, off = [], 0
+    while True:
+        d = get(f"{PM}?categories[]=macro&closed=true&limit=200&offset={off}")
+        pg = d.get("markets", []); macro += pg
+        if len(pg) < 200 or len(macro) > 4000: break
+        off += 200
+    bypre = collections.defaultdict(list)
+    for m in macro: bypre[str(m.get("slug", "")).split("-")[0]].append(m)
+    out = {}
+    for pre, (kser, fam, step) in ECON.items():
+        pml = bypre.get(pre) or []
+        if not pml: continue
+        byper = collections.defaultdict(list)
+        for m in pml:
+            p = econ_parse(m.get("slug"))
+            if p and p.get("period"): byper[p["period"]].append(m)
+        kd = get(f"{KAL}?series_ticker={kser}&status=settled&limit=400"); time.sleep(0.2)
+        kfloor, klabel = collections.defaultdict(dict), collections.defaultdict(dict)
+        for m in kd.get("markets", []):
+            pm_ = re.search(r"-(\d{2}[A-Z]{3}\d{0,2})-", str(m.get("ticker", ""))); per = pm_.group(1) if pm_ else None
+            if m.get("floor_strike") is not None: kfloor[per][round(float(m["floor_strike"]), 6)] = m
+            klabel[per][str(m.get("yes_sub_title", "")).lower()] = m
+        for per, pmkts in sorted(byper.items()):
+            rows = econ_reconcile(pre, step, pmkts, kfloor.get(per, {}), klabel.get(per, {}))
+            if rows: out[(fam, per)] = rows
+    return out
+
+def report_econ(ec):
+    print("\n--- ECON (settled past releases; recurring -> reconcilable now) ---")
+    if not ec:
+        print("  no settled co-listed econ events found (pmus lists only current-cycle econ?)"); return {}
+    agree = diverge = pend = 0
+    for (fam, per), rows in sorted(ec.items()):
+        for r in rows:
+            mark = {"agree": "OK", "DIVERGE": "!!! DIVERGE", "no_twin": "no-twin", "pm_pending": "pending"}.get(r["status"], r["status"])
+            kind = {"ge_twin": ">=twin", "eq_print": "print", "cat": "categ"}.get(r["kind"], r["kind"])
+            print(f"  {fam:4} {per:6} {kind:7} key={str(r['key']):8} pm={str(r['pm']):9} kal={str(r['kal']):9} {mark}")
+            agree += r["status"] == "agree"; diverge += r["status"] == "DIVERGE"; pend += r["status"] in ("no_twin", "pm_pending")
+    print(f"  --> econ reconciled: agree={agree}  DIVERGE={diverge}  pending/no-twin={pend}")
+    return {"agree": agree, "DIVERGE": diverge, "pending": pend}
+
+
+# ============================================================================================
 # REPORT
 # ============================================================================================
 def report(wx, sp):
@@ -758,9 +857,35 @@ def _selftest():
     assert sm["tally"]["pm_not_listed"] == 1 and sm["tally"]["kalval_vs_cli_match"] == 1
     assert len(sm["divergences"]) == 1 and len(sm["cli_mismatches"]) == 1
     assert day_state(wx["days"][0]) == "DIVERGE"
+    # --- econ reconciliation (pure): cumulative >=twin, exact-bucket print-identity, FOMC categorical ---
+    def _pm(slug, yes):  # synthetic settled pmus market (marketSides-graded)
+        return {"slug": slug, "closed": True,
+                "marketSides": [{"description": "Yes", "price": "1" if yes else "0"},
+                                {"description": "No", "price": "0" if yes else "1"}]}
+    def _k(floor=None, res="yes", sub=None):
+        return {"status": "settled", "result": res, "floor_strike": floor, "yes_sub_title": sub}
+    # (1) cumulative twin: pmus >=4.2 YES <-> Kalshi Above-4.1 (floor 4.1) — agree when both YES
+    ge = [_pm("urc-us-seasonadj-gte-june-2026-07-02-atl4pt2", True)]
+    r = econ_reconcile("urc", 0.1, ge, {4.1: _k(4.1, "yes")}, {})
+    assert r == [{"kind": "ge_twin", "key": 4.2, "pm": "yes", "kal": "yes", "status": "agree"}], r
+    assert econ_reconcile("urc", 0.1, ge, {4.1: _k(4.1, "no")}, {})[0]["status"] == "DIVERGE"   # twin disagrees
+    assert econ_reconcile("urc", 0.1, ge, {}, {})[0]["status"] == "no_twin"                     # twin not listed
+    # (2) exact-bucket CPI: print-identity only (pmus exact winner == Kalshi implied print)
+    cp = [_pm("cpic-uscpi-apr2026yoy-2026-05-12-3pt8pct", True),
+          _pm("cpic-uscpi-apr2026yoy-2026-05-12-3pt9pct", False)]
+    kladder = {3.7: _k(3.7, "yes"), 3.8: _k(3.8, "no")}            # Above-3.7 YES, Above-3.8 NO -> print 3.8
+    rr = econ_reconcile("cpic", 0.1, cp, kladder, {})
+    assert rr == [{"kind": "eq_print", "key": "print", "pm": 3.8, "kal": 3.8, "status": "agree"}], rr
+    assert kal_implied_print(list(kladder.values())) == (3.8, 3.7, 3.8)
+    # (3) FOMC categorical: pmus 'maintains' YES <-> Kalshi 'Fed maintains rate' YES
+    fo = [_pm("rdc-usfed-fomc-2026-04-29-maintains", True), _pm("rdc-usfed-fomc-2026-04-29-cut25bps", False)]
+    rc = econ_reconcile("rdc", None, fo, {}, {"fed maintains rate": _k(None, "yes", "Fed maintains rate"),
+                                              "cut 25bps": _k(None, "no", "Cut 25bps")})
+    assert rc == [{"kind": "cat", "key": "maintains", "pm": "maintains", "kal": "fed maintains rate", "status": "agree"}], rc
     print("OK - pm_winner order-independence + ragged guard, kal_result gating, slug parse, bound parity,")
     print("     pm_slug_for inverse join, bucket_hit, cli_finals last-by-t, kal_recorded_value, iso_lag_h,")
-    print("     classify_day three-way (agree/DIVERGE/multi-YES exclusion/pending), summarize_weather tallies")
+    print("     classify_day three-way (agree/DIVERGE/multi-YES exclusion/pending), summarize_weather tallies,")
+    print("     econ_reconcile (>=twin agree/DIVERGE/no_twin, exact-bucket print-identity, FOMC categorical)")
 
 
 # ============================================================================================
@@ -772,10 +897,15 @@ def main():
     ap.add_argument("--days-back", type=int, default=12, help="enumerate settled weather this many days back")
     ap.add_argument("--no-nws", action="store_true", help="skip the NWS CLI version-walk fallback")
     ap.add_argument("--max-pairs", type=int, default=60, help="cap sports pmus fetches (keeps live run fast)")
+    ap.add_argument("--no-econ", action="store_true", help="skip the econ settled-release reconciliation")
+    ap.add_argument("--econ-only", action="store_true", help="ONLY run the econ reconciliation (fast)")
     a = ap.parse_args()
 
     if a.selftest:
         _selftest(); return
+
+    if a.econ_only:
+        report_econ(recon_econ()); return
 
     slugs = archive_slugs(a.archive)
     print(f"co-listed slugs from live archive: {len(slugs)} "
@@ -787,6 +917,8 @@ def main():
           else {"rows": [], "compared": 0, "matched": 0, "mismatched": 0, "divergences": [],
                 "n_slugs": sum(s.startswith('aec-') for s in slugs)})
     report(wx, sp)
+    if not a.no_econ:
+        report_econ(recon_econ())
 
     # evidence dump: full day rows; raw venue objects kept ONLY where something needs proving
     # (any non-agree status, any CLI mismatch, any inconsistent day) - evidence discipline
