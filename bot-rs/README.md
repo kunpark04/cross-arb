@@ -70,29 +70,44 @@ deploy target is **Linux**, where none of this applies (no `windows-sys`, no min
 ```bash
 cd bot-rs
 cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
-cargo test             # risk gates + fees + PnL + auth round-trips + unwind (22 tests)
+cargo test             # full suite: risk gates + fee/signal parity + book + venue parsers + discovery + auth + unwind (66 tests)
 cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
+cargo run -- --smoke   # force the offline smoke even with creds present
 ```
 
 To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI_RW_KEY_PATH`, and
 `CROSSARB_I_UNDERSTAND_PROD=yes` for production) — and complete the stage-2 transport (below).
 
-## What's built (stage 1) vs. next (stage 2)
+## What's built (stages 1–2, complete) vs. what remains (owner env)
 
-- **Built, std-only, safety-critical spine:** `types` (domain), `config` (safe defaults), `risk` (all
-  pre-trade gates + tests), `exec` (dry-run backend + the real Kalshi order-payload builder, pair-shaped
-  `submit_pair`; live POST is the seam), `ledger` (outcome-independent PnL + taker fees, ⚠️ fee
-  parity-vs-`ledger.py` still TODO before live), `unwind` (postponement-unwind decision + closing
-  orders), `main` (banner + hard prod gate + smoke).
-- **Stage 2 (owner env, adds tokio/tungstenite/reqwest/ed25519-dalek/rsa/serde):** the two venue WS
-  clients + auth (port `bot/kalshi_book.py` + the signers, O(1) price-indexed book), the colisted
-  matcher + signal port (`bot/colisted_map.py` + `bot/ledger.py`, with a **parity test** asserting the
-  Rust signal/fees match the Python selftest vectors), the live inputs that wake the dormant gates
-  (`led_by` from book-history, `days_to_event` from event dates, live statsapi postponement detection),
-  the leg-sequencer, the **live transport** (RSA-PSS/Ed25519 sign + HTTPS POST), and — deferred to next
-  session — **edge-RATE allocation** (rank arbs by `edge ÷ lock-days`, the 0014-H2 arm) + **maker-side
+**Built + tested (66 tests, all green; dry-run-default, live gated):**
+- **Safety-critical spine (std-only):** `types`, `config` (safe defaults), `risk` (all pre-trade gates
+  + tests), `exec` (dry-run backend + real Kalshi order-payload builder, pair-shaped `submit_pair`),
+  `ledger` (outcome-independent PnL + taker fees), `unwind` (postponement-unwind), `main` (banner + hard
+  prod gate + smoke).
+- **Signal/match core:** `book` (O(1)-best order book + Kalshi snapshot/delta merge + pmus book +
+  `depth_at_edge`), `signal` (`bot/ledger.py` port, **parity-verified** vs the Python selftest vectors),
+  `matcher` (weather bounds-equality + econ grid-step-twin + sports joins). The econ/weather decoders
+  are **independently parity-verified** vs `bot/colisted_map.py` by differential execution — the L21
+  econ off-by-one phantom cannot recur through the order path (`tasks/_agent_bus/20260611-parity-review/`).
+- **Network + transport:** `venue` (Kalshi RSA-PSS WS + pmus Ed25519 WS, snapshot/delta merge, seq-gap
+  reconnect, in-place no-gap subscribe add/delete), `auth` (both signers, round-trip-tested), `discovery`
+  (paginated public catalog pull → matcher joins → tracked-pair set + periodic refresh), and the **live
+  transport** in `LiveBackend::submit_pair` (RSA-PSS/Ed25519 sign + HTTPS POST, **both legs concurrent**
+  via `tokio::join!`, keys-absent → `KeysUnavailable`). The `#[tokio::main]` live loop wires it all:
+  discovery → WS books (real `age_s`) → matcher → `Quote` → `risk::evaluate` → `submit_pair`.
+
+**Remains — inherently the owner's environment (sandbox blocks auth'd venue I/O), or deferred features:**
+- **Demo-sandbox session** (owner): confirm WS sid-capture, `update_subscription` acceptance, the live
+  catalog HTTP shapes, and a clean dry→demo round-trip.
+- **pmus POST-body signing** (owner): the order POST signs `{ts}{METHOD}{path}` only — verify live whether
+  pmus folds the body into the canonical string (typed error until confirmed; never a silent guess).
+- **Sports subscribable (stage-2.5 feature):** the 1:1 loop can't price a two-ticker game — sports is
+  discovered + counted but not tradeable. Port `pick_game`'s exact-ET-date + doubleheader `used`-set guard
+  (the parity-review WARN) before sports is ever armed, so the C2 wrong-game join can't reach the order path.
+- **Deferred to next session:** **edge-RATE allocation** (`edge ÷ lock-days`, the 0014-H2 arm) + **maker-side
   execution mode** (rest the cheap leg on Kalshi + taker-hedge pmus — the maker study's +EV config).
 
-⚠️ **Do not trade real money on the Rust path until** (a) the fee/signal parity test vs `bot/ledger.py`
-is green, (b) a demo-sandbox session is clean, and (c) the 0014 data validates the edge. The defaults
-above make that the natural order of operations.
+⚠️ **Do not trade real money on the Rust path until** (a) a demo-sandbox session is clean and (b) the 0014
+confirmatory run validates the edge on multi-week data. The signal/fee parity test is green; the defaults
+above make this the natural order of operations.

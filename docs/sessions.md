@@ -6,6 +6,43 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, later) — `bot-rs` stage-2: network layer + discovery → live loop complete, parity-verified
+
+Completed the Rust bot end-to-end (still **dry-run by default**; live connect/orders are the owner's
+droplet step — Claude's sandbox blocks auth'd venue I/O). Three builds + one independent review, each
+committed with green tests:
+
+- **Stage-2 core** (`e789dca`): `book.rs` (O(1)-best order book + Kalshi snapshot/delta merge + pmus
+  book + `depth_at_edge`), `signal.rs` (port of `ledger.py` signal/fees, **parity-verified** vs Python),
+  `matcher.rs` (weather bounds-equality + econ grid-step-twin + sports joins). 42→**42** tests.
+- **Network layer** (`4ed0e61`): `venue.rs` — Kalshi WS (RSA-PSS handshake, `orderbook_delta`,
+  snapshot+delta merge, single-sid seq-gap → reconnect) + pmus WS (Ed25519, `MARKET_DATA`), supervised
+  backoff; `main.rs` → `#[tokio::main]` live loop (WS books → matcher → `Quote` → `risk` →
+  **concurrent** `submit_pair`); `exec.rs` `LiveBackend` real signed POSTs fired via `tokio::join!`,
+  keys-absent → `KeysUnavailable` (never sends in sandbox). **53** tests. Self-review caught + fixed a
+  CRITICAL: the loop fired the *pair cost* as the YES-leg limit → NO leg couldn't fill → naked leg; now
+  book-derived per-leg prices + regression test.
+- **Discovery + staleness** (`d378e08`): `discovery.rs` — paginated public/no-auth catalog pull → reuse
+  `matcher` joins → `Vec<Pair>` (weather+econ subscribable 1:1; **sports matched-and-counted only** — the
+  1:1 loop can't price a two-ticker game); `main.rs` seeds + periodically refreshes the WS subscribe set
+  (in-place no-gap add/delete); `book.rs` per-book `last_update` → real `age_s` so `Reject::StaleBook`
+  fires on a wedged stream (was inert at `age_s=0.0`). **66** tests. Self-review caught + fixed a CRITICAL:
+  GDP econ pairs silently never joined (Kalshi period parser truncated `26JUL` vs pmus `26JUL30`) — **the
+  L21 phantom-edge surface**; fixed `k_econ_period` + regression test.
+- **Independent parity review** (`tasks/_agent_bus/20260611-parity-review/`, no authorship stake):
+  verdict **FAITHFUL** by *differential execution vs live Python* (incl. the float-nasty `4.4−0.1` twin +
+  the `26JUL30` GDP period). **The L21 12.2¢ econ phantom CANNOT recur** through the live order path. One
+  WARN: sports date-binding looser than Python `pick_game` — zero live exposure (sports never becomes a
+  tradeable `Pair`); porting `pick_game` is a pre-condition for the deferred sports-subscribable feature.
+
+**Net:** the bot is functionally complete + safety-spine intact + highest-stakes decoder independently
+verified. What remains is **inherently owner-environment** (demo-sandbox session, pmus POST-body signing
+live-verify) or a **deferred feature** (sports two-ticker pricing, edge-rate/maker modes) — and the edge
+itself still gates the money: do not arm beyond demo until the 0014 confirmatory run passes on multi-week
+data. Plan + follow-ups in [todo](../tasks/todo.md); safety model in [bot-rs/README](../../bot-rs/README.md).
+
+---
+
 ## 2026-06-11 (UTC, late) — Owner override → live trading bot in Rust (`bot-rs/`), safe-by-default
 
 Owner explicitly **overrode the read-only governance** ([0015](../decisions/0015-owner-override-live-trading-phase.md)),

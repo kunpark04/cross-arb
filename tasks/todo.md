@@ -4,7 +4,7 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
-## bot-rs stage-2 NETWORK LAYER (2026-06-11) — in progress
+## bot-rs stage-2 NETWORK LAYER (2026-06-11) — ✅
 
 Build the venue I/O + live transport that completes the Rust bot (compile + unit-test only; live
 connect/orders are the owner's droplet step). Safety spine (42 tests) stays green.
@@ -47,6 +47,31 @@ connect/orders are the owner's droplet step). Safety spine (42 tests) stays gree
       (artifacts: `tasks/_agent_bus/20260611-1015/`). **Self-review caught + fixed a CRITICAL** (GDP econ
       pairs silently dropped — Kalshi period parser truncated the day vs the python `\d{0,2}`; fixed + test).
       Live-verify pending on the droplet (catalog HTTP, WS sid-capture, `update_subscription` acceptance).
+- [x] **INDEPENDENT parity review** (no authorship stake, verdict **FAITHFUL** — artifacts:
+      `tasks/_agent_bus/20260611-parity-review/`): the econ/weather/sports decoders in `matcher.rs` +
+      `discovery.rs` confirmed byte-faithful to `colisted_map.py` by **differential execution vs live
+      Python** (incl. the float-nasty `4.4−0.1` twin case + the GDP `26JUL30` period). **The L21 12.2¢
+      econ phantom CANNOT recur** through the live order path (twin direction, grid_step, threshold
+      rounding, both period parsers all match). One WARN: sports date-binding looser than Python
+      `pick_game` — but sports never becomes a tradeable `Pair`, so zero live-path exposure.
+
+### bot-rs — what remains (all owner/droplet, OR the deferred sports feature)
+
+The bot layer is **functionally complete + parity-verified** (66 tests; discovery → WS books w/ real
+`age` → matcher → signal → risk → concurrent dry-run exec; live transport gated). Nothing further is
+doable in Claude's sandbox — the rest is inherently the owner's environment:
+
+- [ ] **Demo-sandbox session** (owner): `EXECUTION_MODE=live VENUE_ENV=demo` — confirm WS sid-capture,
+      `update_subscription` acceptance, the live catalog HTTP shapes, and a clean dry→demo order round-trip.
+- [ ] **pmus POST-body signing** (owner): the order POST signs `{ts}{METHOD}{path}` only — verify live
+      whether pmus requires the body in the canonical string (brief-flagged; typed error until confirmed).
+- [ ] **Sports subscribable (stage-2.5 feature, not a gap):** the 1:1 loop can't price a two-ticker game;
+      before making sports tradeable, port `pick_game`'s exact-ET-date + doubleheader `used`-set guard
+      (the parity-review WARN) so the C2 wrong-game join can't reach the order path.
+- [ ] **Edge validation gates the money, not the code:** even green, do NOT arm beyond demo until the
+      0014 confirmatory run passes on multi-week data + the naked-unwind cost is measured (README ⚠️).
+- [ ] **Deferred to next session:** edge-RATE allocation (0014-H2, `edge ÷ lock-days`) + maker-side
+      execution mode (rest cheap leg on Kalshi + taker-hedge pmus — the maker study's +EV config).
 
 > **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
 
