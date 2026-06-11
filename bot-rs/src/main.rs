@@ -8,10 +8,13 @@
 #![allow(dead_code)] // stage-1 spine: several domain fields/variants are wired in stage 2 (venue I/O)
 
 mod auth;
+mod book;
 mod config;
 mod exec;
 mod ledger;
+mod matcher;
 mod risk;
+mod signal;
 mod types;
 mod unwind;
 
