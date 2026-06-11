@@ -6,6 +6,35 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, latest) — `bot-rs` stage-2.5: SPORTS made tradable (two-outcome) + latent leg-market bug fixed
+
+Closed the one functional category gap from stage-2 (sports was discovered + counted but not tradeable —
+the 1:1 loop can't price a two-ticker game). Committed `639dd69` + parity review; **80/80 tests**.
+
+- **Sports is genuinely two-outcome:** a pmus game (YES = team A) hedges against the OTHER team's SEPARATE
+  Kalshi market. Ported `monitor.py::game_edge` → `signal::game_signal` (PK = A@pmus + B@Kalshi using the
+  2nd ticker; KP = A@Kalshi + B@pmus-NO; the C3 orientation guard |guard_pm − kA_ask|>0.40) and
+  `GameTracker._depth` → `book::game_depth_at_edge`. `Quote.k_b` carries the away-team book; `risk` gives it
+  the same crossed/stale gates.
+- **Faithful `pick_game` bind** (`discovery`): emits sports as real `Pair`s (kalshi_b = 2nd ticker) on the
+  **exact slug-ET-date** with a **doubleheader `used`-set** — this closes the prior independent-review WARN
+  (it asked for exactly this guard before sports was made subscribable). `days_to_event` is computed dep-free
+  (civil-days, no chrono).
+- **Latent live-order bug fixed (found while wiring sports):** `build_kalshi_payload` uses `intent.market`
+  as the Kalshi `ticker`, but `fire_pair` was sending the pmus SLUG for the Kalshi leg — a real order would
+  have 404'd on an unknown ticker. Unified `build_legs` now emits venue-native ids (Kalshi→ticker, pmus→slug)
+  with per-leg prices from the BOOKS (never the edge — preserves the earlier self-review CRITICAL invariant).
+  `Position` generalized to two explicit legs so the postponement unwind flattens the correct sports legs.
+- **Independent parity review: FAITHFUL** (`tasks/_agent_bus/20260611-sports-parity/`) — verified by
+  differential Python re-execution (PK/KP nets bit-for-bit; C2 exact-date + doubleheader; C3 flip-reject). A
+  sports order cannot be sent mis-hedged or on the wrong game.
+
+**Still owner/droplet for sports specifically:** live statsapi postponement DETECTION + held-position tracking
+to ARM the (built+tested) unwind rule; settlement recon (~06-23/25) before `ASSUME_SPORTS_SETTLED` is more than
+an owner override; a demo-sandbox confirm that a real two-ticker game fires both legs.
+
+---
+
 ## 2026-06-11 (UTC, later) — `bot-rs` stage-2: network layer + discovery → live loop complete, parity-verified
 
 Completed the Rust bot end-to-end (still **dry-run by default**; live connect/orders are the owner's

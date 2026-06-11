@@ -70,7 +70,7 @@ deploy target is **Linux**, where none of this applies (no `windows-sys`, no min
 ```bash
 cd bot-rs
 cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
-cargo test             # full suite: risk gates + fee/signal parity + book + venue parsers + discovery + auth + unwind (66 tests)
+cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + auth + unwind (80 tests)
 cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
 cargo run -- --smoke   # force the offline smoke even with creds present
 ```
@@ -78,18 +78,23 @@ cargo run -- --smoke   # force the offline smoke even with creds present
 To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI_RW_KEY_PATH`, and
 `CROSSARB_I_UNDERSTAND_PROD=yes` for production) — and complete the stage-2 transport (below).
 
-## What's built (stages 1–2, complete) vs. what remains (owner env)
+## What's built (stages 1–2.5, complete) vs. what remains (owner env)
 
-**Built + tested (66 tests, all green; dry-run-default, live gated):**
+**Built + tested (80 tests, all green; dry-run-default, live gated):**
 - **Safety-critical spine (std-only):** `types`, `config` (safe defaults), `risk` (all pre-trade gates
   + tests), `exec` (dry-run backend + real Kalshi order-payload builder, pair-shaped `submit_pair`),
   `ledger` (outcome-independent PnL + taker fees), `unwind` (postponement-unwind), `main` (banner + hard
   prod gate + smoke).
 - **Signal/match core:** `book` (O(1)-best order book + Kalshi snapshot/delta merge + pmus book +
-  `depth_at_edge`), `signal` (`bot/ledger.py` port, **parity-verified** vs the Python selftest vectors),
-  `matcher` (weather bounds-equality + econ grid-step-twin + sports joins). The econ/weather decoders
-  are **independently parity-verified** vs `bot/colisted_map.py` by differential execution — the L21
-  econ off-by-one phantom cannot recur through the order path (`tasks/_agent_bus/20260611-parity-review/`).
+  `depth_at_edge` for 1:1 + `game_depth_at_edge` for two-outcome sports), `signal` (`bot/ledger.py::signal`
+  port for weather/econ + `monitor.py::game_edge` port `game_signal` for sports, both **parity-verified**),
+  `matcher` (weather bounds-equality + econ grid-step-twin + sports abbrev join). The econ/weather decoders
+  AND the sports `game_signal`/`pick_game`/leg-mapping are **independently parity-verified** vs the Python
+  by differential execution — the L21 econ off-by-one phantom, a C2 wrong-game bind, and a C3 flipped sports
+  orientation all cannot reach the order path (`tasks/_agent_bus/20260611-parity-review/` + `…-sports-parity/`).
+- **All three categories tradeable:** weather + econ are 1:1; **sports is two-outcome** (a pmus game YES=team
+  A hedged against the OTHER team's separate Kalshi market — PK = A@pmus + B@Kalshi, KP = A@Kalshi + B@pmus-NO).
+  Each leg carries its venue-native id (Kalshi ticker / pmus slug) with prices read from the books, never the edge.
 - **Network + transport:** `venue` (Kalshi RSA-PSS WS + pmus Ed25519 WS, snapshot/delta merge, seq-gap
   reconnect, in-place no-gap subscribe add/delete), `auth` (both signers, round-trip-tested), `discovery`
   (paginated public catalog pull → matcher joins → tracked-pair set + periodic refresh), and the **live
@@ -102,9 +107,12 @@ To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI
   catalog HTTP shapes, and a clean dry→demo round-trip.
 - **pmus POST-body signing** (owner): the order POST signs `{ts}{METHOD}{path}` only — verify live whether
   pmus folds the body into the canonical string (typed error until confirmed; never a silent guess).
-- **Sports subscribable (stage-2.5 feature):** the 1:1 loop can't price a two-ticker game — sports is
-  discovered + counted but not tradeable. Port `pick_game`'s exact-ET-date + doubleheader `used`-set guard
-  (the parity-review WARN) before sports is ever armed, so the C2 wrong-game join can't reach the order path.
+- **Sports postponement unwind ARMING** (owner): the decision + closing orders are built + tested
+  (`unwind.rs`) and the `Position` now models the two real legs, but the LIVE trigger — statsapi
+  postponement detection + held-position tracking — is the owner's stage-2 wiring. (Sports ENTRY is done;
+  this is the void-tail risk-management trigger.)
+- **Sports settlement recon** (owner): endDates ~06-23/25 — until then `ASSUME_SPORTS_SETTLED` is an owner
+  override, not an empirical clean.
 - **Deferred to next session:** **edge-RATE allocation** (`edge ÷ lock-days`, the 0014-H2 arm) + **maker-side
   execution mode** (rest the cheap leg on Kalshi + taker-hedge pmus — the maker study's +EV config).
 
