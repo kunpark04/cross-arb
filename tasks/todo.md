@@ -4,6 +4,39 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
+## bot-rs — POSTPONEMENT-UNWIND TRIGGER (2026-06-11) — in progress
+
+ARM the (built+tested) postponement-unwind rule: held-position tracking + live MLB statsapi detection +
+the actual SELL-both-legs firing. Closes the #1 sports follow-up (the void/postpone tail is the main
+sports risk). Compile + unit-test only — the live statsapi poll is owner/droplet (statsapi is public, but
+no live HTTP on a test path). Port `scripts/probe_mlb_postpone.py::unwind_trigger`/`snap` FAITHFULLY.
+
+- [ ] `postpone.rs` (new): `snap(game)->GameStatus` + `detect_postponement(prev,cur,event_date,market)->
+      Option<Postponement>` — port of `unwind_trigger`. POSTPONE_STATES={Postponed,Suspended,Cancelled};
+      Cancelled/no-makeup-date → reschedule_in_days None (→ unwind); **measure the gap from the BOUND
+      event_date (pm slug date), NEVER officialDate** (the L3 trap: officialDate moves to the makeup date →
+      makeup−makeup=0 → misses every unwind); the officialDate-moved-without-status case. **Port ALL the
+      Python `_selftest` vectors as Rust tests** (built-in parity gate). + `days_between` (civil-days, dep-free).
+- [ ] `postpone.rs` async `poll_mlb_postponements(http,positions,unwind_tx,cfg)` (owner/droplet; not tested):
+      cache `teams?sportId=1` id→abbrev; group held MLB sports positions by event date; GET
+      `schedule?sportId=1&date=`; match each game by {team_a,team_b} abbrevs; snap→detect→`should_unwind` →
+      send `UnwindRequest{slug}`. MLB-only (statsapi is MLB; other leagues logged as no-auto-source).
+- [ ] held-position TRACKING (`main`): `positions: Arc<Mutex<HashMap<slug,HeldPosition>>>` (Position + game
+      meta + prev GameStatus). On a fired ENTRY where `PairAck.both_filled()` → record the Position straight
+      from the `[OrderIntent;2]` legs (+ bump exposure per_pair/cluster/total/open — currently never tracked
+      live, so caps don't bind: this closes that too). Game meta derived: league=`pm_league(slug)`,
+      date=`iso_date(slug)`, team_a/team_b = last segment of `pair.kalshi`/`kalshi_b`.
+- [ ] FIRING (`main`): `select!` an `unwind_rx` in the event loop; on `UnwindRequest{slug}` price each leg's
+      exit from the live books (SELL: YES leg→best yes_bid; NO leg→1−best yes_ask), `unwind_orders(pos,[ea,eb])`,
+      `submit_pair` the two SELLs; on success remove the position + decrement exposure. One-sided book → log +
+      retry next poll (idempotent `unwind-…` coids). Dry-run LOGS (never sends). **Reduce-only: allowed under
+      the kill-switch** (flattening a void reduces risk) with a loud log; `CROSSARB_NO_AUTO_UNWIND=1` disables.
+- [ ] `config`: `postpone_poll_s` (default 60), `auto_unwind` (default true). Reuse discovery's
+      `iso_date`/`pm_league` (make `pub(crate)`). Keep all 80 tests green + add detector/exit-pricing/record
+      tests; self-review; verify the Rust detector matches the Python `_selftest` on the same vectors.
+
+> **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
+
 ## bot-rs STAGE-2.5 — SPORTS TRADABLE (2026-06-11) — ✅
 
 Made sports a tradeable category in the live loop. Sports is genuinely TWO-OUTCOME (not 1:1): a pmus

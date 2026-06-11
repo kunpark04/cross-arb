@@ -42,6 +42,8 @@ pub struct Config {
     pub assume_econ_settled: bool,        // owner override: treat ECON as settlement-reconciled (else gated)
     pub max_days_to_event: f64,           // event-proximity gate: skip arbs >this many days before settlement (<=0 = off)
     pub kalshi_void_window_days: f64,     // postponement-unwind: Kalshi voids if reschedule is past this (~2d)
+    pub postpone_poll_s: u64,             // MLB statsapi postponement-poll cadence (owner droplet)
+    pub auto_unwind: bool,                // arm the live postponement-unwind trigger (CROSSARB_NO_AUTO_UNWIND=1 disables)
     pub leg_fill_timeout_ms: u64,         // unwind leg A if leg B isn't filled in time
     pub require_settle_clean: bool,       // only trade settlement-verified pairs (econ/sports)
     pub discovery_refresh_s: u64,         // periodic re-discovery interval (monitor.py heartbeat = 300s)
@@ -80,6 +82,9 @@ impl Config {
             assume_econ_settled: env_bool("ASSUME_ECON_SETTLED", false),
             max_days_to_event: env_f64("MAX_DAYS_TO_EVENT", 2.0),
             kalshi_void_window_days: env_f64("KALSHI_VOID_WINDOW_DAYS", 2.0),
+            postpone_poll_s: env_u64("POSTPONE_POLL_S", 60),
+            // armed by default (flattening a void REDUCES risk); CROSSARB_NO_AUTO_UNWIND=1 disengages it.
+            auto_unwind: !env_bool("CROSSARB_NO_AUTO_UNWIND", false),
             leg_fill_timeout_ms: env_u64("LEG_FILL_TIMEOUT_MS", 500),
             require_settle_clean: env_bool("REQUIRE_SETTLE_CLEAN", true),
             discovery_refresh_s: env_u64("DISCOVERY_REFRESH_S", 300),
@@ -121,6 +126,8 @@ impl Config {
             assume_econ_settled: false,
             max_days_to_event: 2.0,
             kalshi_void_window_days: 2.0,
+            postpone_poll_s: 60,
+            auto_unwind: true,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             discovery_refresh_s: 300,

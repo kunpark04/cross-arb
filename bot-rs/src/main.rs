@@ -14,6 +14,7 @@ mod discovery;
 mod exec;
 mod ledger;
 mod matcher;
+mod postpone;
 mod risk;
 mod signal;
 mod types;
@@ -206,9 +207,16 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
     let mut prior_mid: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new(); // slug -> (pm_mid, k_mid) for led_by
     let mut exposure = Exposure::new();
 
+    // HELD positions keyed by pmus slug — the postponement poll reads these (MLB sports), and the entry
+    // path inserts into them on a both-filled fill so exposure caps bind across the session and a void can
+    // be flattened. Shared with the spawned poll task.
+    let positions: Arc<Mutex<HashMap<String, postpone::HeldPosition>>> = Arc::new(Mutex::new(HashMap::new()));
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<venue::VenueEvent>();
     let (k_subs_tx, k_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
     let (pm_subs_tx, pm_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
+    // the postponement-unwind channel: the poll detects a void and sends an UnwindRequest the loop fires.
+    let (unwind_tx, mut unwind_rx) = tokio::sync::mpsc::unbounded_channel::<postpone::UnwindRequest>();
 
     tokio::spawn(venue::kalshi_stream(creds.clone(), k_tracked.clone(), kalshi_books.clone(), tx.clone(), k_subs_rx));
     tokio::spawn(venue::pmus_stream(creds.clone(), pm_tracked.clone(), tx.clone(), pm_subs_rx));
@@ -222,14 +230,44 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         k_subs_tx,
         pm_subs_tx,
     ));
+    // ARM the live postponement-unwind trigger (gated on cfg.auto_unwind). statsapi is public/keyless; the
+    // poll runs on the owner's droplet. Disengage with CROSSARB_NO_AUTO_UNWIND=1 (a manual-only fallback).
+    if cfg.auto_unwind {
+        tokio::spawn(postpone::poll_mlb_postponements(
+            http.clone(),
+            positions.clone(),
+            unwind_tx.clone(),
+            cfg.postpone_poll_s,
+            cfg.kalshi_void_window_days,
+        ));
+    }
     drop(tx); // the spawned tasks hold their own senders; drop ours so rx closes if both ever end
+    // KEEP `unwind_tx` alive for the loop's lifetime: if it were dropped while auto_unwind=false (no poll
+    // task holds a clone), `unwind_rx` would close and its select arm would return `None` every poll ->
+    // a busy-loop. Holding the sender keeps `recv()` PARKED when idle. The loop exits on the venue `rx`
+    // closing (above), not this channel.
+    let _unwind_tx_keepalive = unwind_tx;
 
     // A venue WS reconnect/seq-gap pauses trading until THAT venue's books rebuild (never trade a
     // half-rebuilt book). Tracked PER VENUE: a pmus frame must not clear a Kalshi rebuild pause, and
     // vice-versa. `stream_paused` stays true while EITHER venue is mid-rebuild.
     let (mut k_rebuild, mut pm_rebuild) = (false, false);
 
-    while let Some(ev) = rx.recv().await {
+    loop {
+        // Drive BOTH the venue book stream AND the postponement-unwind channel. A void detection must not
+        // wait behind a quiet book stream, so the unwind arm is co-equal (not polled only between frames).
+        let ev = tokio::select! {
+            v = rx.recv() => match v {
+                Some(ev) => ev,
+                None => break, // both venue streams ended
+            },
+            u = unwind_rx.recv() => {
+                if let Some(req) = u {
+                    handle_unwind(cfg, backend, &positions, &kalshi_books, &pmus_books, &mut exposure, &req.slug);
+                }
+                continue;
+            }
+        };
         // which pmus slug does this event touch? (book updates first, then evaluate on the complete state)
         let slug = match &ev {
             venue::VenueEvent::Kalshi { ticker } => {
@@ -320,12 +358,109 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
                 // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
                 // one-sided book) yields no legs -> skip rather than fire a naked leg.
                 let Some(legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
-                let _ = backend.submit_pair(&legs[0], &legs[1]);
+                let ack = backend.submit_pair(&legs[0], &legs[1]);
+                // On a both-filled fill: record the held position (so a void can be flattened) AND bump
+                // exposure so the caps actually bind across the session. A partial/failed fill is NOT
+                // tracked here — naked-leg handling is the leg-fill-timeout path (stage-2 legs.rs).
+                if ack.both_filled() {
+                    let pos = position_from_intents(&slug, pair.cat, &pair.cluster, &legs);
+                    track_position(&positions, &pair, pos, &mut exposure, a.cost_per);
+                }
             }
             Err(_r) => {} // rejected by a gate — silent in the live loop; transitions/metrics are stage-2
         }
     }
     println!("[live] both venue streams ended — loop exiting.");
+}
+
+/// Record a freshly-filled position + BUMP exposure so the pair/cluster/total/concurrency caps bind across
+/// the session (without this, every fill looks like the first and the caps never engage). For a SPORTS
+/// pair the postponement poll needs league/date/abbrevs: league = `pm_league(slug)`, date = `iso_date(slug)`,
+/// team_a/team_b = the last dash-segment of each Kalshi ticker (`pair.kalshi`/`pair.kalshi_b`). Non-sports
+/// leaves those empty (no postponement concept), so the poll ignores them.
+fn track_position(
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    pair: &LivePair,
+    pos: Position,
+    exposure: &mut Exposure,
+    cost_per: f64,
+) {
+    let notional = cost_per * pos.size as f64;
+    *exposure.per_pair.entry(pos.market.clone()).or_insert(0.0) += notional;
+    *exposure.per_cluster.entry(pos.cluster.clone()).or_insert(0.0) += notional;
+    exposure.total += notional;
+    exposure.open_positions += 1;
+
+    let (league, date, team_a, team_b) = if pair.cat == Cat::Sports {
+        let last_seg = |t: &str| t.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
+        (
+            discovery::pm_league(&pair.slug).unwrap_or_default(),
+            discovery::iso_date(&pair.slug).unwrap_or_default(),
+            last_seg(&pair.kalshi),
+            pair.kalshi_b.as_deref().map(last_seg).unwrap_or_default(),
+        )
+    } else {
+        (String::new(), String::new(), String::new(), String::new())
+    };
+    let slug = pos.market.clone();
+    positions.lock().unwrap().insert(
+        slug,
+        postpone::HeldPosition { pos, league, date, team_a, team_b, prev: None },
+    );
+}
+
+/// Handle a postponement `UnwindRequest`: look up the held position, price each leg's marketable EXIT from
+/// the live books (SELL YES -> that book's best yes_bid; SELL NO -> 1 - yes_ask), and if BOTH price, fire
+/// the two SELLs; on a both-filled ack remove the position + decrement exposure. A one-sided book (a leg
+/// can't be priced) logs a WARN and leaves the position (the poll re-emits; the idempotent `unwind-…` coids
+/// stop a double-flatten). REDUCE-ONLY: this fires even under the kill-switch — flattening a void REDUCES
+/// risk — and the dry-run backend only LOGS, so it's safe by default.
+fn handle_unwind(
+    cfg: &Config,
+    backend: &mut dyn ExecutionBackend,
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
+    pmus_books: &std::collections::HashMap<String, book::PmusBook>,
+    exposure: &mut Exposure,
+    slug: &str,
+) {
+    let Some(hp) = positions.lock().unwrap().get(slug).cloned() else { return }; // already flattened / gone
+    if cfg.kill_switch {
+        println!("[UNWIND] kill-switch engaged but flattening (reduce-only) {slug}");
+    }
+    // price each leg's exit from the venue book it sits on (a SELL never blocks on a fresh entry edge).
+    let exits = unwind_exit_cents(&hp.pos, |leg| match leg.venue {
+        Venue::Kalshi => kalshi_books.lock().unwrap().get(&leg.market).map(|b| b.touch()),
+        Venue::Pmus => pmus_books.get(&leg.market).map(|b| b.touch()),
+    });
+    let Some(exits) = exits else {
+        println!("[UNWIND] WARN one-sided book — cannot price both legs of {slug}; holding (poll re-emits)");
+        return;
+    };
+    let orders = unwind::unwind_orders(&hp.pos, exits);
+    let ack = backend.submit_pair(&orders[0], &orders[1]);
+    if ack.both_filled() {
+        if let Some(removed) = positions.lock().unwrap().remove(slug) {
+            decrement_exposure(exposure, &removed.pos);
+        }
+        println!("[UNWIND] flattened {slug}");
+    } else {
+        println!("[UNWIND] WARN {slug} did not fully flatten (one leg unfilled); poll re-emits");
+    }
+}
+
+/// Decrement exposure when a tracked position is closed (mirror of the bump in `track_position`), so caps
+/// re-open for new entries. Reconstructs the notional from cost_per×size is not available post-fill, so we
+/// remove the recorded per-pair notional directly (the per-pair bucket holds exactly this position's
+/// contribution — one position per pmus slug).
+fn decrement_exposure(exposure: &mut Exposure, pos: &Position) {
+    if let Some(n) = exposure.per_pair.remove(&pos.market) {
+        exposure.total = (exposure.total - n).max(0.0);
+        if let Some(c) = exposure.per_cluster.get_mut(&pos.cluster) {
+            *c = (*c - n).max(0.0);
+        }
+    }
+    exposure.open_positions = exposure.open_positions.saturating_sub(1);
 }
 
 /// Log the discovery coverage report LOUDLY (L7): an unmapped category / misaligned bucket / truncated
@@ -635,6 +770,49 @@ fn fire_legs(backend: &mut dyn ExecutionBackend, legs: &[OrderIntent; 2]) {
     let _ = backend.submit_pair(&legs[0], &legs[1]);
 }
 
+/// The HELD position the live loop derives from a both-filled entry: build a `Position` straight from the
+/// two entry `OrderIntent`s (each leg = its venue/market/side; the pair `market` = the pmus slug). The two
+/// intents are the exact legs we now own, so the unwind SELLs back the same (venue, market, side).
+fn position_from_intents(slug: &str, cat: Cat, cluster: &str, legs: &[OrderIntent; 2]) -> Position {
+    Position {
+        market: slug.to_string(),
+        cat,
+        legs: std::array::from_fn(|i| PositionLeg {
+            venue: legs[i].venue,
+            market: legs[i].market.clone(),
+            side: legs[i].side,
+        }),
+        size: legs[0].qty,
+        cluster: cluster.to_string(),
+    }
+}
+
+/// Price ONE held leg's marketable EXIT (a SELL) from the live book of the venue it sits on: a SELL YES
+/// leg lifts that book's best `yes_bid`; a SELL NO leg unwinds at `1 - yes_ask` (selling NO = buying YES
+/// back, which pays the YES ask -> the NO sale nets `1 - yes_ask`). `None` when the needed side isn't
+/// quoted (a one-sided book) -> the caller leaves the position and the poll re-emits.
+fn exit_price(leg: &PositionLeg, book: &Book) -> Option<f64> {
+    match leg.side {
+        Side::Yes => book.yes_bid,
+        Side::No => book.yes_ask.map(|a| 1.0 - a),
+    }
+}
+
+/// Price BOTH legs of a held position to exit `cents`, reading each leg's book from `book_of` (the live
+/// per-venue books). `None` if EITHER leg can't be priced or rounds outside the venue tick — the caller
+/// then logs a WARN and holds (the poll re-emits; the idempotent `unwind-…` coids prevent a double-flatten).
+fn unwind_exit_cents<F>(pos: &Position, book_of: F) -> Option<[u8; 2]>
+where
+    F: Fn(&PositionLeg) -> Option<Book>,
+{
+    let mut out = [0u8; 2];
+    for (i, leg) in pos.legs.iter().enumerate() {
+        let book = book_of(leg)?;
+        out[i] = cents(exit_price(leg, &book))?;
+    }
+    Some(out)
+}
+
 /// Stage-1 smoke: prove the risk+exec spine behaves on real-shaped snapshots (weather/econ/sports).
 fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
     // a 1:1 LivePair (weather/econ) builder for the smoke (kalshi_b = None).
@@ -718,8 +896,10 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
     println!("[smoke] sports arb (assumed-settled), 1 day pre-game -> within window:");
     report(&sc, &sport_pair_soon, &sport_soon, Edge { net: 0.03, dir: Dir::PK }, backend);
 
-    // (5) postponement unwind: a held MLB pair (dir PK: YES@pmus + YES@Kalshi-B) + a postponement with an
-    //     unknown/late reschedule -> flatten BOTH legs (SELL) before Kalshi voids. (Stage-2 wires statsapi.)
+    // (5) postponement unwind, LIVE PATH on a SYNTHETIC schedule (no network): a held MLB pair (dir PK:
+    //     YES@pmus + YES@Kalshi-B) + a `snap`'d "Postponed, makeup 5d out" schedule game -> the DETECTOR
+    //     fires -> should_unwind true -> print the two SELL unwind orders. This is the real stage-2 trigger
+    //     composition (detect_postponement -> should_unwind -> unwind_orders), exercised offline.
     let held = types::Position {
         market: "aec-mlb-lad-pit-2026-06-16".into(), cat: Cat::Sports,
         legs: [
@@ -729,14 +909,27 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         size: 10,
         cluster: "mlb-2026-06-16".into(),
     };
-    let postponed = vec![unwind::Postponement {
-        market: held.market.clone(), reschedule_in_days: None, // makeup unknown -> Kalshi will void
-    }];
-    println!("[smoke] postponement unwind (held MLB pair, makeup unknown):");
-    for pair in unwind::postponement_unwinds(&[held], &postponed, cfg.kalshi_void_window_days) {
-        for o in &pair {
-            println!("  UNWIND {:?} {:?} {:?} {}x  market={}", o.action, o.venue, o.side, o.qty, o.market);
+    // a synthetic statsapi schedule game: LAD@PIT on 2026-06-16, POSTPONED with a makeup 5 days out (the
+    // 2d–2wk both-legs-loss gap). officialDate already moved to the makeup date (the live shape) — the
+    // detector measures the gap from the BOUND event date (06-16), NOT officialDate (the L3 trap).
+    let game: serde_json::Value = serde_json::from_str(
+        r#"{"gamePk":1,"officialDate":"2026-06-21","gameDate":"2026-06-16T20:00:00Z",
+            "status":{"detailedState":"Postponed","reason":"Rain"},
+            "rescheduleDate":"2026-06-21T17:10:00Z",
+            "teams":{"away":{"team":{"id":134}},"home":{"team":{"id":119}}}}"#,
+    )
+    .unwrap();
+    let cur = postpone::snap(&game);
+    println!("[smoke] postponement unwind LIVE path (snap -> detect -> should_unwind), makeup 5d out:");
+    match postpone::detect_postponement(None, &cur, "2026-06-16", &held.market) {
+        Some(p) if unwind::should_unwind(&p, cfg.kalshi_void_window_days) => {
+            println!("  detected postponement: reschedule_in_days={:?} -> UNWIND (> {}d window)", p.reschedule_in_days, cfg.kalshi_void_window_days);
+            // exit prices: stage-2 reads the live bids; here 1c placeholders (the smoke proves the firing).
+            for o in &unwind::unwind_orders(&held, [1, 1]) {
+                println!("  UNWIND {:?} {:?} {:?} {}x  market={}", o.action, o.venue, o.side, o.qty, o.market);
+            }
         }
+        _ => println!("  (no unwind — unexpected for this synthetic postponement)"),
     }
     println!();
 }
@@ -924,6 +1117,90 @@ mod tests {
         let sp_lp = LivePair::from(sp.clone());
         assert_eq!(sp_lp.kalshi_tickers(), vec!["K-LAD".to_string(), "K-PIT".to_string()]);
         assert_eq!(pair_tickers(&sp), vec!["K-LAD".to_string(), "K-PIT".to_string()]);
+    }
+
+    /// `position_from_intents` builds the held Position straight from the two entry OrderIntents: each leg
+    /// = that intent's venue/market/side, the pair `market` = the slug, size = the intent qty. The unwind
+    /// then SELLs back the exact (venue, market, side) — so this round-trips a sports PK fill (YES@pmus +
+    /// YES@Kalshi-B) into a Position whose two legs are both YES, on the right venues/tickers.
+    #[test]
+    fn position_from_intents_records_exact_legs() {
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 7, client_order_id: "xarb-…-A".into() },
+            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 7, client_order_id: "xarb-…-B".into() },
+        ];
+        let pos = position_from_intents("aec-mlb-lad-pit-2026-06-16", Cat::Sports, "mlb-2026-06-16", &legs);
+        assert_eq!(pos.market, "aec-mlb-lad-pit-2026-06-16"); // pair identity = the pmus slug
+        assert_eq!(pos.size, 7);
+        assert_eq!(pos.cluster, "mlb-2026-06-16");
+        assert_eq!(pos.legs[0], PositionLeg { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), side: Side::Yes });
+        assert_eq!(pos.legs[1], PositionLeg { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), side: Side::Yes });
+        // the unwind SELLs back the EXACT legs (venue/market/side), priced at the supplied exit cents.
+        let u = unwind::unwind_orders(&pos, [98, 55]);
+        assert_eq!((u[0].action, u[0].venue, u[0].side, u[0].market.as_str()), (Action::Sell, Venue::Pmus, Side::Yes, "aec-mlb-lad-pit-2026-06-16"));
+        assert_eq!((u[1].action, u[1].venue, u[1].side, u[1].market.as_str()), (Action::Sell, Venue::Kalshi, Side::Yes, "KXMLBGAME-26JUN16-PIT"));
+    }
+
+    /// The exit-pricing helper: a SELL YES leg lifts that book's best `yes_bid`; a SELL NO leg nets
+    /// `1 - yes_ask` (selling NO = buying YES back at the ask). A missing needed side -> None (one-sided
+    /// book) so `unwind_exit_cents` declines to price the pair and the caller holds.
+    #[test]
+    fn exit_pricing_yes_takes_bid_no_takes_one_minus_ask() {
+        let yes_leg = PositionLeg { venue: Venue::Pmus, market: "s".into(), side: Side::Yes };
+        let no_leg = PositionLeg { venue: Venue::Kalshi, market: "K".into(), side: Side::No };
+        let book = Book { yes_bid: Some(0.98), yes_ask: Some(0.99), age_s: 0.0 };
+        assert_eq!(exit_price(&yes_leg, &book), Some(0.98)); // SELL YES -> hit the YES bid
+        assert_eq!(exit_price(&no_leg, &book), Some(1.0 - 0.99)); // SELL NO -> 1 - YES ask = 0.01
+        // a YES leg with no bid -> None; a NO leg with no ask -> None (one-sided book).
+        assert_eq!(exit_price(&yes_leg, &Book { yes_bid: None, yes_ask: Some(0.99), age_s: 0.0 }), None);
+        assert_eq!(exit_price(&no_leg, &Book { yes_bid: Some(0.98), yes_ask: None, age_s: 0.0 }), None);
+
+        // unwind_exit_cents prices BOTH legs (here a YES@pmus + NO@Kalshi weather pair) from their books.
+        let pos = Position {
+            market: "tc-temp-nychigh-2026-06-11-gte95f".into(), cat: Cat::Weather,
+            legs: [yes_leg.clone(), no_leg.clone()], size: 1, cluster: "c".into(),
+        };
+        // YES@pmus bid 0.98 -> 98c; NO@Kalshi 1 - ask(0.11) = 0.89 -> 89c.
+        let pm = Book { yes_bid: Some(0.98), yes_ask: Some(0.99), age_s: 0.0 };
+        let k = Book { yes_bid: Some(0.10), yes_ask: Some(0.11), age_s: 0.0 };
+        let cents = unwind_exit_cents(&pos, |leg| if leg.venue == Venue::Pmus { Some(pm) } else { Some(k) }).unwrap();
+        assert_eq!(cents, [98, 89]);
+        // one leg's book missing the needed side -> the whole pair declines to price (hold).
+        assert!(unwind_exit_cents(&pos, |leg| if leg.venue == Venue::Pmus { Some(Book { yes_bid: None, yes_ask: Some(0.99), age_s: 0.0 }) } else { Some(k) }).is_none());
+    }
+
+    /// `track_position` then `decrement_exposure` round-trips exposure to zero (caps bind on entry, re-open
+    /// on flatten), and a SPORTS pair derives league/date/abbrevs for the poll while non-sports leaves them
+    /// empty.
+    #[test]
+    fn track_and_decrement_exposure_round_trips() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let pair = LivePair {
+            slug: "aec-mlb-lad-pit-2026-06-16".into(),
+            kalshi: "KXMLBGAME-26JUN16-LAD".into(),
+            kalshi_b: Some("KXMLBGAME-26JUN16-PIT".into()),
+            cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0),
+        };
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
+        ];
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs);
+        track_position(&positions, &pair, pos, &mut exp, 0.97);
+        // exposure bumped by cost_per×size = 0.97×4 = 3.88 across pair/cluster/total; one open position.
+        assert!((exp.total - 3.88).abs() < 1e-9);
+        assert!((exp.per_pair["aec-mlb-lad-pit-2026-06-16"] - 3.88).abs() < 1e-9);
+        assert!((exp.per_cluster["mlb-2026-06-16"] - 3.88).abs() < 1e-9);
+        assert_eq!(exp.open_positions, 1);
+        // the held position carries the poll's match fields (league/date/abbrevs from the slug + tickers).
+        let hp = positions.lock().unwrap().get(&pair.slug).cloned().unwrap();
+        assert_eq!((hp.league.as_str(), hp.date.as_str(), hp.team_a.as_str(), hp.team_b.as_str()), ("mlb", "2026-06-16", "lad", "pit"));
+        // flatten -> exposure back to zero, position gone.
+        decrement_exposure(&mut exp, &hp.pos);
+        assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0);
+        assert!(!exp.per_pair.contains_key("aec-mlb-lad-pit-2026-06-16"));
     }
 
     /// PairState registers BOTH sports tickers in `by_ticker` -> slug, and `remove` frees both (so a

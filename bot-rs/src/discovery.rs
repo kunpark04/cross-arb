@@ -116,12 +116,12 @@ pub fn weather_city(slug: &str) -> Option<String> {
 }
 
 /// pmus league token from a sports slug: the 2nd dash-segment (`aec-mlb-lad-pit-...` -> `mlb`). Port of `pmlg`.
-fn pm_league(slug: &str) -> Option<String> {
+pub(crate) fn pm_league(slug: &str) -> Option<String> {
     slug.split('-').nth(1).map(|s| s.to_ascii_lowercase())
 }
 
 /// Extract a `YYYY-MM-DD` date from a slug, if present.
-fn iso_date(slug: &str) -> Option<String> {
+pub(crate) fn iso_date(slug: &str) -> Option<String> {
     let b = slug.as_bytes();
     let mut i = 0;
     while i + 10 <= b.len() {
