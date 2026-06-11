@@ -6,6 +6,37 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, latest+1) — `bot-rs`: postponement-unwind TRIGGER armed (held-position tracking + MLB statsapi + fire)
+
+Armed the postponement-unwind rule — the #1 remaining sports risk (a game postponed past Kalshi's ~2-day
+void window loses BOTH legs: Kalshi voids to a fair price while pmus pays the real result). Committed
+`45a6115` + parity review; **98/98 tests**.
+
+- **Detector** (`postpone.rs`, new): faithful port of `scripts/probe_mlb_postpone.py::unwind_trigger`/`snap`.
+  `detect_postponement` flags Postponed/Suspended/Cancelled (+ an officialDate-move-without-status-flip) and
+  computes the makeup gap from the **bound event date** (the pm slug date), **never** `officialDate` — the L3
+  trap, since on a postponement `officialDate` moves to the makeup date (gap-from-officialDate = 0d → would
+  miss every unwind). All Python `_selftest` vectors ported as Rust tests + verified to match the live Python
+  selftest. `days_between` is dep-free civil-days.
+- **Tracking + firing** (`main.rs`): held positions are recorded from the two entry `OrderIntent`s on a
+  both-filled fill (and exposure is now bumped, so the caps actually bind across the session — a latent gap);
+  a `tokio::select!` adds an `unwind_rx`; `handle_unwind` prices each leg's exit from the live books (SELL
+  YES→best bid, SELL NO→1−ask), fires the two SELLs, removes the position. A one-sided book skips BOTH legs
+  (never a one-legged naked unwind) and retries (idempotent `unwind-…` coids). The live `poll_mlb_postponements`
+  (statsapi teams + schedule, MLB-only) is the owner/droplet path, off all test paths.
+- **Safety:** unwinds are **reduce-only** — they fire even under the kill-switch (flattening a void reduces
+  risk), loudly logged; the dry-run backend only logs; `CROSSARB_NO_AUTO_UNWIND=1` disables auto-unwind. A
+  self-review CRITICAL (a dropped `unwind_tx` busy-looping the `select!`) was caught + fixed in-run.
+- **Independent review: FAITHFUL + SAFE** (`tasks/_agent_bus/20260611-unwind-parity/`) — detector parity
+  triangulated in Python (the TB@NYY officialDate-already-moved case → UNWIND, not the trap's WATCH); exits
+  priced on the correct book side; no one-legged/wrong-game/no-postponement fire. No CRITICAL, no blocking WARN.
+
+**Residual (owner/droplet):** a one-time live `/teams` smoke (the statsapi join matches the Kalshi-ticker team
+suffix to the `/teams` abbreviation — a divergence is a MISSED detect, never a wrong-game fire) + the general
+live poll/connect verification. Non-MLB leagues have no auto-detection source yet (statsapi is MLB).
+
+---
+
 ## 2026-06-11 (UTC, latest) — `bot-rs` stage-2.5: SPORTS made tradable (two-outcome) + latent leg-market bug fixed
 
 Closed the one functional category gap from stage-2 (sports was discovered + counted but not tradeable —

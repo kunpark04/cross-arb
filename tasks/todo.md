@@ -4,36 +4,40 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
-## bot-rs — POSTPONEMENT-UNWIND TRIGGER (2026-06-11) — in progress
+## bot-rs — POSTPONEMENT-UNWIND TRIGGER (2026-06-11) — ✅
 
-ARM the (built+tested) postponement-unwind rule: held-position tracking + live MLB statsapi detection +
+ARMED the (built+tested) postponement-unwind rule: held-position tracking + live MLB statsapi detection +
 the actual SELL-both-legs firing. Closes the #1 sports follow-up (the void/postpone tail is the main
-sports risk). Compile + unit-test only — the live statsapi poll is owner/droplet (statsapi is public, but
-no live HTTP on a test path). Port `scripts/probe_mlb_postpone.py::unwind_trigger`/`snap` FAITHFULLY.
+sports risk). Faithful port of `scripts/probe_mlb_postpone.py::unwind_trigger`/`snap`. **98/98 tests;
+independent review verdict FAITHFUL + SAFE** (`tasks/_agent_bus/20260611-unwind-parity/`).
 
-- [ ] `postpone.rs` (new): `snap(game)->GameStatus` + `detect_postponement(prev,cur,event_date,market)->
-      Option<Postponement>` — port of `unwind_trigger`. POSTPONE_STATES={Postponed,Suspended,Cancelled};
-      Cancelled/no-makeup-date → reschedule_in_days None (→ unwind); **measure the gap from the BOUND
-      event_date (pm slug date), NEVER officialDate** (the L3 trap: officialDate moves to the makeup date →
-      makeup−makeup=0 → misses every unwind); the officialDate-moved-without-status case. **Port ALL the
-      Python `_selftest` vectors as Rust tests** (built-in parity gate). + `days_between` (civil-days, dep-free).
-- [ ] `postpone.rs` async `poll_mlb_postponements(http,positions,unwind_tx,cfg)` (owner/droplet; not tested):
-      cache `teams?sportId=1` id→abbrev; group held MLB sports positions by event date; GET
-      `schedule?sportId=1&date=`; match each game by {team_a,team_b} abbrevs; snap→detect→`should_unwind` →
-      send `UnwindRequest{slug}`. MLB-only (statsapi is MLB; other leagues logged as no-auto-source).
-- [ ] held-position TRACKING (`main`): `positions: Arc<Mutex<HashMap<slug,HeldPosition>>>` (Position + game
-      meta + prev GameStatus). On a fired ENTRY where `PairAck.both_filled()` → record the Position straight
-      from the `[OrderIntent;2]` legs (+ bump exposure per_pair/cluster/total/open — currently never tracked
-      live, so caps don't bind: this closes that too). Game meta derived: league=`pm_league(slug)`,
-      date=`iso_date(slug)`, team_a/team_b = last segment of `pair.kalshi`/`kalshi_b`.
-- [ ] FIRING (`main`): `select!` an `unwind_rx` in the event loop; on `UnwindRequest{slug}` price each leg's
-      exit from the live books (SELL: YES leg→best yes_bid; NO leg→1−best yes_ask), `unwind_orders(pos,[ea,eb])`,
-      `submit_pair` the two SELLs; on success remove the position + decrement exposure. One-sided book → log +
-      retry next poll (idempotent `unwind-…` coids). Dry-run LOGS (never sends). **Reduce-only: allowed under
-      the kill-switch** (flattening a void reduces risk) with a loud log; `CROSSARB_NO_AUTO_UNWIND=1` disables.
-- [ ] `config`: `postpone_poll_s` (default 60), `auto_unwind` (default true). Reuse discovery's
-      `iso_date`/`pm_league` (make `pub(crate)`). Keep all 80 tests green + add detector/exit-pricing/record
-      tests; self-review; verify the Rust detector matches the Python `_selftest` on the same vectors.
+- [x] `postpone.rs` (new) DETECTOR: `snap` + `detect_postponement(prev,cur,event_date,market)` — port of
+      `unwind_trigger`. POSTPONE_STATES={Postponed,Suspended,Cancelled}; Cancelled/no-makeup → reschedule None
+      (→ unwind); **gap measured from the BOUND event_date, NEVER officialDate** (the L3 trap — verified: the
+      TB@NYY officialDate-already-moved vector fires UNWIND at 104d, not the trap's 0d→WATCH); officialDate-
+      moved-without-status case. ALL Python `_selftest` vectors ported as Rust tests + match the live Python
+      selftest. `days_between` = dep-free civil-days.
+- [x] `postpone.rs` async `poll_mlb_postponements` (owner/droplet; off all test paths): caches
+      `teams?sportId=1` id→abbrev; groups held MLB sports positions by event date; `schedule?date=`; matches
+      each game by {team_a,team_b}; snap→detect→`should_unwind` → `UnwindRequest{slug}`. MLB-only (other
+      leagues logged no-auto-source). Supervised (a bad pull logs + continues).
+- [x] held-position TRACKING (`main`): `positions: Arc<Mutex<HashMap<slug,HeldPosition>>>`. On a fired ENTRY
+      where `PairAck.both_filled()` → records the Position from the `[OrderIntent;2]` legs + bumps exposure
+      (per_pair/cluster/total/open — was never tracked live, so caps didn't bind: now they do). Game meta
+      derived from the slug + the two Kalshi tickers' last segments.
+- [x] FIRING (`main`): `select!` over the venue rx + `unwind_rx`; `handle_unwind` prices each leg's exit from
+      the live books (SELL YES→yes_bid, NO→1−yes_ask), fires the two SELLs, removes the position + decrements
+      exposure. One-sided book → WARN + retry (idempotent `unwind-…` coids; never a one-legged unwind).
+      Dry-run LOGS only. **Reduce-only: fires under the kill-switch** (flattening a void reduces risk), logged;
+      `CROSSARB_NO_AUTO_UNWIND=1` disables. Smoke demonstrates snap→detect→should_unwind→two SELLs offline.
+- [x] `config`: `postpone_poll_s` (60) + `auto_unwind` (default on). discovery `iso_date`/`pm_league`
+      → `pub(crate)`. **98 tests** (80 + 18) green; self-review caught + fixed a CRITICAL (dropped `unwind_tx`
+      busy-looping the select!); independent review FAITHFUL+SAFE (no CRITICAL/blocking WARN).
+
+**One residual (owner/droplet INFO, not a code gap):** the statsapi join matches the Kalshi-ticker team
+suffix to the `/teams` abbreviation (lowercased); if a club's two ever diverge it's a MISSED detection
+(never a wrong-game fire) — warrants a one-time live `/teams` smoke on the droplet. Plus the general live
+poll/connect verification (same owner step as the other categories).
 
 > **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
 

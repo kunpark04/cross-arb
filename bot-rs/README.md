@@ -70,7 +70,7 @@ deploy target is **Linux**, where none of this applies (no `windows-sys`, no min
 ```bash
 cd bot-rs
 cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
-cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + auth + unwind (80 tests)
+cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind (98 tests)
 cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
 cargo run -- --smoke   # force the offline smoke even with creds present
 ```
@@ -80,7 +80,7 @@ To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI
 
 ## What's built (stages 1–2.5, complete) vs. what remains (owner env)
 
-**Built + tested (80 tests, all green; dry-run-default, live gated):**
+**Built + tested (98 tests, all green; dry-run-default, live gated):**
 - **Safety-critical spine (std-only):** `types`, `config` (safe defaults), `risk` (all pre-trade gates
   + tests), `exec` (dry-run backend + real Kalshi order-payload builder, pair-shaped `submit_pair`),
   `ledger` (outcome-independent PnL + taker fees), `unwind` (postponement-unwind), `main` (banner + hard
@@ -101,16 +101,21 @@ To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI
   transport** in `LiveBackend::submit_pair` (RSA-PSS/Ed25519 sign + HTTPS POST, **both legs concurrent**
   via `tokio::join!`, keys-absent → `KeysUnavailable`). The `#[tokio::main]` live loop wires it all:
   discovery → WS books (real `age_s`) → matcher → `Quote` → `risk::evaluate` → `submit_pair`.
+- **Postponement-unwind ARMED:** `postpone` (faithful port of `probe_mlb_postpone.py::unwind_trigger` —
+  detects MLB postponements off statsapi and measures the makeup gap from the BOUND event date, not the
+  trap `officialDate`; **independently parity-verified**) + held-position tracking + `handle_unwind` (SELLs
+  both legs at book-derived exits before Kalshi voids). **Reduce-only** (fires under the kill-switch; dry-run
+  logs only; `CROSSARB_NO_AUTO_UNWIND=1` disables). The live statsapi poll is the owner/droplet step.
 
 **Remains — inherently the owner's environment (sandbox blocks auth'd venue I/O), or deferred features:**
 - **Demo-sandbox session** (owner): confirm WS sid-capture, `update_subscription` acceptance, the live
   catalog HTTP shapes, and a clean dry→demo round-trip.
 - **pmus POST-body signing** (owner): the order POST signs `{ts}{METHOD}{path}` only — verify live whether
   pmus folds the body into the canonical string (typed error until confirmed; never a silent guess).
-- **Sports postponement unwind ARMING** (owner): the decision + closing orders are built + tested
-  (`unwind.rs`) and the `Position` now models the two real legs, but the LIVE trigger — statsapi
-  postponement detection + held-position tracking — is the owner's stage-2 wiring. (Sports ENTRY is done;
-  this is the void-tail risk-management trigger.)
+- **Sports postponement unwind — live `/teams` smoke** (owner): the trigger is BUILT + parity-verified
+  (detection + tracking + firing); the one residual is a one-time live `statsapi /teams` check — the join
+  matches the Kalshi-ticker team suffix to the `/teams` abbreviation, so a club whose two diverge is a MISSED
+  detection (never a wrong-game fire). Non-MLB leagues have no auto-detection source yet (statsapi is MLB).
 - **Sports settlement recon** (owner): endDates ~06-23/25 — until then `ASSUME_SPORTS_SETTLED` is an owner
   override, not an empirical clean.
 - **Deferred to next session:** **edge-RATE allocation** (`edge ÷ lock-days`, the 0014-H2 arm) + **maker-side
