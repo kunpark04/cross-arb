@@ -29,6 +29,24 @@ pub enum Dir {
     PK,
 }
 
+impl Dir {
+    /// The DEAR (expensive) venue — the leg you buy NO on. A weather edge led by THIS venue is the
+    /// toxic class (H1: ~79% toxic vs ~17% for the cheap-led venue).
+    pub fn dear_venue(self) -> Venue {
+        match self {
+            Dir::PK => Venue::Kalshi, // pmus cheap (buy YES), Kalshi dear (buy NO)
+            Dir::KP => Venue::Pmus,
+        }
+    }
+    /// The CHEAP venue — the leg you buy YES on.
+    pub fn cheap_venue(self) -> Venue {
+        match self {
+            Dir::PK => Venue::Pmus,
+            Dir::KP => Venue::Kalshi,
+        }
+    }
+}
+
 /// One venue's top-of-book for a market. Prices are dollars in `0.0..=1.0`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Book {
@@ -76,6 +94,10 @@ pub struct Quote {
     pub settle_clean: bool,
     /// Correlated-exposure cluster key (city-date for weather, game for sports) — see [risk].
     pub cluster: String,
+    /// Which venue's quote MOVED to open this edge (the at-open "led_by"). `None` = unknown / first
+    /// sighting. For WEATHER, a DEAR-led edge is ~79% toxic vs ~17% cheap-led (H1, weather-only) — the
+    /// toxicity-direction signal. Stage-2 populates this by diffing against the prior book snapshot.
+    pub led_by: Option<Venue>,
 }
 
 /// A priced cross-venue edge, net of fees, per `$1` of payout.

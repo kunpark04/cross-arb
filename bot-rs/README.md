@@ -24,6 +24,7 @@ of least resistance, because the readiness audit + backtest concluded the edge i
 | Edge floor | `EDGE_FLOOR_CENTS` | 2.0 | 0014 pre-registered floor |
 | Fat-edge haircut | `FAT_EDGE_SIZE_FACTOR` / `FAT_EDGE_KNEE_CENTS` | 0.5 / 6c | size **down** above the knee — fat edges are ~66% toxic & die ~0.5s (readiness audit + rust review); **set factor=1.0 to test** whether a sub-0.5s concurrent fill can capture them |
 | Econ twin divergence | `ECON_TWIN_MAX_DIVERGENCE_CENTS` | 15c | tighter divergence bound for settlement-identical econ twins (vs the 40c cross-category guard) — the 18c U-3 phantom must not sail through |
+| Toxicity-direction gate | `SKIP_DEAR_LED_WEATHER` | true | **H1** (the one tested strategy idea with a signal) — skip **dear-led weather** edges (~79% toxic vs ~17% cheap-led, Fisher p=2.7e-6); **weather-only** (sports null); dormant until stage-2 supplies `led_by` |
 | Settle-clean | `REQUIRE_SETTLE_CLEAN` | true | only trade settlement-verified pairs (weather; econ/sports per recon) |
 | Key path | `KALSHI_RW_KEY_PATH` | unset | external path to the read-write key — loaded at runtime, never copied into the repo |
 
@@ -37,9 +38,11 @@ Kill-switch · WS-reconnect/seq-gap pause (never trade a rebuilding book) · **s
 (invariant #1 — econ/sports must be empirically verified) · crossed/locked book (L12) · staleness (L13)
 · cross-venue **mid-divergence** (L1 bad-join/stale guard; **tighter category bound for econ twins**) ·
 non-positive edge (L11) · opt-in edge floor (L15) · **fat-edge toxicity haircut** (size down above the
-~6c knee — fat edges are adversely-selected; knob to test speed-capture) · per-pair / per-cluster
-(city-date, game) / total notional caps · concurrency cap · depth- and bankroll-limited sizing (a thin
-book is *small* size, not no-trade — L15) · order **idempotency** (`client_order_id`).
+~6c knee — fat edges are adversely-selected; knob to test speed-capture) · **toxicity-DIRECTION gate**
+(H1 — skip dear-led *weather* edges, ~79% toxic; weather-only, dormant until stage-2 supplies `led_by`) ·
+per-pair / per-cluster (city-date, game) / total notional caps · concurrency cap · depth- and
+bankroll-limited sizing (a thin book is *small* size, not no-trade — L15) · order **idempotency**
+(`client_order_id`).
 
 Execution is **pair-shaped**: `ExecutionBackend::submit_pair` fires BOTH legs as the unit (the live
 backend fires them *concurrently* over two warm connections — serial legging ~doubles latency, the one

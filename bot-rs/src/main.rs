@@ -89,11 +89,12 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         depth: Depth { c2: 100, c1: 100, c0: 100 },
         settle_clean: false,
         cluster: "u3-2026-07-02".into(),
+        led_by: None,
     };
     println!("[smoke] econ U-3 9c gap, settlement NOT yet verified:");
     report(cfg, &econ, Edge { net: 0.09, dir: Dir::PK }, 75, backend);
 
-    // (2) a clean, settlement-verified weather arb above the 2c floor -> approved (size=1 by default).
+    // (2) a clean, settlement-verified weather arb above the 2c floor, cheap-led (benign) -> approved.
     let wx = Quote {
         market: "tc-temp-nychigh-2026-06-11-gte95f".into(),
         cat: Cat::Weather,
@@ -102,9 +103,16 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         depth: Depth { c2: 40, c1: 50, c0: 60 },
         settle_clean: true,
         cluster: "nychigh-2026-06-11".into(),
+        led_by: Some(Venue::Pmus), // cheap venue (dir PK) led -> benign
     };
-    println!("[smoke] weather arb, settlement verified, 3c edge:");
+    println!("[smoke] weather arb, verified, 3c edge, cheap-led (benign):");
     report(cfg, &wx, Edge { net: 0.03, dir: Dir::PK }, 7, backend);
+
+    // (3) same weather arb but DEAR-led -> the H1 toxicity-direction gate rejects it (weather-only).
+    let mut wx_toxic = wx.clone();
+    wx_toxic.led_by = Some(Venue::Kalshi); // dear venue (dir PK) led -> ~79% toxic
+    println!("[smoke] weather arb, verified, 3c edge, DEAR-led (toxic):");
+    report(cfg, &wx_toxic, Edge { net: 0.03, dir: Dir::PK }, 7, backend);
 }
 
 fn report(cfg: &Config, q: &Quote, edge: Edge, buy_price_cents: u8, backend: &mut dyn ExecutionBackend) {

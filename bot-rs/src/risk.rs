@@ -17,6 +17,7 @@ pub enum Reject {
     MidDivergence(f64),   // L1 — identical-settlement pair's mids disagree wildly (bad join/stale)
     NonPositiveEdge,      // L11 — never book net<=0
     BelowEdgeFloor,       // opt-in 0014 floor (skip thin arbs); always reported, never silent (L15)
+    ToxicDirection,       // H1 — dear-led WEATHER edge (~79% toxic); weather-only, tested signal
     NoFillableSize,       // size collapsed to 0 after depth/clip/affordability/caps
     PairCap,
     ClusterCap,
@@ -110,6 +111,17 @@ pub fn evaluate(
         return Err(Reject::BelowEdgeFloor);
     }
 
+    // 4b. TOXICITY-DIRECTION gate (H1 — the one tested idea that produced a signal; WEATHER-ONLY).
+    //     A weather edge where the DEAR venue led the move is ~79% toxic vs ~17% for cheap-led; the
+    //     cheap quote was right and you'd be adversely-selected onto the wrong leg. Skipping dear-led
+    //     weather cut portfolio toxicity ~43%->31% at ~0c realized-edge cost (strategy-idea tests,
+    //     Fisher p=2.7e-6, weather-only — sports is null, so this MUST stay weather-scoped). `led_by`
+    //     is None until stage-2 tracks the prior book snapshot, so the gate is dormant until then.
+    //     (Stage-2 may swap skip -> serial-lead-the-cheap-leg to KEEP the edge instead of skipping it.)
+    if cfg.skip_dear_led_weather && q.cat == Cat::Weather && q.led_by == Some(edge.dir.dear_venue()) {
+        return Err(Reject::ToxicDirection);
+    }
+
     // 5. concurrency
     if exp.open_positions >= cfg.max_concurrent_positions {
         return Err(Reject::ConcurrencyCap);
@@ -185,6 +197,7 @@ mod tests {
             econ_twin_max_divergence_cents: 15.0,
             fat_edge_knee_cents: 6.0,
             fat_edge_size_factor: 0.5,
+            skip_dear_led_weather: true,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             kill_switch: false,
@@ -199,6 +212,7 @@ mod tests {
             depth: Depth { c2: 50, c1: 60, c0: 70 },
             settle_clean: true,
             cluster: "nychigh-2026-06-11".into(),
+            led_by: None, // unknown until stage-2 tracks the prior book snapshot
         }
     }
     fn edge() -> Edge {
@@ -288,6 +302,32 @@ mod tests {
         w.pm = Book { yes_bid: Some(0.66), yes_ask: Some(0.69), age_s: 0.1 };
         w.k = Book { yes_bid: Some(0.85), yes_ask: Some(0.86), age_s: 0.0 };
         assert!(evaluate(&cfg(), &w, &edge(), &Exposure::new(), 1000).is_ok());
+    }
+
+    #[test]
+    fn toxicity_direction_gate_is_weather_only_and_dear_led() {
+        // edge dir PK => cheap=Pmus, dear=Kalshi. A weather edge LED BY the dear venue (Kalshi) is the
+        // ~79%-toxic class -> rejected. Same edge cheap-led (Pmus) or unknown (None) -> allowed.
+        let e = Edge { net: 0.03, dir: Dir::PK };
+        let mut dear_led = quote();
+        dear_led.led_by = Some(Venue::Kalshi); // dear venue led -> toxic
+        assert_eq!(evaluate(&cfg(), &dear_led, &e, &Exposure::new(), 1000), Err(Reject::ToxicDirection));
+
+        let mut cheap_led = quote();
+        cheap_led.led_by = Some(Venue::Pmus); // cheap venue led -> benign, allowed
+        assert!(evaluate(&cfg(), &cheap_led, &e, &Exposure::new(), 1000).is_ok());
+
+        // sports is NULL for this signal -> the gate must NOT fire even when dear-led
+        let mut sport = quote();
+        sport.cat = Cat::Sports;
+        sport.settle_clean = true;
+        sport.led_by = Some(Venue::Kalshi);
+        assert!(evaluate(&cfg(), &sport, &e, &Exposure::new(), 1000).is_ok());
+
+        // knob off -> dear-led weather allowed (e.g. to A/B the gate or run serial-lead-cheap instead)
+        let mut c = cfg();
+        c.skip_dear_led_weather = false;
+        assert!(evaluate(&c, &dear_led, &e, &Exposure::new(), 1000).is_ok());
     }
 
     #[test]
