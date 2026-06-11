@@ -167,6 +167,35 @@ pub fn pmus_subscribe(request_id: &str, slugs: &[String]) -> String {
     .to_string()
 }
 
+/// The Kalshi `update_subscription` frame — a NO-GAP in-place add/delete on the live sid (probe-verified
+/// `probe_kalshi_ws.py --multisub`: control acks consume a seq slot, existing books stream uninterrupted,
+/// only added tickers re-snapshot). Port of `monitor.py::update_sub_cmd`. `action` ∈ {add_markets,
+/// delete_markets}; an unknown action returns `None` (the caller must not send a bogus frame).
+pub fn kalshi_update_subscription(id: u64, sid: u64, tickers: &[String], action: &str) -> Option<String> {
+    if action != "add_markets" && action != "delete_markets" {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "id": id,
+            "cmd": "update_subscription",
+            "params": {"sids": [sid], "market_tickers": tickers, "action": action}
+        })
+        .to_string(),
+    )
+}
+
+/// A live subscribe-set mutation handed to a running stream over its control channel: new keys to
+/// subscribe + settled keys to drop. Mirrors `monitor.py`'s heartbeat add/prune. For Kalshi these become
+/// `update_subscription` add/delete on the live sid; for pmus, an `add` is a new subscribe shard and a
+/// `del` is a local no-op (pmus has no documented unsubscribe — a settled market simply stops streaming
+/// and the main loop already ignores untracked slugs).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SubUpdate {
+    pub add: Vec<String>,
+    pub del: Vec<String>,
+}
+
 // =====================================================================================================
 // LIVE ASYNC STREAMS  (connect + subscribe + supervised reconnect; the owner's-droplet path)
 // =====================================================================================================
@@ -236,18 +265,26 @@ fn client_request(
 
 /// Kalshi WS stream: connect, subscribe the tickers, merge snapshot+delta frames into the shared book
 /// map, push a `VenueEvent::Kalshi{ticker}` per updated book. A seq gap pushes `SeqGap` and cycles the
-/// connection. Supervised reconnect with backoff. Runs until `tickers` is empty or forever otherwise.
+/// connection. Supervised reconnect with backoff. Runs forever (discovery keeps the set non-empty).
 /// `books` is shared (the main loop reads it to build Quotes); this task is its only writer.
+///
+/// `subs` is the live discovery channel: each `SubUpdate` is applied IN PLACE via `update_subscription`
+/// (no-gap add/delete on the captured sid — `monitor.py` cadence), so a newly-discovered weather day is
+/// subscribed without cycling the connection and a settled market is dropped. `tracked` (shared with the
+/// main loop) is the authoritative current ticker set: a reconnect re-subscribes IT (adds made during the
+/// last connection survive the reconnect, mirroring monitor.py re-subscribing the CURRENT targets).
 #[allow(clippy::await_holding_lock)] // book lock is a std Mutex held only across in-memory merges, never .await
 pub async fn kalshi_stream(
     creds: std::sync::Arc<VenueCreds>,
-    tickers: Vec<String>,
+    tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     books: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, KalshiBook>>>,
     tx: tokio::sync::mpsc::UnboundedSender<VenueEvent>,
+    mut subs: tokio::sync::mpsc::UnboundedReceiver<SubUpdate>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = 1u64;
+    let mut cmd_id = 1u64; // monotonic WS command id (id=1 is the connect subscribe)
     loop {
         let ts = now_ms();
         let hdrs = auth::kalshi_headers(&creds.kalshi_rsa, &creds.kalshi_access_key, ts, "GET", KALSHI_WS_PATH);
@@ -259,27 +296,49 @@ pub async fn kalshi_stream(
             }
         };
         let mut seq = SeqTracker::new();
+        let mut sid: Option<u64> = None; // captured from the subscribed/ok ack -> targets update_subscription
         let mut clean;
         match tokio_tungstenite::connect_async(req).await {
             Ok((mut ws, _resp)) => {
-                // fresh connection -> rebuild every book from snapshots (clear stale state).
+                // fresh connection -> rebuild every book from snapshots (clear stale state). Re-subscribe
+                // the CURRENT tracked set (includes anything discovery added on the prior connection).
                 books.lock().unwrap().clear();
-                let sub = kalshi_subscribe(1, &tickers);
+                let current: Vec<String> = tracked.lock().unwrap().iter().cloned().collect();
+                let sub = kalshi_subscribe(cmd_id, &current);
+                cmd_id += 1;
                 if ws.send(Message::text(sub)).await.is_err() {
                     eprintln!("[kalshi] subscribe send failed; reconnecting");
                 } else {
                     backoff = 1; // connected + subscribed OK -> reset backoff
                     clean = true;
-                    while let Some(item) = ws.next().await {
+                    'read: loop {
+                        // FAIR select (no `biased`): a busy frame stream must not starve discovery sub
+                        // updates (tokio randomizes poll order each iteration). Adds/deletes apply between
+                        // frames; the WS lib still drains pings/pongs.
+                        let item = tokio::select! {
+                            frame = ws.next() => match frame {
+                                Some(f) => f,
+                                None => break 'read, // stream ended
+                            },
+                            upd = subs.recv() => {
+                                match upd {
+                                    Some(u) => {
+                                        apply_kalshi_sub_update(&mut ws, sid, &mut cmd_id, &u).await;
+                                        continue 'read;
+                                    }
+                                    None => continue 'read, // discovery channel closed -> keep streaming
+                                }
+                            }
+                        };
                         let raw = match item {
                             Ok(Message::Text(t)) => t.to_string(),
                             Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
-                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Close(_)) => break 'read,
                             Ok(_) => continue, // ping/pong handled by the lib
                             Err(e) => {
                                 eprintln!("[kalshi] read error: {e}");
                                 clean = false;
-                                break;
+                                break 'read;
                             }
                         };
                         let o: Value = match serde_json::from_str(&raw) {
@@ -291,11 +350,15 @@ pub async fn kalshi_stream(
                                 let _ = tx.send(VenueEvent::SeqGap { seq: s });
                                 eprintln!("[kalshi] seq gap at {s} -> cycling connection (no replay)");
                                 clean = false;
-                                break;
+                                break 'read;
                             }
                         }
                         let typ = o.get("type").and_then(Value::as_str).unwrap_or("");
                         let msg = o.get("msg").cloned().unwrap_or(Value::Null);
+                        // capture the sid from the subscribed/ok ack — update_subscription targets it.
+                        if sid.is_none() && matches!(typ, "subscribed" | "ok") {
+                            sid = msg.get("sid").and_then(Value::as_u64);
+                        }
                         let ticker = msg.get("market_ticker").and_then(Value::as_str).map(str::to_string);
                         match typ {
                             "orderbook_snapshot" => {
@@ -330,24 +393,51 @@ pub async fn kalshi_stream(
                 let _ = tx.send(VenueEvent::Reconnect { venue: Venue::Kalshi, clean: false });
             }
         }
-        if tickers.is_empty() {
-            return;
-        }
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
 }
 
+/// Apply a discovery `SubUpdate` to the live Kalshi connection: `update_subscription` add/delete on the
+/// captured `sid` (no-gap). If the sid isn't known yet (ack not seen), the add can't target it — the
+/// `tracked` set already holds the new keys, so the NEXT reconnect subscribes them (the monitor.py
+/// "sid not yet known -> cycle" fallback; here a cheaper "wait for reconnect" since the set is shared).
+async fn apply_kalshi_sub_update<S>(ws: &mut S, sid: Option<u64>, cmd_id: &mut u64, u: &SubUpdate)
+where
+    S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
+{
+    use tokio_tungstenite::tungstenite::Message;
+    let Some(sid) = sid else {
+        return; // ack not yet seen; reconnect will subscribe the current tracked set
+    };
+    for (keys, action) in [(&u.add, "add_markets"), (&u.del, "delete_markets")] {
+        if keys.is_empty() {
+            continue;
+        }
+        if let Some(frame) = kalshi_update_subscription(*cmd_id, sid, keys, action) {
+            *cmd_id += 1;
+            let _ = ws.send(Message::text(frame)).await;
+        }
+    }
+}
+
 /// pmus WS stream: connect, subscribe the slugs (sharded ≤100), parse each `marketData` frame and push
 /// `VenueEvent::Pmus{slug, bids, asks}` (the main loop owns the `PmusBook` map). Supervised reconnect.
+///
+/// `subs` is the live discovery channel: an `add` is sent as a new subscribe shard (the live-verified
+/// add pattern from `monitor.py`); a `del` is a LOCAL no-op (pmus has no documented unsubscribe — a
+/// settled market stops streaming and the main loop already ignores untracked slugs, and `tracked` is
+/// pruned so a reconnect doesn't re-subscribe it). A reconnect re-subscribes the CURRENT `tracked` set.
 pub async fn pmus_stream(
     creds: std::sync::Arc<VenueCreds>,
-    slugs: Vec<String>,
+    tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     tx: tokio::sync::mpsc::UnboundedSender<VenueEvent>,
+    mut subs: tokio::sync::mpsc::UnboundedReceiver<SubUpdate>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = 1u64;
+    let mut add_seq = 0u64; // unique requestId suffix for in-place add shards
     loop {
         let ts = now_ms();
         let hdrs = auth::pmus_headers(&creds.pmus_ed25519, &creds.pmus_access_key, ts, "GET", PMUS_WS_PATH);
@@ -361,8 +451,9 @@ pub async fn pmus_stream(
         let mut clean = true;
         match tokio_tungstenite::connect_async(req).await {
             Ok((mut ws, _resp)) => {
+                let current: Vec<String> = tracked.lock().unwrap().iter().cloned().collect();
                 let mut send_ok = true;
-                for (i, shard) in slugs.chunks(PMUS_SHARD).enumerate() {
+                for (i, shard) in current.chunks(PMUS_SHARD).enumerate() {
                     let sub = pmus_subscribe(&format!("md-{i}"), shard);
                     if ws.send(Message::text(sub)).await.is_err() {
                         eprintln!("[pmus] subscribe send failed; reconnecting");
@@ -372,16 +463,34 @@ pub async fn pmus_stream(
                 }
                 if send_ok {
                     backoff = 1;
-                    while let Some(item) = ws.next().await {
+                    'read: loop {
+                        // FAIR select (no `biased`) — same rationale as kalshi_stream.
+                        let item = tokio::select! {
+                            frame = ws.next() => match frame {
+                                Some(f) => f,
+                                None => break 'read,
+                            },
+                            upd = subs.recv() => {
+                                if let Some(u) = upd {
+                                    for shard in u.add.chunks(PMUS_SHARD) {
+                                        add_seq += 1;
+                                        let sub = pmus_subscribe(&format!("md-add-{add_seq}"), shard);
+                                        let _ = ws.send(Message::text(sub)).await;
+                                    }
+                                    // u.del: no wire action (see fn docs).
+                                }
+                                continue 'read;
+                            }
+                        };
                         let raw = match item {
                             Ok(Message::Text(t)) => t.to_string(),
                             Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
-                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Close(_)) => break 'read,
                             Ok(_) => continue,
                             Err(e) => {
                                 eprintln!("[pmus] read error: {e}");
                                 clean = false;
-                                break;
+                                break 'read;
                             }
                         };
                         let o: Value = match serde_json::from_str(&raw) {
@@ -412,9 +521,6 @@ pub async fn pmus_stream(
                 eprintln!("[pmus] connect failed: {e}; reconnect in {backoff}s");
                 let _ = tx.send(VenueEvent::Reconnect { venue: Venue::Pmus, clean: false });
             }
-        }
-        if slugs.is_empty() {
-            return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
@@ -529,5 +635,29 @@ mod tests {
         // the snapshot/delta parsers only act on their own `type`; a `subscribed` frame has neither.
         assert_eq!(ack["type"], "subscribed");
         assert!(ack["msg"].get("market_ticker").is_none());
+        // the sid is captured from this ack -> targets update_subscription (the stream reads msg.sid).
+        assert_eq!(ack["msg"]["sid"], 7);
+    }
+
+    /// `update_subscription` add/delete envelope matches the probe-verified wire shape (monitor.py
+    /// update_sub_cmd selftest); a bogus action yields None so no malformed frame is ever sent.
+    #[test]
+    fn update_subscription_envelope_and_bad_action() {
+        let add: Value = serde_json::from_str(&kalshi_update_subscription(7, 3, &["T1".into(), "T2".into()], "add_markets").unwrap()).unwrap();
+        assert_eq!(add["cmd"], "update_subscription");
+        assert_eq!(add["id"], 7);
+        assert_eq!(add["params"]["sids"][0], 3);
+        assert_eq!(add["params"]["market_tickers"][1], "T2");
+        assert_eq!(add["params"]["action"], "add_markets");
+        let del: Value = serde_json::from_str(&kalshi_update_subscription(8, 3, &["T1".into()], "delete_markets").unwrap()).unwrap();
+        assert_eq!(del["params"]["action"], "delete_markets");
+        assert!(kalshi_update_subscription(9, 3, &["T1".into()], "remove_markets").is_none()); // bogus -> no frame
+    }
+
+    /// SubUpdate diffing helper the refresh task uses (current vs fresh -> add/del). A pure set-diff.
+    #[test]
+    fn sub_update_default_is_empty() {
+        let u = SubUpdate::default();
+        assert!(u.add.is_empty() && u.del.is_empty());
     }
 }

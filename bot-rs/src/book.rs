@@ -14,6 +14,7 @@
 
 use crate::types::{Book, Depth, Dir, Venue};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// Integer price key in hundredths of a cent (4dp dollars * 10_000) so the BTreeMap orders by price
 /// and equal prices collapse to one level regardless of float representation. Range 0..=10_000.
@@ -29,10 +30,20 @@ fn from_key(k: PriceKey) -> f64 {
 const QTY_EPS: f64 = 1e-9; // a level at/under this is empty (drop it) — mirrors kalshi_book.py.
 
 /// Kalshi local book for ONE market: `yes`/`no` hold resting BID qty keyed by price.
-#[derive(Default, Debug, Clone)]
+/// `last_update` stamps the wall-clock instant of the most recent applied snapshot/delta — the source
+/// of the staleness `age` the risk gate reads (L13: a wedged stream stops restamping, so its `age`
+/// grows and `Reject::StaleBook` fires). Not `#[derive(Default)]` because `Instant` has no `Default`.
+#[derive(Debug, Clone)]
 pub struct KalshiBook {
     yes: BTreeMap<PriceKey, f64>, // resting YES bids
     no: BTreeMap<PriceKey, f64>,  // resting NO bids (a YES ask = 1 - no bid)
+    last_update: Instant,
+}
+
+impl Default for KalshiBook {
+    fn default() -> Self {
+        KalshiBook { yes: BTreeMap::new(), no: BTreeMap::new(), last_update: Instant::now() }
+    }
 }
 
 impl KalshiBook {
@@ -46,6 +57,7 @@ impl KalshiBook {
     pub fn apply_snapshot(&mut self, yes: &[(f64, f64)], no: &[(f64, f64)]) {
         self.yes = yes.iter().map(|&(p, q)| (to_key(p), q)).collect();
         self.no = no.iter().map(|&(p, q)| (to_key(p), q)).collect();
+        self.last_update = Instant::now();
     }
 
     /// Apply one signed delta to a side. `delta_qty` is additive; a level at/under zero is dropped.
@@ -61,6 +73,7 @@ impl KalshiBook {
         if *v <= QTY_EPS {
             book.remove(&k);
         }
+        self.last_update = Instant::now();
     }
 
     /// (best YES bid, best YES ask). YES ask = 1 - best NO bid. Mirrors `best()`. O(1) via map ends.
@@ -70,10 +83,31 @@ impl KalshiBook {
         (yb, ya)
     }
 
-    /// The `Book` touch the signal/risk layers consume (best YES bid/ask + staleness age).
-    pub fn touch(&self, age_s: f64) -> Book {
+    /// The `Book` touch the signal/risk layers consume (best YES bid/ask + staleness age). `age_s` is
+    /// derived from `last_update` so a wedged/half-dead stream's book ages out and the staleness gate
+    /// (L13) fires — the live loop no longer hands a hard-coded `0.0`.
+    pub fn touch(&self) -> Book {
+        self.touch_at(self.last_update.elapsed().as_secs_f64())
+    }
+
+    /// `touch` with an EXPLICIT age — for synthetic snapshots/tests that pin staleness deterministically
+    /// (real-time `Instant` elapsed is non-deterministic). The live path uses `touch()`.
+    pub fn touch_at(&self, age_s: f64) -> Book {
         let (yb, ya) = self.best();
         Book { yes_bid: yb, yes_ask: ya, age_s }
+    }
+
+    /// Seconds since the last applied snapshot/delta (the raw staleness `age`). Exposed so the live loop
+    /// can take the WORST of the two legs as the pair's staleness.
+    pub fn age_s(&self) -> f64 {
+        self.last_update.elapsed().as_secs_f64()
+    }
+
+    /// TEST-ONLY: backdate `last_update` so `touch()`/`age_s()` report a deterministic age without a real
+    /// sleep — lets a test prove a wedged book ages out (the `Reject::StaleBook` path) end-to-end.
+    #[cfg(test)]
+    pub fn backdate(&mut self, secs: u64) {
+        self.last_update = Instant::now() - std::time::Duration::from_secs(secs);
     }
 
     /// YES BID ladder as `[(price, qty)]` DESCENDING (best/highest first).
@@ -94,11 +128,19 @@ impl KalshiBook {
 }
 
 /// pmus book for ONE market: YES bid + YES ask ladders straight from its snapshot (pmus serves the
-/// YES book directly — no merge). Ladders are stored sorted on access.
-#[derive(Default, Debug, Clone)]
+/// YES book directly — no merge). Ladders are stored sorted on access. `last_update` carries the
+/// staleness clock, same as `KalshiBook`.
+#[derive(Debug, Clone)]
 pub struct PmusBook {
     yes_bids: Vec<(f64, f64)>, // (price, qty)
     yes_asks: Vec<(f64, f64)>,
+    last_update: Instant,
+}
+
+impl Default for PmusBook {
+    fn default() -> Self {
+        PmusBook { yes_bids: Vec::new(), yes_asks: Vec::new(), last_update: Instant::now() }
+    }
 }
 
 impl PmusBook {
@@ -111,6 +153,7 @@ impl PmusBook {
     pub fn apply_snapshot(&mut self, yes_bids: &[(f64, f64)], yes_asks: &[(f64, f64)]) {
         self.yes_bids = yes_bids.to_vec();
         self.yes_asks = yes_asks.to_vec();
+        self.last_update = Instant::now();
     }
 
     /// (best YES bid = highest bid, best YES ask = lowest ask).
@@ -128,9 +171,26 @@ impl PmusBook {
         (yb, ya)
     }
 
-    pub fn touch(&self, age_s: f64) -> Book {
+    /// `Book` touch with the staleness age derived from `last_update` (see `KalshiBook::touch`).
+    pub fn touch(&self) -> Book {
+        self.touch_at(self.last_update.elapsed().as_secs_f64())
+    }
+
+    /// `touch` with an EXPLICIT age — synthetic/test path (see `KalshiBook::touch_at`).
+    pub fn touch_at(&self, age_s: f64) -> Book {
         let (yb, ya) = self.best();
         Book { yes_bid: yb, yes_ask: ya, age_s }
+    }
+
+    /// Seconds since the last applied snapshot (the raw staleness `age`).
+    pub fn age_s(&self) -> f64 {
+        self.last_update.elapsed().as_secs_f64()
+    }
+
+    /// TEST-ONLY: backdate `last_update` (see `KalshiBook::backdate`).
+    #[cfg(test)]
+    pub fn backdate(&mut self, secs: u64) {
+        self.last_update = Instant::now() - std::time::Duration::from_secs(secs);
     }
 
     /// YES BID ladder DESCENDING (best first).
@@ -313,5 +373,50 @@ mod tests {
         let yes: Vec<(f64, f64)> = (1..=50).map(|i| (i as f64 / 100.0, 10.0)).collect();
         b.apply_snapshot(&yes, &[(0.49, 5.0)]);
         assert_eq!(b.best(), (Some(0.50), Some(0.51))); // top YES bid .50; ask = 1 - .49
+    }
+
+    /// Staleness `age` is derived from the last applied update (L13): a just-applied snapshot/delta is
+    /// ~fresh (age ~0), so `touch()` no longer hard-codes 0.0. (The "old book -> StaleBook reject" path
+    /// is exercised at the risk layer via `touch_at`, since fast-forwarding a real `Instant` isn't
+    /// deterministic — `touch_at` presents exactly what an aged book yields.)
+    #[test]
+    fn touch_age_tracks_last_update() {
+        let mut k = KalshiBook::new();
+        k.apply_snapshot(&[(0.67, 100.0)], &[(0.31, 40.0)]);
+        assert!(k.touch().age_s < 1.0, "just-updated Kalshi book is fresh"); // wall-clock, well under 1s
+        let mut pm = PmusBook::new();
+        pm.apply_snapshot(&[(0.05, 300.0)], &[(0.07, 90.0)]);
+        assert!(pm.touch().age_s < 1.0, "just-updated pmus book is fresh");
+        // an applied delta restamps freshness too.
+        k.apply_delta(Side::Yes, 0.68, 30.0);
+        assert!(k.age_s() < 1.0);
+    }
+
+    /// A wedged stream stops restamping -> `touch()` reports a large age that the risk gate rejects
+    /// (`Reject::StaleBook`). Backdating is deterministic (no sleep); this is the real `touch()` path,
+    /// not a hand-built `Book{age_s}`. The threshold lives in config (`max_book_age_s`, default 5s).
+    #[test]
+    fn wedged_book_ages_out_and_is_rejected_by_risk() {
+        use crate::types::*;
+        let mut k = KalshiBook::new();
+        k.apply_snapshot(&[(0.86, 100.0)], &[(0.13, 100.0)]);
+        let mut pm = PmusBook::new();
+        pm.apply_snapshot(&[(0.74, 100.0)], &[(0.75, 100.0)]);
+        pm.backdate(9); // pmus stream wedged ~9s -> stale (> the 5s default)
+        let q = Quote {
+            market: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+            cat: Cat::Weather,
+            pm: pm.touch(), // REAL age from last_update, not 0.0
+            k: k.touch(),
+            depth: Depth { c2: 50, c1: 60, c0: 70 },
+            settle_clean: true,
+            cluster: "nychigh-2026-06-11".into(),
+            led_by: None,
+            days_to_event: None,
+        };
+        assert!(q.pm.age_s > 5.0 && q.k.age_s < 1.0);
+        let cfg = crate::config::Config::test_default();
+        let r = crate::risk::evaluate(&cfg, &q, &Edge { net: 0.09, dir: Dir::PK }, &crate::risk::Exposure::new(), 1000);
+        assert_eq!(r, Err(crate::risk::Reject::StaleBook(Venue::Pmus)));
     }
 }

@@ -27,6 +27,27 @@ connect/orders are the owner's droplet step). Safety spine (42 tests) stays gree
       DISCOVERY port (fills the live loop's `pairs`); per-venue book `age` (the staleness gate `Reject::StaleBook`
       is inert while books are fed `age_s=0.0`); pmus POST-body signing live-verify; demo-sandbox session.
 
+## bot-rs DISCOVERY + STALENESS (2026-06-11) — closing the last two functional gaps ✅
+
+- [x] `discovery.rs` (new): async catalog pull BOTH venues (reqwest/rustls, PUBLIC/no-auth). pmus
+      `?closed=false&limit=500&offset=` (page<limit = last); Kalshi `?series_ticker=&limit=&cursor=`
+      (empty cursor = last). Pure slug PARSERS (weather city, econ fam/ineq/period/thr, sports
+      league/abbrevs/date) → apply `matcher.rs` joins → `Vec<Pair>` (weather+econ subscribable 1:1;
+      sports matched+counted only — 1:1 loop can't price two tickers). UNIT-TESTED on embedded JSON
+      (joins + no-false-joins, incl. the L21 econ off-by-one + GDP full-date period); live pull NOT tested.
+- [x] Staleness: `KalshiBook`/`PmusBook` carry `last_update: Instant`, stamped on every applied
+      snapshot/delta; `touch()` derives real `age_s` from it. Loop's per-leg gate = worst-of-two-legs →
+      `Reject::StaleBook` fires on a wedged stream (deterministic backdate test, no sleep).
+- [x] Wired into `main.rs`: initial discover → seed shared `tracked` + `PairState`; periodic
+      `refresh_loop` (`DISCOVERY_REFRESH_S`, default 300) re-discovers, diffs (`diff_targets`), prunes
+      (2-miss `prune_step`), applies in-place add/delete + frees pruned books. Dry-run + all gates intact.
+- [x] venue.rs: in-place subscribe-set update via a `SubUpdate` control channel — Kalshi no-gap
+      `update_subscription` add/delete on the captured sid; pmus add-shard, delete local no-op. Fair select.
+- [x] `cargo test` GREEN (**66**: 53 existing + 13 new) + clippy clean (new code) + self-review
+      (artifacts: `tasks/_agent_bus/20260611-1015/`). **Self-review caught + fixed a CRITICAL** (GDP econ
+      pairs silently dropped — Kalshi period parser truncated the day vs the python `\d{0,2}`; fixed + test).
+      Live-verify pending on the droplet (catalog HTTP, WS sid-capture, `update_subscription` acceptance).
+
 > **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
 
 ## Reviewer audit (2026-06-09) — fixes ([reviewer-audit-2026-06-09.md](reviewer-audit-2026-06-09.md))

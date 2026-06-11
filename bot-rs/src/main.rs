@@ -10,6 +10,7 @@
 mod auth;
 mod book;
 mod config;
+mod discovery;
 mod exec;
 mod ledger;
 mod matcher;
@@ -96,10 +97,9 @@ fn banner(cfg: &Config) {
     println!();
 }
 
-/// A co-listed pair the live loop tracks: the pmus slug + its settlement-identical Kalshi twin(s).
-/// (Weather/econ bind ONE Kalshi ticker; sports bind two — out of scope for this network-layer loop,
-/// which handles the 1:1 binary case. Discovery — the `colisted_map.py` port that fills this list from
-/// the live universe — is the SEPARATE stage-2 matcher task; here the loop consumes whatever it's given.)
+/// A co-listed pair the live loop tracks: the pmus slug + its settlement-identical Kalshi twin (1:1).
+/// Filled by `discovery` (the colisted_map.py port). Sports' two-ticker shape is out of this 1:1 loop's
+/// scope — discovery counts it but does not emit it here (see `discovery` module docs).
 #[derive(Clone, Debug)]
 struct LivePair {
     slug: String,         // pmus market slug
@@ -110,25 +110,72 @@ struct LivePair {
     days_to_event: Option<f64>,
 }
 
-/// STAGE-2 live loop: connect both venue WS streams, maintain a book per venue for each tracked pair,
-/// and on each COMPLETE dual-venue update (L5) build a `Quote`, run `risk::evaluate`, and `submit_pair`
-/// (dry-run default). Honors the kill-switch + the already-checked prod-consent gate.
+impl From<discovery::Pair> for LivePair {
+    fn from(p: discovery::Pair) -> Self {
+        LivePair { slug: p.slug, kalshi: p.kalshi, cat: p.cat, cluster: p.cluster, settle_clean: p.settle_clean, days_to_event: p.days_to_event }
+    }
+}
+
+/// Shared, mutable pair state the event loop READS and the refresh task MUTATES (add new pairs / drop
+/// settled). `by_slug` is the authoritative pair record; `by_ticker` indexes the Kalshi side.
+#[derive(Default)]
+struct PairState {
+    by_slug: std::collections::HashMap<String, LivePair>,
+    by_ticker: std::collections::HashMap<String, String>, // Kalshi ticker -> pmus slug
+}
+
+impl PairState {
+    fn insert(&mut self, p: LivePair) {
+        self.by_ticker.insert(p.kalshi.clone(), p.slug.clone());
+        self.by_slug.insert(p.slug.clone(), p);
+    }
+    fn remove(&mut self, slug: &str) {
+        if let Some(p) = self.by_slug.remove(slug) {
+            self.by_ticker.remove(&p.kalshi);
+        }
+    }
+}
+
+/// STAGE-2 live loop: discover the co-listed universe, connect both venue WS streams, maintain a book
+/// per venue for each tracked pair, and on each COMPLETE dual-venue update (L5) build a `Quote`, run
+/// `risk::evaluate`, and `submit_pair` (dry-run default). A periodic refresh task re-discovers and
+/// applies in-place subscribe add/prune. Honors the kill-switch + the already-checked prod-consent gate.
 async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::sync::Arc<venue::VenueCreds>) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
-    // DISCOVERY SEAM: the colisted-map port (stage-2 matcher task) fills this. Until then the loop runs
-    // with no pairs (connects, idles) unless pairs are injected by a test/harness — it never invents a
-    // universe to trade. An empty list means "nothing to subscribe", and the loop reports + idles.
-    let pairs: Vec<LivePair> = Vec::new();
-    if pairs.is_empty() {
-        println!("[live] no co-listed pairs supplied (discovery is the stage-2 matcher port) — the WS");
-        println!("[live] clients are wired; with pairs they subscribe both venues and run the pipeline.");
-        println!("[live] idling. (This is the network layer; discovery plugs in here.)\n");
-        // We still demonstrate the spine is reachable by running the offline smoke once, then return —
-        // so a creds-present sandbox run is not a silent no-op.
-        smoke(cfg, backend);
-        return;
+    let http = reqwest::Client::builder().use_rustls_tls().build().unwrap_or_else(|_| reqwest::Client::new());
+
+    // INITIAL DISCOVERY (PUBLIC, no-auth catalog pull). A degraded/empty first pass is not fatal — seed
+    // with whatever discovery returns (possibly nothing) and let the refresh task fill in; the loop never
+    // invents a universe to trade.
+    let initial = match discovery::discover(&http).await {
+        Ok(d) => {
+            println!(
+                "[discovery] {} weather + {} econ pairs ({} sports matched, not subscribed in the 1:1 loop)",
+                d.weather_pairs, d.econ_pairs, d.sports_pairs
+            );
+            report_coverage(&d);
+            d.pairs
+        }
+        Err(e) => {
+            println!("[discovery] initial pull failed ({e}) — starting empty; refresh will retry.");
+            Vec::new()
+        }
+    };
+
+    let pairs: Arc<Mutex<PairState>> = Arc::new(Mutex::new(PairState::default()));
+    let k_tracked: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let pm_tracked: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    {
+        let mut ps = pairs.lock().unwrap();
+        let mut kt = k_tracked.lock().unwrap();
+        let mut pt = pm_tracked.lock().unwrap();
+        for p in initial {
+            kt.insert(p.kalshi.clone());
+            pt.insert(p.slug.clone());
+            ps.insert(LivePair::from(p));
+        }
     }
 
     // book stores: Kalshi books are owned by the kalshi_stream (shared so the loop can read touches);
@@ -136,16 +183,24 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
     let kalshi_books: Arc<Mutex<HashMap<String, book::KalshiBook>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut pmus_books: HashMap<String, book::PmusBook> = HashMap::new();
     let mut prior_mid: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new(); // slug -> (pm_mid, k_mid) for led_by
-    let by_slug: HashMap<String, LivePair> = pairs.iter().cloned().map(|p| (p.slug.clone(), p)).collect();
-    let by_ticker: HashMap<String, String> = pairs.iter().map(|p| (p.kalshi.clone(), p.slug.clone())).collect();
     let mut exposure = Exposure::new();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<venue::VenueEvent>();
-    let tickers: Vec<String> = pairs.iter().map(|p| p.kalshi.clone()).collect();
-    let slugs: Vec<String> = pairs.iter().map(|p| p.slug.clone()).collect();
+    let (k_subs_tx, k_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
+    let (pm_subs_tx, pm_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
 
-    tokio::spawn(venue::kalshi_stream(creds.clone(), tickers, kalshi_books.clone(), tx.clone()));
-    tokio::spawn(venue::pmus_stream(creds.clone(), slugs, tx.clone()));
+    tokio::spawn(venue::kalshi_stream(creds.clone(), k_tracked.clone(), kalshi_books.clone(), tx.clone(), k_subs_rx));
+    tokio::spawn(venue::pmus_stream(creds.clone(), pm_tracked.clone(), tx.clone(), pm_subs_rx));
+    tokio::spawn(refresh_loop(
+        http.clone(),
+        cfg.discovery_refresh_s,
+        pairs.clone(),
+        k_tracked.clone(),
+        pm_tracked.clone(),
+        kalshi_books.clone(),
+        k_subs_tx,
+        pm_subs_tx,
+    ));
     drop(tx); // the spawned tasks hold their own senders; drop ours so rx closes if both ever end
 
     // A venue WS reconnect/seq-gap pauses trading until THAT venue's books rebuild (never trade a
@@ -158,12 +213,17 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         let slug = match &ev {
             venue::VenueEvent::Kalshi { ticker } => {
                 k_rebuild = false; // a Kalshi book frame -> its rebuild is flowing again
-                by_ticker.get(ticker).cloned()
+                pairs.lock().unwrap().by_ticker.get(ticker).cloned()
             }
             venue::VenueEvent::Pmus { slug, bids, asks } => {
                 pm_rebuild = false; // a pmus book frame -> its rebuild is flowing again
-                pmus_books.entry(slug.clone()).or_default().apply_snapshot(bids, asks);
-                Some(slug.clone())
+                if pm_tracked.lock().unwrap().contains(slug) {
+                    pmus_books.entry(slug.clone()).or_default().apply_snapshot(bids, asks);
+                    Some(slug.clone())
+                } else {
+                    pmus_books.remove(slug); // a settled/pruned slug still streaming -> free its book (L20)
+                    None
+                }
             }
             venue::VenueEvent::Reconnect { venue: v, clean } => {
                 println!("[live] {v:?} reconnect (clean={clean}) — pausing entries until its books rebuild");
@@ -183,17 +243,22 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         };
         exposure.stream_paused = k_rebuild || pm_rebuild; // recompute after a (possibly) clearing frame
         let Some(slug) = slug else { continue }; // a Kalshi ticker we don't track
-        let Some(pair) = by_slug.get(&slug) else { continue };
+        // clone the pair record out so we don't hold the pairs lock across the Quote build / book locks
+        // (the refresh task may be mutating the map concurrently).
+        let Some(pair) = pairs.lock().unwrap().by_slug.get(&slug).cloned() else { continue };
 
         // build the COMPLETE dual-venue Quote (L5: classify on both venues' current state, not one frame).
+        // Each touch carries its book's REAL staleness `age` (seconds since its last applied frame), so a
+        // wedged stream ages its leg out and `risk::evaluate` fires `Reject::StaleBook` (L13). The gate
+        // checks BOTH legs, so the worse (older) leg governs the pair's staleness.
         let pm = match pmus_books.get(&slug) {
-            Some(b) => b.touch(0.0), // age tracked elsewhere in stage-2; fresh-on-update here
-            None => continue,        // no pmus book yet -> incomplete, wait
+            Some(b) => b.touch(),
+            None => continue, // no pmus book yet -> incomplete, wait
         };
         let (k, depth_dir, edge) = {
             let kb = kalshi_books.lock().unwrap();
             let Some(kbook) = kb.get(&pair.kalshi) else { continue }; // no Kalshi book yet -> incomplete
-            let k = kbook.touch(0.0);
+            let k = kbook.touch();
             let pmb = pmus_books.get(&slug).unwrap();
             let sig = signal::signal(&pm, &k);
             let depth = book::depth_at_edge(kbook, pmb, sig.edge.dir);
@@ -229,6 +294,156 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         }
     }
     println!("[live] both venue streams ended — loop exiting.");
+}
+
+/// Log the discovery coverage report LOUDLY (L7): an unmapped category / misaligned bucket / truncated
+/// catalog must never pass silently — a human decides whether to extend the config.
+fn report_coverage(d: &discovery::Discovery) {
+    if !d.weather_cities_unmapped.is_empty() {
+        println!("[coverage] UNMAPPED climate cities (MISSED until added to discovery::WX): {:?}", d.weather_cities_unmapped);
+    }
+    if !d.sports_leagues_unmapped.is_empty() {
+        println!("[coverage] UNMAPPED sports leagues: {:?}", d.sports_leagues_unmapped);
+    }
+    if d.weather_buckets_misaligned > 0 {
+        println!("[coverage] {} weather buckets had no identical-bounds Kalshi twin (NOT paired)", d.weather_buckets_misaligned);
+    }
+    if d.truncated {
+        println!("[coverage] WARNING pmus catalog hit the page cap — coverage INCOMPLETE");
+    }
+}
+
+/// Set-diff the CURRENT subscribed keys against a FRESH discovery's keys -> the in-place `SubUpdate`
+/// (add = fresh-not-current; del = current-not-fresh). Pure; the prune debounce is applied separately so
+/// a transient discovery blip can't drop a live market (see `prune_step`).
+fn diff_targets(current: &std::collections::HashSet<String>, fresh: &std::collections::HashSet<String>, to_prune: &std::collections::HashSet<String>) -> venue::SubUpdate {
+    let add = fresh.iter().filter(|k| !current.contains(*k)).cloned().collect();
+    let del = to_prune.iter().filter(|k| current.contains(*k)).cloned().collect();
+    venue::SubUpdate { add, del }
+}
+
+/// 2-miss prune debounce (port of `monitor.py::prune_decision`): a tracked slug absent from `current`
+/// discovery for `threshold` consecutive refreshes is settled -> prune. A reappearance resets its count,
+/// so an API hiccup / pagination blip doesn't tear down a still-live market. Mutates `absent`.
+fn prune_step(
+    tracked: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
+    absent: &mut std::collections::HashMap<String, u32>,
+    threshold: u32,
+) -> std::collections::HashSet<String> {
+    let mut to_prune = std::collections::HashSet::new();
+    for slug in tracked {
+        if current.contains(slug) {
+            absent.insert(slug.clone(), 0);
+        } else {
+            let c = absent.entry(slug.clone()).or_insert(0);
+            *c += 1;
+            if *c >= threshold {
+                to_prune.insert(slug.clone());
+            }
+        }
+    }
+    to_prune
+}
+
+/// PERIODIC RE-DISCOVERY (mirrors `monitor.py::rest_heartbeat`): every `refresh_s` re-pull both catalogs,
+/// add newly-listed pairs (no-gap in-place subscribe), and prune settled ones (2-miss debounce). A
+/// DEGRADED pull (error) is skipped entirely — never prune on a failed pull (a fetch error makes live
+/// markets look settled; monitor.py H4). Supervised: one bad cycle logs and continues, never kills the task.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_loop(
+    http: reqwest::Client,
+    refresh_s: u64,
+    pairs: std::sync::Arc<std::sync::Mutex<PairState>>,
+    k_tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pm_tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    kalshi_books: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
+    k_subs: tokio::sync::mpsc::UnboundedSender<venue::SubUpdate>,
+    pm_subs: tokio::sync::mpsc::UnboundedSender<venue::SubUpdate>,
+) {
+    use std::collections::{HashMap, HashSet};
+    let mut absent: HashMap<String, u32> = HashMap::new(); // pmus slug -> consecutive-miss count
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(refresh_s.max(1))).await;
+        let fresh = match discovery::discover(&http).await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("[refresh] discovery DEGRADED ({e}) — keeping current set, no prune (H4)");
+                continue;
+            }
+        };
+        report_coverage(&fresh);
+
+        // fresh keys by venue.
+        let fresh_slugs: HashSet<String> = fresh.pairs.iter().map(|p| p.slug.clone()).collect();
+        let fresh_tickers: HashSet<String> = fresh.pairs.iter().map(|p| p.kalshi.clone()).collect();
+
+        // snapshot the PRE-refresh subscribed set (slugs + each pair's Kalshi ticker) before mutating.
+        let (pre_slugs, slug_to_ticker): (HashSet<String>, HashMap<String, String>) = {
+            let ps = pairs.lock().unwrap();
+            (
+                ps.by_slug.keys().cloned().collect(),
+                ps.by_slug.iter().map(|(s, p)| (s.clone(), p.kalshi.clone())).collect(),
+            )
+        };
+        let pre_tickers: HashSet<String> = slug_to_ticker.values().cloned().collect();
+
+        // PRUNE debounce (keyed on the pmus slug = the pair identity); pruned slugs -> their Kalshi tickers.
+        let prune_slugs = prune_step(&pre_slugs, &fresh_slugs, &mut absent, 2);
+        let prune_tickers: HashSet<String> = prune_slugs.iter().filter_map(|s| slug_to_ticker.get(s).cloned()).collect();
+
+        // the in-place WIRE updates: add = fresh keys not already subscribed; del = the pruned keys. Pure
+        // set-diff (the stream tolerates a re-add as a harmless no-gap merge, but we send the minimal set).
+        let k_update = diff_targets(&pre_tickers, &fresh_tickers, &prune_tickers);
+        let pm_update = diff_targets(&pre_slugs, &fresh_slugs, &prune_slugs);
+
+        // apply to the shared pair map + tracked sets (streams re-subscribe `tracked` on reconnect, so
+        // mutate it before dispatching so a reconnect-during-refresh stays consistent).
+        let mut added = 0usize;
+        {
+            let mut ps = pairs.lock().unwrap();
+            let mut kt = k_tracked.lock().unwrap();
+            let mut pt = pm_tracked.lock().unwrap();
+            for p in &fresh.pairs {
+                if !ps.by_slug.contains_key(&p.slug) {
+                    kt.insert(p.kalshi.clone());
+                    pt.insert(p.slug.clone());
+                    ps.insert(LivePair::from(p.clone()));
+                    added += 1;
+                }
+            }
+            for s in &prune_slugs {
+                ps.remove(s);
+                pt.remove(s);
+                absent.remove(s);
+            }
+            for tk in &prune_tickers {
+                kt.remove(tk);
+            }
+        }
+        // free settled Kalshi books so memory stays FLAT over a multi-week run (L20), not only on the next
+        // reconnect-clear. (pmus books are freed in the event loop when an untracked frame arrives.)
+        if !prune_tickers.is_empty() {
+            let mut kb = kalshi_books.lock().unwrap();
+            for tk in &prune_tickers {
+                kb.remove(tk);
+            }
+        }
+
+        // dispatch the wire updates (pmus `del` is a local-only no-op — see pmus_stream docs).
+        if !k_update.add.is_empty() || !k_update.del.is_empty() {
+            let _ = k_subs.send(k_update);
+        }
+        if !pm_update.add.is_empty() {
+            let _ = pm_subs.send(venue::SubUpdate { add: pm_update.add, del: Vec::new() });
+        }
+        if added > 0 || !prune_slugs.is_empty() {
+            println!(
+                "[refresh] +{added} pairs, -{} settled ({} weather + {} econ pairs live)",
+                prune_slugs.len(), fresh.weather_pairs, fresh.econ_pairs
+            );
+        }
+    }
 }
 
 /// Contracts the bankroll can fund at this pair price — the `affordable` arg to `risk::evaluate`. Derived
@@ -474,5 +689,52 @@ mod tests {
         let (yes_ask, no_ask) = leg_prices(&q, Dir::PK);
         assert_eq!(cents(yes_ask), Some(7));
         assert_eq!(cents(no_ask), None); // -> the live loop `continue`s instead of firing a naked leg
+    }
+
+    use std::collections::{HashMap, HashSet};
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The refresh diff: add = fresh-not-current, del = the pruned keys. Pure set-diff.
+    #[test]
+    fn diff_targets_adds_new_and_deletes_pruned() {
+        let current = set(&["A", "B", "C"]);
+        let fresh = set(&["B", "C", "D"]); // A gone, D new
+        let to_prune = set(&["A"]); // A debounced out
+        let u = diff_targets(&current, &fresh, &to_prune);
+        assert_eq!(u.add, vec!["D".to_string()]);
+        assert_eq!(u.del, vec!["A".to_string()]);
+        // a key still in fresh is never deleted even if it appears in to_prune (defensive: prune wins
+        // only on keys actually absent from fresh, which the debounce already guarantees).
+        let u2 = diff_targets(&current, &fresh, &HashSet::new());
+        assert!(u2.del.is_empty() && u2.add == vec!["D".to_string()]);
+    }
+
+    /// The 2-miss prune debounce (monitor.py parity): missing ONCE holds; missing TWICE prunes; a
+    /// reappearance resets the miss count.
+    #[test]
+    fn prune_step_debounces_two_misses() {
+        let tracked = set(&["a", "b", "c"]);
+        let mut absent: HashMap<String, u32> = HashMap::new();
+        // round 1: b,c missing once -> hold (only a is present).
+        assert_eq!(prune_step(&tracked, &set(&["a"]), &mut absent, 2), HashSet::new());
+        // round 2: still missing -> prune both.
+        assert_eq!(prune_step(&tracked, &set(&["a"]), &mut absent, 2), set(&["b", "c"]));
+        // a reappearance resets the counter (b back -> not pruned next miss).
+        let mut absent2: HashMap<String, u32> = HashMap::new();
+        prune_step(&tracked, &set(&["a", "c"]), &mut absent2, 2); // b missing once
+        prune_step(&tracked, &set(&["a", "b", "c"]), &mut absent2, 2); // b back -> reset
+        assert_eq!(prune_step(&tracked, &set(&["a", "c"]), &mut absent2, 2), HashSet::new()); // b missing once again -> hold
+    }
+
+    /// `LivePair` carries discovery's settle_clean through unchanged (weather true, econ false) so the
+    /// risk gate's settlement-identity check is fed the right value per category.
+    #[test]
+    fn livepair_from_discovery_preserves_settle_clean() {
+        let wx = discovery::Pair { slug: "tc-temp-x-2026-06-11-gte95f".into(), kalshi: "K".into(), cat: Cat::Weather, cluster: "x".into(), settle_clean: true, days_to_event: Some(0.0) };
+        let ec = discovery::Pair { slug: "urc-x".into(), kalshi: "K2".into(), cat: Cat::Econ, cluster: "u3-26JUN".into(), settle_clean: false, days_to_event: None };
+        assert!(LivePair::from(wx).settle_clean);
+        assert!(!LivePair::from(ec).settle_clean);
     }
 }

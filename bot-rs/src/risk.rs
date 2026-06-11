@@ -222,6 +222,7 @@ mod tests {
             kalshi_void_window_days: 2.0,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
+            discovery_refresh_s: 300,
             kill_switch: false,
         }
     }

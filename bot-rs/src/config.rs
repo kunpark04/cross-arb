@@ -44,6 +44,7 @@ pub struct Config {
     pub kalshi_void_window_days: f64,     // postponement-unwind: Kalshi voids if reschedule is past this (~2d)
     pub leg_fill_timeout_ms: u64,         // unwind leg A if leg B isn't filled in time
     pub require_settle_clean: bool,       // only trade settlement-verified pairs (econ/sports)
+    pub discovery_refresh_s: u64,         // periodic re-discovery interval (monitor.py heartbeat = 300s)
 
     pub kill_switch: bool, // CROSSARB_KILL=1 -> halt everything
 }
@@ -81,6 +82,7 @@ impl Config {
             kalshi_void_window_days: env_f64("KALSHI_VOID_WINDOW_DAYS", 2.0),
             leg_fill_timeout_ms: env_u64("LEG_FILL_TIMEOUT_MS", 500),
             require_settle_clean: env_bool("REQUIRE_SETTLE_CLEAN", true),
+            discovery_refresh_s: env_u64("DISCOVERY_REFRESH_S", 300),
 
             kill_switch: env_bool("CROSSARB_KILL", false),
         }
@@ -91,6 +93,39 @@ impl Config {
     }
     pub fn is_prod(&self) -> bool {
         self.venue_env == VenueEnv::Prod
+    }
+
+    /// TEST-ONLY staged-rollout defaults built WITHOUT reading the environment (the real `from_env`
+    /// reads process env, which is shared mutable state across parallel tests). Mirrors the per-module
+    /// inline literals so cross-module tests (book/discovery) don't re-spell all fields.
+    #[cfg(test)]
+    pub fn test_default() -> Config {
+        Config {
+            mode: ExecutionMode::DryRun,
+            venue_env: VenueEnv::Demo,
+            kalshi_key_path: String::new(),
+            pmus_env_path: String::new(),
+            edge_floor_cents: 2.0,
+            max_contracts_per_pair: 100,
+            max_notional_per_pair: 1000.0,
+            max_notional_per_cluster: 1000.0,
+            max_total_notional: 1000.0,
+            max_concurrent_positions: 5,
+            max_book_age_s: 5.0,
+            mid_divergence_reject_cents: 40.0,
+            econ_twin_max_divergence_cents: 15.0,
+            fat_edge_knee_cents: 6.0,
+            fat_edge_size_factor: 0.5,
+            skip_dear_led_weather: true,
+            assume_sports_settled: false,
+            assume_econ_settled: false,
+            max_days_to_event: 2.0,
+            kalshi_void_window_days: 2.0,
+            leg_fill_timeout_ms: 500,
+            require_settle_clean: true,
+            discovery_refresh_s: 300,
+            kill_switch: false,
+        }
     }
 }
 
