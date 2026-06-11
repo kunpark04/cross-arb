@@ -62,12 +62,22 @@ for city, (kser, pmtag) in CITY.items():
         dir_, X = mth.group(1), int(mth.group(2))
         r = get(f"https://gateway.polymarket.us/v1/markets?id={x.get('id')}&includeBook=true")
         m0 = (r.get("markets") or [{}])[0] if isinstance(r, dict) else {}
-        outs = json.loads(m0.get("outcomes","[]")) if isinstance(m0.get("outcomes"), str) else (m0.get("outcomes") or [])
-        prices = json.loads(m0.get("outcomePrices","[]")) if isinstance(m0.get("outcomePrices"), str) else (m0.get("outcomePrices") or [])
-        yi = outs.index("Yes") if "Yes" in outs else 0
-        ni = outs.index("No") if "No" in outs else 1
-        yask = float(prices[yi]) if yi < len(prices) and prices[yi] else None
-        nask = float(prices[ni]) if ni < len(prices) and prices[ni] else None
+        # marketSides is the authoritative label<->price pairing: outcomes[] and outcomePrices[] are
+        # NOT index-aligned (prices follow marketSides order; outcomes order is display noise) — [L23]
+        yask = nask = None
+        for s in (m0.get("marketSides") or []):
+            d = str(s.get("description") or "").strip().lower()
+            try: p = float(s.get("price"))
+            except (TypeError, ValueError): continue
+            if d == "yes" or (not d and s.get("long") is True): yask = p
+            elif d == "no" or (not d and s.get("long") is False): nask = p
+        if yask is None and nask is None:  # legacy fallback only if marketSides is absent entirely
+            outs = json.loads(m0.get("outcomes","[]")) if isinstance(m0.get("outcomes"), str) else (m0.get("outcomes") or [])
+            prices = json.loads(m0.get("outcomePrices","[]")) if isinstance(m0.get("outcomePrices"), str) else (m0.get("outcomePrices") or [])
+            yi = outs.index("Yes") if "Yes" in outs else 0
+            ni = outs.index("No") if "No" in outs else 1
+            yask = float(prices[yi]) if yi < len(prices) and prices[yi] else None
+            nask = float(prices[ni]) if ni < len(prices) and prices[ni] else None
         ybid = (1-nask) if nask is not None else None
         ymid = (yask+ybid)/2 if (yask is not None and ybid is not None) else (yask if yask is not None else None)
         # P(high<=X): if dir is lt/lte -> Yes==P(<=X); if gte/gt -> Yes==P(>=X) -> P(<=X-1)=1-Yes

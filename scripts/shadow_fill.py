@@ -25,18 +25,30 @@ trajectory is COARSE and the survival/realized-edge numbers are OPTIMISTIC - rea
 move between logged transitions. This BOUNDS achievable edge FROM ABOVE; true fills are no better than this.
 
 READ-ONLY. `--selftest` runs the offline synthetic verification; no args runs on the real archive.
+`--post-epoch` restricts to records stamped by the 0013 monitor (detection-time CLOSEs) — the ONLY
+records on which the sub-second grid points are real (pre-0013 stamps carry the ~1.25s flush lag the
+shared loader corrects, so nothing below ~1s is resolvable there; see decision 0013 / [L22]).
 
   python scripts/shadow_fill.py --selftest
-  python scripts/shadow_fill.py [--data-dir PATH] [--edge-min 0.01]
+  python scripts/shadow_fill.py [--data-dir PATH] [--edge-min 0.01] [--post-epoch]
+                                [--window-min S] [--liq-floor N] [--by-category] [--json-out PATH]
 """
 import os, sys, argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from analyze_persistence import load, build_episodes  # reuse - do not duplicate
+from analyze_persistence import load, build_episodes, ECON_REMAP_DEPLOY_TS  # reuse - do not duplicate
+from capital_sim import capturable as _shared_capturable   # the ONE quality gate ([L20])
 
-# Latency sweep (seconds): 0 = idealized instant fill; up to 10s = a sluggish path.
-LATENCIES = (0, 0.25, 0.5, 1, 2, 5, 10)
+# Latency sweep (seconds): 0 = idealized instant fill; 0.05-0.5 = the sub-second regime where the
+# measured 86-261ms order RTT lives (real only on post-0013 detection-time stamps); up to 10s sluggish.
+LATENCIES = (0, 0.05, 0.1, 0.15, 0.25, 0.5, 1, 2, 5, 10)
 CONT = ("WIDEN", "NARROW", "FLIP")   # in-episode continuations that move net_edge
+
+
+def post_epoch(records, epoch=ECON_REMAP_DEPLOY_TS):
+    """Records stamped by the 0013 monitor only (t >= deploy epoch). The straddling deploy restart is a
+    session_start, so any episode cut by this filter was restart-censored anyway."""
+    return [r for r in records if r["t"] >= epoch]
 
 
 def build_trajectories(records, sessions, episodes):
@@ -102,19 +114,18 @@ def edge_at(ep, x):
     return net
 
 
-def capturable(episodes, edge_min):
-    """Capturable = measured (clean or eod, real duration lower bound), opened with edge >= edge_min, and with
-    measured fillable depth (open_c2 >= 1). Mirrors analyze_persistence's CAPTURABLE gate so the two agree."""
-    return [e for e in episodes
-            if e["censored"] in ("none", "eod")
-            and e["open_net"] >= edge_min
-            and e.get("open_c2", 0) >= 1]
+def capturable(episodes, edge_min, window_min=0, liq_floor=1):
+    """Quality gate via the SHARED chokepoint capital_sim.capturable ([L20] - never a private copy).
+    Defaults (window_min=0, liq_floor=1) reproduce the historical shadow-fill cohort: measured episodes
+    (restart-censored phantoms dropped, clean+eod kept), open_net >= edge_min, measured depth c2 >= 1.
+    window_min/liq_floor are OPT-IN analysis lenses ([L15]) - callers must show the unfiltered baseline."""
+    return _shared_capturable(episodes, edge_min, window_min, liq_floor=liq_floor)
 
 
-def shadow_fill(episodes, edge_min, latencies=LATENCIES):
+def shadow_fill(episodes, edge_min, latencies=LATENCIES, window_min=0, liq_floor=1):
     """Return per-L rows: {L, n, survival, fill_fail, realized_median, realized_mean, realized_p25}.
        survival/fill_fail are fractions of the SAME capturable cohort; realized_* are over survivors only."""
-    cohort = capturable(episodes, edge_min)
+    cohort = capturable(episodes, edge_min, window_min, liq_floor)
     rows = []
     n = len(cohort)
     for L in latencies:
@@ -168,11 +179,21 @@ def _c(x):
     return 100.0 * x
 
 
-def render(rows, n_cohort, edge_min, span_d=None):
+DUR_CUTS = (0.25, 0.5, 1.0, 2.0, 5.0, 30.0)
+
+def duration_dist(cohort, cuts=DUR_CUTS):
+    """Share of the cohort whose episode duration is < each cut (seconds). eod-censored durations are
+    LOWER BOUNDS, so the sub-cut shares are slightly conservative-high if eod episodes sit below a cut."""
+    n = len(cohort)
+    return {c: (sum(1 for e in cohort if e["duration"] < c) / n if n else 0.0) for c in cuts}
+
+
+def render(rows, n_cohort, edge_min, span_d=None, label=""):
     out = []
     P = out.append
     P("=" * 74)
-    P("SHADOW-FILL  (read-only leg-fill-risk proxy; OPTIMISTIC upper bound on achievable edge)")
+    P("SHADOW-FILL  (read-only leg-fill-risk proxy; OPTIMISTIC upper bound on achievable edge)" +
+      (f"  [{label}]" if label else ""))
     P(f"  cohort: {n_cohort} capturable episodes (open_net >= {_c(edge_min):.1f}c, measured depth c2 >= 1)")
     if span_d is not None:
         P(f"  archive span: {span_d:.2f} d")
@@ -300,7 +321,39 @@ def _selftest():
     txt = render(rows, n, 0.01)
     assert "SHADOW-FILL" in txt and "leg-fail" in txt
     print("  OK - render produces the table")
+
+    # sub-second grid points exist and are exercised: E1 (closes t=1.5) survives at L=0.5 but its
+    # realized edge at 0.5 is still the open 3c; at L=2 it leg-fails (asserted above).
+    assert all(L in byL for L in (0.05, 0.1, 0.15, 0.25, 0.5)), sorted(byL)
+    assert byL[0.5]["n_survived"] == 2 and byL[0.5]["fill_fail"] == 0.0, byL[0.5]
+
+    # post-epoch filter: only records at/after the epoch survive
+    pe = post_epoch([{"t": 5, "x": 1}, {"t": 15, "x": 2}], epoch=10)
+    assert pe == [{"t": 15, "x": 2}], pe
+
+    # duration distribution: E1 dur=1.5, E2 dur=10 -> <2s share 0.5, <30s share 1.0, <1s share 0
+    dd = duration_dist(capturable(eps, 0.01))
+    assert abs(dd[2.0] - 0.5) < 1e-12 and abs(dd[30.0] - 1.0) < 1e-12 and dd[1.0] == 0.0, dd
+
+    # opt-in lenses flow through the SHARED capital_sim gate: dur>=5s keeps only E2; c2>=150 keeps only E2
+    assert [e["market"] for e in capturable(eps, 0.01, window_min=5)] == [E2]
+    assert [e["market"] for e in capturable(eps, 0.01, liq_floor=150)] == [E2]
+    rows_w, n_w = shadow_fill(eps, 0.01, window_min=5)
+    assert n_w == 1 and {r["L"]: r for r in rows_w}[2]["fill_fail"] == 0.0   # E2 alone, alive at 2s
+    print("  OK - sub-second grid + post-epoch filter + duration dist + shared-gate lenses")
     print("self-test passed.")
+
+
+def _dump_subset(eps, edge_min, window_min=0, liq_floor=1, label=""):
+    """Run the grid on one (optionally lensed) cohort; return (printable, json-safe dict)."""
+    rows, n = shadow_fill(eps, edge_min, window_min=window_min, liq_floor=liq_floor)
+    cohort = capturable(eps, edge_min, window_min, liq_floor)
+    dd = duration_dist(cohort)
+    txt = [render(rows, n, edge_min, label=label), "  duration < cut (share of cohort): " +
+           "  ".join(f"<{c:g}s {100*v:.1f}%" for c, v in sorted(dd.items()))]
+    return "\n".join(txt), {"label": label, "filter": {"edge_min": edge_min, "window_min": window_min,
+                            "liq_floor": liq_floor}, "n": n, "rows": rows,
+                            "duration_dist": {str(k): v for k, v in dd.items()}}
 
 
 # ============================================================================================
@@ -309,20 +362,52 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true", help="offline synthetic verification")
     ap.add_argument("--data-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "data", "cross-arb"))
     ap.add_argument("--edge-min", type=float, default=0.01, help="min open_net fraction for capturable (default 0.01 = 1c)")
+    ap.add_argument("--post-epoch", action="store_true",
+                    help="post-0013 records only (detection-time stamps; sub-second grid is real)")
+    ap.add_argument("--window-min", type=float, default=0,
+                    help="OPT-IN lens ([L15]): also show the duration >= S subset next to the baseline")
+    ap.add_argument("--liq-floor", type=int, default=1,
+                    help="OPT-IN lens ([L15]): also show the open_c2 >= N subset next to the baseline")
+    ap.add_argument("--by-category", action="store_true", help="also break out weather/sports/econ")
+    ap.add_argument("--json-out", default=None, help="dump all subset grids to this JSON path")
     args = ap.parse_args()
 
     if args.selftest:
         _selftest(); sys.exit(0)
 
-    import glob
+    import glob, json
     data_dir = os.path.abspath(args.data_dir)
     if not os.path.isdir(data_dir) or not glob.glob(os.path.join(data_dir, "transitions-*.jsonl*")):
         print(f"no data at {data_dir} - run `pwsh deploy/pull-data.ps1` first, or `--selftest`.")
         sys.exit(0)
     recs, sessions = load(data_dir)
+    if args.post_epoch:
+        n0 = len(recs)
+        recs = post_epoch(recs)
+        print(f"POST-EPOCH: {len(recs)}/{n0} records at t >= {ECON_REMAP_DEPLOY_TS} (0013 detection-time stamps)")
     eps = build_episodes(recs, sessions)
     build_trajectories(recs, sessions, eps)
     span_d = (recs[-1]["t"] - recs[0]["t"]) / 86400.0 if recs else 0.0
     print(f"loaded {len(recs)} transitions + {len(sessions)} restarts from {data_dir}\n")
-    rows, n = shadow_fill(eps, args.edge_min)
-    print(render(rows, n, args.edge_min, span_d))
+
+    subsets = []                                       # (eps_subset, window_min, liq_floor, label)
+    subsets.append((eps, 0, 1, "ALL capturable (unfiltered baseline)"))
+    if args.window_min or args.liq_floor > 1:          # the opt-in decision lens, baseline always shown
+        subsets.append((eps, args.window_min, args.liq_floor,
+                        f"LENS dur>={args.window_min:g}s c2>={args.liq_floor}"))
+        if args.window_min and args.liq_floor > 1:     # isolate each lever ([L19])
+            subsets.append((eps, 0, args.liq_floor, f"LENS c2>={args.liq_floor} only (ex-ante observable)"))
+    if args.by_category:
+        for cat in ("weather", "sports", "econ"):
+            subsets.append(([e for e in eps if e["cat"] == cat], 0, 1, f"category={cat}"))
+
+    js = {"data_dir": data_dir, "post_epoch": bool(args.post_epoch), "epoch": ECON_REMAP_DEPLOY_TS,
+          "span_d": span_d, "n_records": len(recs), "subsets": []}
+    for sub_eps, wm, lf, label in subsets:
+        txt, j = _dump_subset(sub_eps, args.edge_min, wm, lf, label)
+        print(txt + ("\n  archive span: %.2f d\n" % span_d))
+        js["subsets"].append(j)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(js, f, indent=1)
+        print(f"json -> {args.json_out}")
