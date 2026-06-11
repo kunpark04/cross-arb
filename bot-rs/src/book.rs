@@ -10,14 +10,16 @@
 //!
 //! Storage is a `BTreeMap<PriceKey, qty>` keyed on integer ticks (not a HashMap scanned every read);
 //! best-bid/ask are O(1) via the map's ordered ends. Prices are dollars in `0.0..=1.0`, quantized to
-//! the 1c venue tick for the key so float dust can't fragment a level.
+//! 4dp (1/100c) for the key so float dust can't fragment a level — sub-cent-safe for the 2dp venue grid
+//! (a genuine sub-cent price keys separately, matching no current series).
 
 use crate::types::{Book, Depth, Dir, Venue};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Integer price key in hundredths of a cent (4dp dollars * 10_000) so the BTreeMap orders by price
-/// and equal prices collapse to one level regardless of float representation. Range 0..=10_000.
+/// and equal prices collapse to one level regardless of float representation. Range 0..=10_000. The
+/// quantum is 1/100c (4dp), NOT 1c — safe for the 2dp venue grid; a true sub-cent price keys separately.
 type PriceKey = i32;
 
 fn to_key(price_dollars: f64) -> PriceKey {

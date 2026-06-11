@@ -118,24 +118,32 @@ pub enum Ineq {
     Cat, // categorical (Fed) — label==label, no inequality
 }
 
+/// The parsed pmus econ slug fields a join needs (bundled so `match_econ` doesn't take a long positional
+/// run of two `Option`s + three `&str`s that are easy to transpose at a call site — a silent cluster-label
+/// bug). Built from `discovery::EconParse` at the call site; carries no Kalshi-catalog data.
+#[derive(Clone, Copy, Debug)]
+pub struct EconQuery<'a> {
+    pub ineq: Ineq,
+    pub thr: Option<f64>,
+    pub step: f64,
+    pub fed_label: Option<&'a str>,
+    pub period: &'a str,
+    pub family: &'a str,
+}
+
 /// Match a pmus econ market to its Kalshi twin. Only a `>= T` whose `T - step` twin is listed (or a Fed
 /// categorical whose label is listed) co-lists; `<=`/`==` are skipped (returns `None`). `k_floors` maps
 /// a listed Kalshi `floor_strike` -> ticker; `k_labels` maps a Fed yes_sub_title -> ticker.
 /// Port of the `>=` / `cat` branches of `econ_colisted`.
 pub fn match_econ(
-    ineq: Ineq,
-    thr: Option<f64>,
-    step: f64,
-    fed_label: Option<&str>,
-    period: &str,
-    family: &str,
+    q: &EconQuery,
     k_floors: &[(f64, String)],
     k_labels: &[(String, String)],
 ) -> Option<ColistedMatch> {
-    let cluster = format!("{family}-{period}");
-    match ineq {
+    let cluster = format!("{}-{}", q.family, q.period);
+    match q.ineq {
         Ineq::Ge => {
-            let twin = econ_twin(thr?, step);
+            let twin = econ_twin(q.thr?, q.step);
             for (floor, ticker) in k_floors {
                 if (floor - twin).abs() < 1e-9 {
                     return Some(ColistedMatch {
@@ -151,7 +159,7 @@ pub fn match_econ(
             None // twin not listed -> NOT co-listed
         }
         Ineq::Cat => {
-            let want = fed_canonical_label(fed_label?)?;
+            let want = fed_canonical_label(q.fed_label?)?;
             for (label, ticker) in k_labels {
                 if label.eq_ignore_ascii_case(want) {
                     return Some(ColistedMatch {
@@ -233,15 +241,23 @@ fn digits_at(s: &str, start: usize) -> Option<(i64, usize)> {
     s[start..i].parse::<i64>().ok().map(|v| (v, i))
 }
 
-/// `gteXltY` style: find `t1` immediately followed by digits, then `t2` immediately followed by digits.
+/// `gteXltY` style: `t1` followed by digits, then `t2` followed by digits. RETRIES from each subsequent
+/// `t1` occurrence (like `re_one`) so a decoy `gte<digits>` not followed by `lt` doesn't shadow the real
+/// `gteXltY` tail — mirrors Python `re.search`'s backtracking (else a preceding `gte5high` mis-reads).
 fn re_two(s: &str, t1: &str, t2: &str) -> Option<(i64, i64)> {
-    let p1 = s.find(t1)?;
-    let (x, after_x) = digits_at(s, p1 + t1.len())?;
-    if !s[after_x..].starts_with(t2) {
-        return None;
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(t1) {
+        let p1 = from + rel;
+        if let Some((x, after_x)) = digits_at(s, p1 + t1.len()) {
+            if s[after_x..].starts_with(t2) {
+                if let Some((y, _)) = digits_at(s, after_x + t2.len()) {
+                    return Some((x, y));
+                }
+            }
+        }
+        from = p1 + t1.len();
     }
-    let (y, _) = digits_at(s, after_x + t2.len())?;
-    Some((x, y))
+    None
 }
 
 /// `gteX` style: first occurrence of `t` followed by digits.
@@ -295,6 +311,9 @@ mod tests {
         assert_eq!(pm_bounds("tc-temp-x-gte9lt10f"), (Some(9), Some(10))); // 1- then 2-digit
         assert_eq!(pm_bounds("tc-temp-x-gte72f"), (Some(72), None)); // gteX tail, no lt
         assert_eq!(pm_bounds("aec-mlb-lad-pit-2026-06-09"), (None, None)); // non-weather -> no bucket
+        // DECOY gte before the real bucket: a leading `gte5high` not followed by `lt` must NOT shadow the
+        // real `gte64lt65f` (re_two retries like re.search; old first-occurrence code returned (5,None)).
+        assert_eq!(pm_bounds("tc-temp-gte5high-2026-06-09-gte64lt65f"), (Some(64), Some(65)));
     }
 
     #[test]
@@ -315,6 +334,12 @@ mod tests {
     }
 
     // ---- ECON: the L21 off-by-one twin (floor = T - step, NOT T) -------------------------------------
+    /// Build an `EconQuery` from positional fields (test ergonomics; the production call site uses the
+    /// named struct literal directly).
+    fn eq<'a>(ineq: Ineq, thr: Option<f64>, step: f64, fed_label: Option<&'a str>, period: &'a str, family: &'a str) -> EconQuery<'a> {
+        EconQuery { ineq, thr, step, fed_label, period, family }
+    }
+
     #[test]
     fn econ_twin_is_floor_minus_step() {
         assert!((econ_twin(4.4, 0.1) - 4.3).abs() < 1e-9); // U-3 >=4.4 ↔ Above 4.3
@@ -327,28 +352,28 @@ mod tests {
     fn econ_ge_pairs_the_identical_twin_only() {
         // pmus >=4.4 must bind Kalshi floor 4.3 (twin), NOT floor 4.4 (the phantom off-by-one pair).
         let floors = vec![(4.3_f64, "K-U3-ABOVE43".to_string()), (4.4, "K-U3-ABOVE44".to_string())];
-        let m = match_econ(Ineq::Ge, Some(4.4), 0.1, None, "26JUN", "u3", &floors, &[]).unwrap();
+        let m = match_econ(&eq(Ineq::Ge, Some(4.4), 0.1, None, "26JUN", "u3"), &floors, &[]).unwrap();
         assert_eq!(m.kalshi, "K-U3-ABOVE43", "must bind T-step twin, never floor==T (L21)");
         assert_eq!(m.cat, Cat::Econ);
         assert!(!m.settle_clean); // econ recon still open
         // no listed twin -> not co-listed.
         let only44 = vec![(4.4_f64, "K-U3-ABOVE44".to_string())];
-        assert!(match_econ(Ineq::Ge, Some(4.4), 0.1, None, "26JUN", "u3", &only44, &[]).is_none());
+        assert!(match_econ(&eq(Ineq::Ge, Some(4.4), 0.1, None, "26JUN", "u3"), &only44, &[]).is_none());
     }
 
     #[test]
     fn econ_le_and_eq_are_skipped() {
         // <= tail (opposite orientation) and == point bucket never co-list.
-        assert!(match_econ(Ineq::Le, Some(3.7), 0.1, None, "26MAY", "cpi", &[(3.6, "x".into())], &[]).is_none());
-        assert!(match_econ(Ineq::Eq, Some(3.8), 0.1, None, "26MAY", "cpi", &[(3.8, "x".into())], &[]).is_none());
+        assert!(match_econ(&eq(Ineq::Le, Some(3.7), 0.1, None, "26MAY", "cpi"), &[(3.6, "x".into())], &[]).is_none());
+        assert!(match_econ(&eq(Ineq::Eq, Some(3.8), 0.1, None, "26MAY", "cpi"), &[(3.8, "x".into())], &[]).is_none());
     }
 
     #[test]
     fn econ_fed_categorical_matches_label() {
         let labels = vec![("fed maintains rate".to_string(), "K-FED-MAINT".to_string())];
-        let m = match_econ(Ineq::Cat, None, 0.0, Some("maintains"), "26JUN", "fed", &[], &labels).unwrap();
+        let m = match_econ(&eq(Ineq::Cat, None, 0.0, Some("maintains"), "26JUN", "fed"), &[], &labels).unwrap();
         assert_eq!(m.kalshi, "K-FED-MAINT");
-        assert!(match_econ(Ineq::Cat, None, 0.0, Some("cut25bps"), "26JUN", "fed", &[], &labels).is_none());
+        assert!(match_econ(&eq(Ineq::Cat, None, 0.0, Some("cut25bps"), "26JUN", "fed"), &[], &labels).is_none());
     }
 
     // ---- SPORTS: abbrev binding to two distinct tickers ----------------------------------------------

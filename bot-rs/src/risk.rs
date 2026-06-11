@@ -84,10 +84,15 @@ pub fn evaluate(
     //     on entry. Category-agnostic: it keys purely on `days_to_event`, so weather (event ~now ->
     //     days_to_event ~0 or None) naturally passes while a sports/econ arb weeks out is skipped.
     //     `days_to_event` is None until stage-2 computes it -> dormant. (max_days_to_event <= 0 = off.)
-    if cfg.max_days_to_event > 0.0
-        && q.days_to_event.map_or(false, |d| d > cfg.max_days_to_event)
-    {
-        return Err(Reject::TooEarly);
+    //     A present-but-NON-FINITE value (NaN from a bad date subtraction) fails CLOSED: `NaN > max` is
+    //     false in IEEE-754, which would let a corrupt lock-time defeat the capital-velocity gate, so we
+    //     reject it explicitly (W5). `None` stays dormant by design.
+    if cfg.max_days_to_event > 0.0 {
+        if let Some(d) = q.days_to_event {
+            if !d.is_finite() || d > cfg.max_days_to_event {
+                return Err(Reject::TooEarly);
+            }
+        }
     }
 
     // 2. per-venue book sanity (L12 crossed, L13 stale). For SPORTS the AWAY-team Kalshi book (`k_b`) is
@@ -127,6 +132,22 @@ pub fn evaluate(
         };
         if dd_cents > ceiling {
             return Err(Reject::MidDivergence(dd_cents));
+        }
+    }
+
+    // 3b. SPORTS away-team (`k_b`) divergence (C7): the team-B Kalshi book is a load-bearing hedge leg
+    //     (PK fills YES@Kalshi-B), but step 3 only checks team-A vs pmus, so a stale/mislabeled team-B
+    //     book (e.g. a doubleheader/duplicate-ticker misbind, or a one-sided book whose `mid()` collapses)
+    //     was a blind spot on exactly the 2-outcome category where a bad join is most likely. The two
+    //     single-team Kalshi YES prices must be mutually coherent with pmus: team-B implied ~= 1 - pmus_yes
+    //     (since ka + kb ~= 1 and pm_yes ~= ka). Reject past the same cross-category ceiling. `None` k_b
+    //     (weather/econ) skips this entirely.
+    if let Some(kb) = q.k_b {
+        if let (Some(kbm), Some(pm)) = (kb.mid(), q.pm.mid()) {
+            let dd_cents = (kbm - (1.0 - pm)).abs() * 100.0;
+            if dd_cents > cfg.mid_divergence_reject_cents {
+                return Err(Reject::MidDivergence(dd_cents));
+            }
         }
     }
 
@@ -308,6 +329,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_divergent_uncrossed_away_team_book() {
+        // C7: a sports team-B (k_b) book that is FRESH + UNCROSSED but DIVERGENT from pmus (team-B implied
+        // should be ~ 1 - pm_yes) is the bad-join/mislabel blind spot the crossed/stale gates miss. Here
+        // pm mid = 0.55 -> team-B should imply ~0.45, but k_b mid is 0.05 -> 40c apart -> MidDivergence.
+        let e = Edge { net: 0.03, dir: Dir::PK };
+        let mut q = quote();
+        q.cat = Cat::Sports;
+        q.settle_clean = true;
+        q.pm = Book { yes_bid: Some(0.54), yes_ask: Some(0.56), age_s: 0.1 }; // pm mid 0.55 -> B implied 0.45
+        q.k = Book { yes_bid: Some(0.55), yes_ask: Some(0.57), age_s: 0.0 };  // team-A coherent w/ pm (no k-vs-pm trip)
+        // team-B book fresh + uncrossed, but its mid (0.03) is 42c off the implied 0.45 -> > 40c -> rejected.
+        q.k_b = Some(Book { yes_bid: Some(0.02), yes_ask: Some(0.04), age_s: 0.1 });
+        match evaluate(&cfg(), &q, &e, &Exposure::new(), 1000) {
+            Err(Reject::MidDivergence(d)) => assert!(d > cfg().mid_divergence_reject_cents),
+            other => panic!("expected MidDivergence from the away-team book, got {:?}", other),
+        }
+        // a COHERENT team-B book (implied ~0.45) passes the C7 gate (other gates may apply, but not this).
+        q.k_b = Some(Book { yes_bid: Some(0.44), yes_ask: Some(0.46), age_s: 0.1 });
+        assert!(evaluate(&cfg(), &q, &e, &Exposure::new(), 1000).is_ok());
+    }
+
+    #[test]
     fn rejects_unverified_econ_settlement() {
         let mut q = quote();
         q.cat = Cat::Econ;
@@ -403,6 +446,22 @@ mod tests {
         assert!(evaluate(&c, &evt_quote(Cat::Sports, Some(5.0)), &e, &Exposure::new(), 1000).is_ok());
         // weather (event ~now -> days_to_event None) is never gated by proximity
         assert!(evaluate(&cfg(), &quote(), &e, &Exposure::new(), 1000).is_ok());
+    }
+
+    #[test]
+    fn nan_days_to_event_fails_closed() {
+        // W5: a present-but-NaN days_to_event (a bad date subtraction) must be REJECTED, not let through.
+        // `NaN > max` is false in IEEE-754, so the old `map_or` passed it -> the capital-velocity gate
+        // failed OPEN on exactly the input it can't trust. assume both reconciled so settlement doesn't gate.
+        let e = Edge { net: 0.03, dir: Dir::PK };
+        let mut c = cfg();
+        c.assume_sports_settled = true;
+        c.max_days_to_event = 2.0;
+        let mut q = evt_quote(Cat::Sports, Some(f64::NAN));
+        q.settle_clean = false; // relies on assume_sports_settled, isolating the proximity gate
+        assert_eq!(evaluate(&c, &q, &e, &Exposure::new(), 1000), Err(Reject::TooEarly));
+        // a finite in-window value still passes (the fix only rejects the non-finite case + the > max case).
+        assert!(evaluate(&c, &evt_quote(Cat::Sports, Some(1.0)), &e, &Exposure::new(), 1000).is_ok());
     }
 
     #[test]

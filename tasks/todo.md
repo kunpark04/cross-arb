@@ -4,6 +4,22 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
+## bot-rs — CONCURRENCY-CORE + GATE FIXES (2026-06-11) — engine-fix-B
+
+Adversarial-engine-review fixes on the LIVE order path. Core refactor: route ALL submissions through a
+spawned/acked path so the event loop never blocks on network + the unwind arm stays hot. Touch only
+main.rs/risk.rs/config.rs/exec.rs/types.rs.
+
+- [x] CORE (C4+C5+W14+W16): `&self` backends + `Arc<dyn …Send+Sync>`; spawn-submit + `outcome_rx` arm;
+      `pending_entries`/`flattening` in-flight sets; reserve-on-spawn exposure (+ exact `release_exposure`);
+      W14 naked-leg fail-close (live one-leg fill ⇒ runtime halt).
+- [x] C3 per-pair freshness `k_fresh`; C6 preserve `prev` on re-track; W16 don't-prune-held; W17 unwrap→let-else.
+- [x] C1 supervise spawned tasks (dead collector ⇒ runtime halt + break) + poison-tolerant `lock()` helper.
+- [x] GATES: C7 sports `k_b` divergence; C8 settle-clean off-switch consent gate + loud banner; C9 truncated-
+      prune skip; W4 affordable−exposure; W5 NaN proximity fail-closed; W6 post-rounding realized-edge re-check.
+- [x] 112 tests (was 103; +9 regression) + clippy clean (no NEW warnings) + `--smoke` + C8 refuse/unlock verified.
+      Artifacts → `tasks/_agent_bus/20260611-engine-fix-B/`.
+
 ## bot-rs — POSTPONEMENT-UNWIND TRIGGER (2026-06-11) — ✅
 
 ARMED the (built+tested) postponement-unwind rule: held-position tracking + live MLB statsapi detection +

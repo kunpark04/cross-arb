@@ -47,15 +47,20 @@ impl PairAck {
     }
 }
 
-pub trait ExecutionBackend {
+/// `Send + Sync` so the live loop can hold the backend as `Arc<dyn ExecutionBackend>` and `tokio::spawn`
+/// a submission task that clones the Arc — the event loop never blocks on the two-leg network RTT (the
+/// concurrency-core fix). All methods take `&self`: `DryRunBackend` only logs and `LiveBackend` drives its
+/// POSTs off `&self.http` (reqwest::Client is itself `Send + Sync` + cheaply cloneable), so neither needs
+/// `&mut self`. Shared- access correctness is preserved because no method mutates backend state.
+pub trait ExecutionBackend: Send + Sync {
     /// Fire BOTH legs of a hedged pair. The unit of execution is the PAIR — callers must NEVER
     /// serialize the legs: serial legging ~doubles effective latency (measured serial floor p50 148 ms
     /// vs ~86 ms concurrent). The LIVE backend fires them CONCURRENTLY over two warm, pre-authed
     /// connections (stage-2, `tokio::join!`); the dry-run backend logs both. This pair-shaped signature
     /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
     /// highest-leverage latency item from the rust review, and the only latency lever the code controls.
-    fn submit_pair(&mut self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
-    fn cancel(&mut self, client_order_id: &str) -> Result<(), ExecError>;
+    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
+    fn cancel(&self, client_order_id: &str) -> Result<(), ExecError>;
     fn label(&self) -> &'static str;
 }
 
@@ -77,14 +82,14 @@ impl DryRunBackend {
 }
 
 impl ExecutionBackend for DryRunBackend {
-    fn submit_pair(&mut self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
+    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
         // both legs logged together — mirrors the concurrent live fire.
         PairAck {
             a: self.log_leg(a),
             b: self.log_leg(b),
         }
     }
-    fn cancel(&mut self, _client_order_id: &str) -> Result<(), ExecError> {
+    fn cancel(&self, _client_order_id: &str) -> Result<(), ExecError> {
         Ok(())
     }
     fn label(&self) -> &'static str {
@@ -112,6 +117,17 @@ struct TransportKeys {
 }
 
 const KALSHI_ORDERS_PATH: &str = "/trade-api/v2/portfolio/orders";
+
+/// Whether the owner has explicitly confirmed the pmus POST-body signing scheme against the live/demo
+/// endpoint. Default OFF: until set, a pmus LIVE leg is REFUSED (not fired possibly-mis-signed, which
+/// would systematically leg out the hedge — see `build_pmus_payload`). Self-contained env read (NOT a
+/// config field) so the gate is a deliberate operator unlock, independent of the rest of the config.
+fn pmus_post_signing_verified() -> bool {
+    matches!(
+        std::env::var("PMUS_POST_SIGNING_VERIFIED").ok().as_deref(),
+        Some("yes") | Some("1") | Some("true")
+    )
+}
 
 impl LiveBackend {
     pub fn new(cfg: &Config) -> Self {
@@ -160,7 +176,10 @@ impl LiveBackend {
     }
 
     /// Build the venue-native CreateOrder body (real). A limit order; the venue dedupes on
-    /// `client_order_id` so a transport retry can't double-fire (idempotency).
+    /// `client_order_id` so a transport retry can't double-fire (idempotency). Built with `serde_json`
+    /// (never `format!`) so a `"`/`\`/control char in the venue-supplied `market`/`client_order_id` is
+    /// escaped, not spliced raw into the body — a malformed/injected order would otherwise 400 (naked leg)
+    /// or alter `count`/price. Numbers stay numbers (`json!` preserves the bare `count`/`yes_price`).
     pub fn build_kalshi_payload(&self, intent: &OrderIntent) -> String {
         let side = match intent.side {
             Side::Yes => "yes",
@@ -170,10 +189,16 @@ impl LiveBackend {
             Action::Buy => "buy",
             Action::Sell => "sell", // an unwind closes the leg we hold
         };
-        format!(
-            "{{\"action\":\"{}\",\"side\":\"{}\",\"ticker\":\"{}\",\"count\":{},\"type\":\"limit\",\"yes_price\":{},\"client_order_id\":\"{}\"}}",
-            action, side, intent.market, intent.qty, intent.price_cents, intent.client_order_id
-        )
+        serde_json::json!({
+            "action": action,
+            "side": side,
+            "ticker": intent.market,
+            "count": intent.qty,
+            "type": "limit",
+            "yes_price": intent.price_cents,
+            "client_order_id": intent.client_order_id,
+        })
+        .to_string()
     }
 
     /// Build a pmus CreateOrder body (best-effort shape). ⚠️ The pmus POST-body signing convention is
@@ -189,16 +214,20 @@ impl LiveBackend {
             Action::Buy => "buy",
             Action::Sell => "sell",
         };
-        // price as a dollar string (pmus money objects use {value}); qty as whole shares.
-        format!(
-            "{{\"slug\":\"{}\",\"action\":\"{}\",\"side\":\"{}\",\"size\":{},\"price\":\"{:.2}\",\"clientOrderId\":\"{}\"}}",
-            intent.market,
-            action,
-            side,
-            intent.qty,
-            (intent.price_cents as f64) / 100.0,
-            intent.client_order_id
-        )
+        // Built with `serde_json` (never `format!`) so a `"`/`\` in the venue-supplied slug/coid is
+        // escaped, not spliced raw (a crafted slug could otherwise alter the body). price as a 2dp dollar
+        // STRING (pmus money objects use a string {value}); qty as a bare whole-shares number — same wire
+        // shape the old format! emitted, now safe for dirty input.
+        let price = format!("{:.2}", (intent.price_cents as f64) / 100.0);
+        serde_json::json!({
+            "slug": intent.market,
+            "action": action,
+            "side": side,
+            "size": intent.qty,
+            "price": price,
+            "clientOrderId": intent.client_order_id,
+        })
+        .to_string()
     }
 
     /// Send ONE signed leg to its venue and parse the ack. Async; the two legs are joined concurrently
@@ -219,9 +248,15 @@ impl LiveBackend {
                 (format!("{}/portfolio/orders", self.kalshi_base()), self.build_kalshi_payload(intent), h)
             }
             Venue::Pmus => {
-                // TODO verify pmus POST signing live — the auth brief marks body inclusion UNCONFIRMED.
-                // We sign the documented canonical `{ts}POST{path}` and send the body; if pmus actually
-                // requires the body in the signature this will 401, surfaced as Rejected (not a guess).
+                // GATE: refuse a pmus LIVE leg until the owner confirms the POST-body signing scheme
+                // (default OFF). The auth brief marks body inclusion UNCONFIRMED; firing anyway would
+                // 401 *after* the Kalshi leg fills => a systematic naked leg. An explicit env unlock turns
+                // that silent leg-out generator into a deliberate, loud opt-in.
+                if !pmus_post_signing_verified() {
+                    return Err(ExecError::Rejected(
+                        "pmus POST-body signing unverified — set PMUS_POST_SIGNING_VERIFIED=yes".into(),
+                    ));
+                }
                 let path = "/v1/portfolio/orders";
                 let h = crate::auth::pmus_headers(&keys.pmus_ed25519, &keys.pmus_access_key, ts, "POST", path);
                 (format!("{}{}", self.pmus_base(), path), self.build_pmus_payload(intent), h)
@@ -286,7 +321,7 @@ impl LiveBackend {
 }
 
 impl ExecutionBackend for LiveBackend {
-    fn submit_pair(&mut self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
+    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
         // Fire BOTH legs CONCURRENTLY (tokio::join! inside run_pair) — each RSA-PSS (Kalshi) / Ed25519
         // (pmus) signed. Concurrency is the one latency lever the code owns (serial ~148 ms p50 ->
         // concurrent ~86 ms). Returns KeysUnavailable per-leg when the signing keys aren't loaded
@@ -299,7 +334,7 @@ impl ExecutionBackend for LiveBackend {
         }
         self.run_pair(a, b)
     }
-    fn cancel(&mut self, client_order_id: &str) -> Result<(), ExecError> {
+    fn cancel(&self, client_order_id: &str) -> Result<(), ExecError> {
         // Kalshi cancel is DELETE /portfolio/orders/{order_id}; the live unwind/leg-fill-timeout path
         // (stage-2 legs.rs) will need the venue order_id from the ack, not the client id. Until that
         // tracking exists, refuse loudly rather than pretend success.
@@ -320,7 +355,7 @@ mod tests {
 
     #[test]
     fn dry_run_fires_both_legs_simulated() {
-        let mut bk = DryRunBackend;
+        let bk = DryRunBackend;
         let a = OrderIntent {
             venue: Venue::Kalshi,
             market: "KXHIGHNY-26JUN11-T95".into(),
@@ -373,7 +408,7 @@ mod tests {
             discovery_refresh_s: 300,
             kill_switch: false,
         };
-        let mut bk = LiveBackend::new(&cfg);
+        let bk = LiveBackend::new(&cfg);
         let intent = OrderIntent {
             venue: Venue::Kalshi,
             market: "KXHIGHNY-26JUN11-T95".into(),
@@ -435,5 +470,86 @@ mod tests {
         let body = bk.build_pmus_payload(&intent);
         assert!(body.contains("\"slug\":\"tc-temp-nychigh-2026-06-11-gte95f\""));
         assert!(body.contains("\"side\":\"yes\"") && body.contains("\"size\":2") && body.contains("\"price\":\"0.07\""));
+    }
+
+    /// CRITICAL C2 regression: a venue-supplied `market`/`coid` containing a `"` (or `\`) must NOT malform
+    /// or inject the order body — `serde_json` escapes it and the result re-parses to the LITERAL string
+    /// (the old `format!` splice produced invalid JSON / an altered count). Checked on BOTH venue builders.
+    #[test]
+    fn payload_escapes_quotes_in_untrusted_fields() {
+        let cfg = Config {
+            mode: crate::config::ExecutionMode::Live,
+            venue_env: VenueEnv::Demo,
+            kalshi_key_path: String::new(),
+            pmus_env_path: String::new(),
+            edge_floor_cents: 2.0,
+            max_contracts_per_pair: 1,
+            max_notional_per_pair: 1.0,
+            max_notional_per_cluster: 5.0,
+            max_total_notional: 20.0,
+            max_concurrent_positions: 5,
+            max_book_age_s: 5.0,
+            mid_divergence_reject_cents: 40.0,
+            econ_twin_max_divergence_cents: 15.0,
+            fat_edge_knee_cents: 6.0,
+            fat_edge_size_factor: 0.5,
+            skip_dear_led_weather: true,
+            assume_sports_settled: false,
+            assume_econ_settled: false,
+            max_days_to_event: 2.0,
+            kalshi_void_window_days: 2.0,
+            postpone_poll_s: 60,
+            auto_unwind: true,
+            leg_fill_timeout_ms: 500,
+            require_settle_clean: true,
+            discovery_refresh_s: 300,
+            kill_switch: false,
+        };
+        let bk = LiveBackend::new(&cfg);
+        // an adversarial slug trying to inject a second field via an unescaped quote + backslash.
+        let evil = r#"x","count":9999,"x":"\"#;
+        let intent = OrderIntent {
+            venue: Venue::Kalshi,
+            market: evil.into(),
+            action: Action::Buy,
+            side: Side::Yes,
+            price_cents: 8,
+            qty: 1,
+            client_order_id: evil.into(),
+        };
+        // Kalshi: body re-parses, ticker == the literal evil string (quote escaped, no injected count).
+        let kbody = bk.build_kalshi_payload(&intent);
+        let kv: serde_json::Value = serde_json::from_str(&kbody).expect("kalshi body is valid JSON");
+        assert_eq!(kv["ticker"], evil);
+        assert_eq!(kv["count"], 1); // the injected "count":9999 did NOT take effect
+        assert_eq!(kv["client_order_id"], evil);
+        // pmus: same — slug re-parses to the literal evil string, size is the real qty.
+        let pintent = OrderIntent { venue: Venue::Pmus, ..intent };
+        let pbody = bk.build_pmus_payload(&pintent);
+        let pv: serde_json::Value = serde_json::from_str(&pbody).expect("pmus body is valid JSON");
+        assert_eq!(pv["slug"], evil);
+        assert_eq!(pv["size"], 1);
+    }
+
+    /// WARN D: the pmus LIVE leg is gated behind `PMUS_POST_SIGNING_VERIFIED` (default OFF). Until it's
+    /// set to yes/1/true, `pmus_post_signing_verified()` is false so `post_leg` refuses the pmus order
+    /// (rather than fire a possibly-mis-signed body that legs out the hedge). All in one test: env-var
+    /// state is process-global, so toggling + restoring here avoids racing a parallel test.
+    #[test]
+    fn pmus_live_leg_gated_behind_signing_env() {
+        let prev = std::env::var("PMUS_POST_SIGNING_VERIFIED").ok();
+        std::env::remove_var("PMUS_POST_SIGNING_VERIFIED");
+        assert!(!pmus_post_signing_verified(), "default OFF -> pmus leg refused");
+        std::env::set_var("PMUS_POST_SIGNING_VERIFIED", "yes");
+        assert!(pmus_post_signing_verified(), "explicit yes -> unlocked");
+        std::env::set_var("PMUS_POST_SIGNING_VERIFIED", "1");
+        assert!(pmus_post_signing_verified(), "1 also unlocks");
+        std::env::set_var("PMUS_POST_SIGNING_VERIFIED", "no");
+        assert!(!pmus_post_signing_verified(), "any other value stays gated");
+        // restore the prior process env so a parallel test sees what it expected.
+        match prev {
+            Some(v) => std::env::set_var("PMUS_POST_SIGNING_VERIFIED", v),
+            None => std::env::remove_var("PMUS_POST_SIGNING_VERIFIED"),
+        }
     }
 }

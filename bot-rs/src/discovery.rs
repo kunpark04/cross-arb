@@ -309,39 +309,55 @@ fn parse_point_tail(s: &str) -> Option<String> {
     }
 }
 
-/// CPI period: `...mayYYYYyoy...` -> `YYMMM`. Port of the cpic branch.
+/// CPI period: `...mayYYYYyoy...` -> `YYMMM`. Port of the cpic branch's `re.search((month)[a-z]*?(\d{4})yoy)`
+/// — LEFTMOST match in the string (NOT calendar order): on two `monthYYYYyoy` tokens, the textually-first
+/// wins (the old Jan→Dec scan returned the calendar-earliest, diverging from Python).
 fn parse_cpi_period(s: &str) -> Option<String> {
-    // find a month name immediately followed by 4 digits then "yoy".
+    // a month token that begins at byte `p`, then (optional trailing alpha) 4 digits + "yoy" -> the year.
+    let match_at = |p: usize, mi: usize| -> Option<String> {
+        let ml = MON[mi].to_ascii_lowercase();
+        let after = s.get(p + ml.len()..)?;
+        let digits_start = after.find(|c: char| c.is_ascii_digit())?;
+        if !after[..digits_start].chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let rest = &after[digits_start..];
+        if rest.len() >= 4 && rest.as_bytes()[..4].iter().all(|b| b.is_ascii_digit()) && rest[4..].starts_with("yoy") {
+            return Some(format!("{}{}", &rest[2..4], MON[mi]));
+        }
+        None
+    };
+    // pick the LEFTMOST validating month-token start (min byte position), matching re.search. Scan ALL
+    // occurrences of each month (not just the first) so a non-validating earlier hit can't mask a valid
+    // later one of the same month.
+    let mut best: Option<(usize, String)> = None;
     for (mi, m) in MON.iter().enumerate() {
         let ml = m.to_ascii_lowercase();
-        if let Some(p) = s.find(&ml) {
-            let after = &s[p + ml.len()..];
-            // tolerate the full month spelling: skip alpha until digits.
-            let digits_start = after.find(|c: char| c.is_ascii_digit())?;
-            let inter = &after[..digits_start];
-            if !inter.chars().all(|c| c.is_ascii_alphabetic()) {
-                continue;
-            }
-            let rest = &after[digits_start..];
-            if rest.len() >= 4 && rest.as_bytes()[..4].iter().all(|b| b.is_ascii_digit()) {
-                let yr = &rest[..4];
-                if rest[4..].starts_with("yoy") {
-                    return Some(format!("{}{}", &yr[2..], MON[mi]));
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(&ml) {
+            let p = from + rel;
+            if let Some(period) = match_at(p, mi) {
+                if best.as_ref().is_none_or(|(bp, _)| p < *bp) {
+                    best = Some((p, period));
                 }
+                break; // earliest occurrence of THIS month that validates is its best candidate
             }
+            from = p + ml.len();
         }
     }
-    None
+    best.map(|(_, period)| period)
 }
 
 /// urc/nfpc period: a `-<monthname>-` token + a release date `YYYY-MM-DD`; data-year = release-year - 1
 /// when data-month > release-month (Dec data releases in Jan). Port of the urc/nfpc branch.
 fn parse_release_period(s: &str) -> Option<String> {
-    // data-month name token between dashes.
+    // data-month name token between dashes. The whole segment must be PURELY ALPHABETIC (Python's
+    // `-(month)[a-z]*-` left/right alpha boundary): a digit-bearing decoy like `jun2`/`may1adj` is NOT a
+    // month token, so the scan skips it to the real `-june-` (the bare 3-char-prefix test mis-read it).
     let dmon = s
         .split('-')
-        .find_map(|seg| emon(&seg.chars().take(3).collect::<String>()).map(|m| (m, seg)))
-        .map(|(m, _)| m)?;
+        .filter(|seg| seg.chars().all(|c| c.is_ascii_alphabetic()))
+        .find_map(|seg| emon(&seg.chars().take(3).collect::<String>()))?;
     let date = iso_date(s)?;
     let p: Vec<&str> = date.split('-').collect();
     let rel_year: i32 = p[0].parse().ok()?;
@@ -529,7 +545,15 @@ where
             let empty_l: Vec<(String, String)> = Vec::new();
             let floors = k_floors.get(&per).unwrap_or(&empty_f);
             let labels = k_labels.get(&per).unwrap_or(&empty_l);
-            match matcher::match_econ(p.ineq, p.thr, step.unwrap_or(0.0), p.fed_label.as_deref(), &per, family, floors, labels) {
+            let q = matcher::EconQuery {
+                ineq: p.ineq,
+                thr: p.thr,
+                step: step.unwrap_or(0.0),
+                fed_label: p.fed_label.as_deref(),
+                period: &per,
+                family,
+            };
+            match matcher::match_econ(&q, floors, labels) {
                 Some(m) => {
                     d.pairs.push(Pair {
                         slug,
@@ -575,7 +599,13 @@ where
             }
         }
         let mut kbydate: std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>> = std::collections::HashMap::new();
-        for (ev, dict) in by_event {
+        // DETERMINISM: `by_event` is a HashMap (random iteration order), so push events sorted by
+        // event_ticker. Otherwise each date's event INDEX `i` (the `used`-set key in pick_game) is random
+        // per process, and a same-team doubleheader could bind game-1 on one re-discovery and game-2 on the
+        // next — swapping a held position's Kalshi tickers. Sorted push gives a stable index across passes.
+        let mut events: Vec<(String, std::collections::HashMap<String, String>)> = by_event.into_iter().collect();
+        events.sort_by(|a, b| a.0.cmp(&b.0));
+        for (ev, dict) in events {
             let date = event_date.get(&ev).cloned().unwrap_or_default();
             kbydate.entry(date).or_default().push(dict);
         }
@@ -709,10 +739,14 @@ async fn pull_pmus(http: &reqwest::Client) -> Result<(Vec<Value>, bool), String>
     }
 }
 
-/// Pull one Kalshi series' OPEN markets, paginated by `cursor` (empty/absent cursor = last page).
+/// Pull one Kalshi series' OPEN markets, paginated by `cursor` (empty/absent cursor = last page). Bounded
+/// by a page cap + a stuck-cursor break (`next == cursor`) + a row cap, mirroring the pmus `PM_CATALOG_CAP`
+/// — a buggy endpoint returning the SAME non-empty cursor every page would otherwise loop forever and grow
+/// `all` without bound (hang + OOM on the 24/7 droplet, blocking the refresh task). 50×1000 has headroom.
 async fn pull_kalshi_series(http: &reqwest::Client, series: &str) -> Result<Vec<Value>, String> {
     let mut all = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
     loop {
         let mut url = format!("{KALSHI_MARKETS}?series_ticker={series}&status=open&limit=1000");
         if let Some(c) = &cursor {
@@ -722,11 +756,20 @@ async fn pull_kalshi_series(http: &reqwest::Client, series: &str) -> Result<Vec<
         if let Some(arr) = v.get("markets").and_then(Value::as_array) {
             all.extend(arr.iter().cloned());
         }
-        cursor = v.get("cursor").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
-        if cursor.is_none() {
+        let next = v.get("cursor").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
+        pages += 1;
+        if cursor_loop_done(&next, &cursor, pages, all.len()) {
             return Ok(all);
         }
+        cursor = next;
     }
+}
+
+/// Termination predicate for the Kalshi cursor pagination: stop on an empty/absent cursor (last page),
+/// a self-referential cursor (`next == prev`, a stuck endpoint), the page cap, or the row cap — so the
+/// loop can never spin forever / OOM. Pure, so it's unit-testable without live HTTP.
+fn cursor_loop_done(next: &Option<String>, prev: &Option<String>, pages: usize, rows: usize) -> bool {
+    next.is_none() || next == prev || pages > 50 || rows > 50_000
 }
 
 /// GET a catalog page and return its `key` array (`markets`). A non-2xx or non-JSON body is an error
@@ -783,6 +826,10 @@ mod tests {
         // CPI lte tail -> Le, YYMMM period.
         let c = econ_parse("cpic-uscpi-may2026yoy-2026-06-10-lte3pt7pct").unwrap();
         assert_eq!((c.ineq, c.thr, c.period.as_deref()), (Ineq::Le, Some(3.7), Some("26MAY")));
+        // TWO monthYYYYyoy tokens: Python re.search picks the LEFTMOST in the string (25SEP), NOT the
+        // calendar-earliest (the old Jan->Dec scan returned 26MAR). Regression for the leftmost-match fix.
+        let two = econ_parse("cpic-sep2025yoy-mar2026yoy-2026-06-10-lte3pt8pct").unwrap();
+        assert_eq!(two.period.as_deref(), Some("25SEP"), "leftmost monthYYYYyoy wins, not calendar order");
         // CPI bare point bucket -> Eq.
         assert_eq!(econ_parse("cpic-uscpi-may2026yoy-2026-06-10-3pt8pct").unwrap().ineq, Ineq::Eq);
         // NFP: atl + 1000-grid threshold, release-period.
@@ -794,6 +841,10 @@ mod tests {
         // year boundary: Dec data released next Jan -> prior data-year (26DEC not 27DEC).
         assert_eq!(econ_parse("urc-us-seasonadj-gte-december-2027-01-08-atl4pt4").unwrap().period.as_deref(), Some("26DEC"));
         assert_eq!(econ_parse("urc-us-seasonadj-gte-june-2026-07-02-atl4pt4").unwrap().period.as_deref(), Some("26JUN"));
+        // DIGIT-BEARING decoy month segment must be SKIPPED (Python's -(month)[a-z]*- needs a pure-alpha
+        // token): `jun2`/`may1adj` are not months -> the real `-july-` wins (was a Rust-only 26JUN/26MAY).
+        assert_eq!(econ_parse("urc-jun2-gte-july-2026-08-02-atl4pt4").unwrap().period.as_deref(), Some("26JUL"));
+        assert_eq!(econ_parse("urc-may1adj-gte-july-2026-08-02-atl4pt4").unwrap().period.as_deref(), Some("26JUL"));
         // non-econ -> None.
         assert!(econ_parse("tc-temp-laxhigh-2026-06-09-gte73").is_none());
         assert!(econ_parse("aec-mlb-x-y-2026-06-10").is_none());
@@ -997,6 +1048,79 @@ mod tests {
         assert_eq!(ymd_to_epoch_days("2026-03-01").unwrap() - ymd_to_epoch_days("2026-02-28").unwrap(), 1);
         assert_eq!(ymd_to_epoch_days("2024-03-01").unwrap() - ymd_to_epoch_days("2024-02-28").unwrap(), 2); // 2024 leap
         assert_eq!(ymd_to_epoch_days("bad-date"), None);
+    }
+
+    /// Stuck-cursor / page-cap termination for the Kalshi pagination (the pure predicate). A self-
+    /// referential cursor (`next == prev`), an absent cursor, the page cap, and the row cap all stop the
+    /// loop; only genuine forward progress (a NEW non-empty cursor under the caps) continues.
+    #[test]
+    fn cursor_loop_terminates_on_stuck_or_caps() {
+        let c = |s: &str| Some(s.to_string());
+        // forward progress: new cursor, under caps -> keep going.
+        assert!(!cursor_loop_done(&c("p2"), &c("p1"), 1, 10));
+        assert!(!cursor_loop_done(&c("p2"), &None, 1, 10)); // first page -> next page
+        // STUCK: the endpoint returns the SAME non-empty cursor -> stop (would loop forever otherwise).
+        assert!(cursor_loop_done(&c("p1"), &c("p1"), 5, 100));
+        // last page: empty/absent cursor -> stop.
+        assert!(cursor_loop_done(&None, &c("p9"), 3, 100));
+        // page cap + row cap -> stop even with a fresh cursor.
+        assert!(cursor_loop_done(&c("pN"), &c("pM"), 51, 100));
+        assert!(cursor_loop_done(&c("pN"), &c("pM"), 2, 50_001));
+    }
+
+    /// DETERMINISM (doubleheader): two re-discovery passes must bind the SAME Kalshi tickers to the same
+    /// pm games. The Kalshi events come out of a HashMap (random iteration), so without the event_ticker
+    /// sort a same-team DH could swap game-1/game-2 across passes under a live position. Run assemble many
+    /// times; every pass must produce byte-identical sports bindings.
+    #[test]
+    fn sports_doubleheader_binding_is_deterministic_across_passes() {
+        // two pm MLB games, same teams + date (a doubleheader); distinct slugs so both are tracked.
+        let pm_cat = vec![
+            pm(
+                "aec-mlb-lad-pit-2026-06-16-g1",
+                "sports",
+                r#""marketType":"moneyline","gameStartTime":"2026-06-16T18:00:00Z","marketSides":[{"long":true,"team":{"name":"Los Angeles Dodgers","abbreviation":"LAD"}},{"long":false,"team":{"name":"Pittsburgh Pirates","abbreviation":"PIT"}}]"#,
+            ),
+            pm(
+                "aec-mlb-lad-pit-2026-06-16-g2",
+                "sports",
+                r#""marketType":"moneyline","gameStartTime":"2026-06-16T21:00:00Z","marketSides":[{"long":true,"team":{"name":"Los Angeles Dodgers","abbreviation":"LAD"}},{"long":false,"team":{"name":"Pittsburgh Pirates","abbreviation":"PIT"}}]"#,
+            ),
+        ];
+        // two Kalshi events on the SAME date, same team abbrevs, DISTINCT event tickers + full tickers.
+        fn dh_stub(series: &str) -> Vec<Value> {
+            if series == "KXMLBGAME" {
+                vec![
+                    serde_json::from_str(r#"{"ticker":"KXMLBGAME-26JUN16LADPITG2-LAD","event_ticker":"KXMLBGAME-26JUN16LADPITG2","yes_sub_title":"Los Angeles Dodgers"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXMLBGAME-26JUN16LADPITG2-PIT","event_ticker":"KXMLBGAME-26JUN16LADPITG2","yes_sub_title":"Pittsburgh Pirates"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXMLBGAME-26JUN16LADPITG1-LAD","event_ticker":"KXMLBGAME-26JUN16LADPITG1","yes_sub_title":"Los Angeles Dodgers"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXMLBGAME-26JUN16LADPITG1-PIT","event_ticker":"KXMLBGAME-26JUN16LADPITG1","yes_sub_title":"Pittsburgh Pirates"}"#).unwrap(),
+                ]
+            } else {
+                vec![]
+            }
+        }
+        // the canonical binding (sorted by event_ticker: G1 < G2): g1 slug -> G1 event, g2 slug -> G2 event.
+        let bindings = |d: &Discovery| -> Vec<(String, String, Option<String>)> {
+            let mut v: Vec<(String, String, Option<String>)> = d
+                .pairs
+                .iter()
+                .filter(|p| p.cat == Cat::Sports)
+                .map(|p| (p.slug.clone(), p.kalshi.clone(), p.kalshi_b.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let first = bindings(&assemble(&pm_cat, false, None, dh_stub));
+        assert_eq!(first.len(), 2, "both doubleheader games bind");
+        // many passes — each builds a fresh HashMap with a fresh random seed; all must agree with `first`.
+        for _ in 0..50 {
+            assert_eq!(bindings(&assemble(&pm_cat, false, None, dh_stub)), first, "DH binding must be stable across re-discovery");
+        }
+        // and the binding is the event_ticker-sorted one (G1 ticker for the first slug after sort).
+        let g1 = first.iter().find(|(s, ..)| s.ends_with("-g1")).unwrap();
+        assert_eq!(g1.1, "KXMLBGAME-26JUN16LADPITG1-LAD");
+        assert_eq!(g1.2.as_deref(), Some("KXMLBGAME-26JUN16LADPITG1-PIT"));
     }
 
     /// A no-twin econ market (>=T whose T-step floor isn't listed) is skipped, not falsely paired.

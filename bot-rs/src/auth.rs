@@ -16,13 +16,15 @@ pub fn canonical(ts_ms: u128, method: &str, path: &str) -> String {
 }
 
 /// Millis since the Unix epoch — the timestamp both venues require (≤30 s / 5 s skew). Single source so
-/// the WS handshake and the REST POST sign with the same clock convention.
+/// the WS handshake and the REST POST sign with the same clock convention. A pre-epoch clock can't
+/// produce a valid signing timestamp (every venue would 401 on the stale string), so fail LOUD rather
+/// than silently sign with `0` — a wrong signing clock is unrecoverable, not a transient error.
 pub fn now_ms_for_sign() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .expect("system clock before UNIX epoch — cannot sign")
+        .as_millis()
 }
 
 // ----------------------------------------------------------------------------------------------

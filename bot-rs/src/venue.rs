@@ -241,11 +241,13 @@ impl VenueCreds {
 }
 
 fn now_ms() -> u128 {
+    // A pre-epoch clock can't sign a valid handshake (the venue rejects the stale timestamp); fail LOUD
+    // rather than fall back to `0` and 401 forever with no indication why (a wrong clock is unrecoverable).
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .expect("system clock before UNIX epoch — cannot sign")
+        .as_millis()
 }
 
 /// Build the tungstenite handshake request with signed auth headers (`IntoClientRequest`).
@@ -297,6 +299,7 @@ pub async fn kalshi_stream(
         };
         let mut seq = SeqTracker::new();
         let mut sid: Option<u64> = None; // captured from the subscribed/ok ack -> targets update_subscription
+        let mut sid_warned = false; // one-shot guard for the "ack had no sid" WARN (per connection)
         let mut clean;
         match tokio_tungstenite::connect_async(req).await {
             Ok((mut ws, _resp)) => {
@@ -323,7 +326,10 @@ pub async fn kalshi_stream(
                             upd = subs.recv() => {
                                 match upd {
                                     Some(u) => {
-                                        apply_kalshi_sub_update(&mut ws, sid, &mut cmd_id, &u).await;
+                                        if apply_kalshi_sub_update(&mut ws, sid, &mut cmd_id, &u).await {
+                                            clean = false; // sid-unknown or a failed control send -> cycle
+                                            break 'read;
+                                        }
                                         continue 'read;
                                     }
                                     None => continue 'read, // discovery channel closed -> keep streaming
@@ -358,6 +364,13 @@ pub async fn kalshi_stream(
                         // capture the sid from the subscribed/ok ack — update_subscription targets it.
                         if sid.is_none() && matches!(typ, "subscribed" | "ok") {
                             sid = msg.get("sid").and_then(Value::as_u64);
+                            // ack seen but no parseable sid -> the no-gap add path is disabled for this
+                            // connection (a sub-update will force a reconnect). Operators must know. Warn
+                            // once (the flag stops it spamming on every subsequent `ok`).
+                            if sid.is_none() && !sid_warned {
+                                eprintln!("[kalshi] {typ} ack carried no parseable sid -> no-gap adds DISABLED for this connection (adds will force a reconnect)");
+                                sid_warned = true;
+                            }
                         }
                         let ticker = msg.get("market_ticker").and_then(Value::as_str).map(str::to_string);
                         match typ {
@@ -399,16 +412,20 @@ pub async fn kalshi_stream(
 }
 
 /// Apply a discovery `SubUpdate` to the live Kalshi connection: `update_subscription` add/delete on the
-/// captured `sid` (no-gap). If the sid isn't known yet (ack not seen), the add can't target it — the
-/// `tracked` set already holds the new keys, so the NEXT reconnect subscribes them (the monitor.py
-/// "sid not yet known -> cycle" fallback; here a cheaper "wait for reconnect" since the set is shared).
-async fn apply_kalshi_sub_update<S>(ws: &mut S, sid: Option<u64>, cmd_id: &mut u64, u: &SubUpdate)
+/// captured `sid` (no-gap). Returns `true` when the caller should FORCE A RECONNECT — either the sid isn't
+/// known yet (so the add can't target it; `tracked` already holds the new keys, so cycling re-subscribes
+/// them promptly instead of dropping the add until an unrelated reconnect), or a control `ws.send` failed
+/// (a half-broken socket — don't keep streaming on it). Matches monitor.py's "sid not known -> cycle".
+async fn apply_kalshi_sub_update<S>(ws: &mut S, sid: Option<u64>, cmd_id: &mut u64, u: &SubUpdate) -> bool
 where
     S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
 {
     use tokio_tungstenite::tungstenite::Message;
     let Some(sid) = sid else {
-        return; // ack not yet seen; reconnect will subscribe the current tracked set
+        // ack not yet seen -> can't target update_subscription. Force a reconnect so the (already-updated)
+        // tracked set is re-subscribed now, rather than silently dropping the add until the next cycle.
+        eprintln!("[kalshi] sub-update before sid known -> forcing reconnect to subscribe the tracked set");
+        return true;
     };
     for (keys, action) in [(&u.add, "add_markets"), (&u.del, "delete_markets")] {
         if keys.is_empty() {
@@ -416,9 +433,15 @@ where
         }
         if let Some(frame) = kalshi_update_subscription(*cmd_id, sid, keys, action) {
             *cmd_id += 1;
-            let _ = ws.send(Message::text(frame)).await;
+            if ws.send(Message::text(frame)).await.is_err() {
+                // a failed control send means the socket is suspect — reconnect rather than leave the
+                // add/delete silently lost while the read loop spins on a half-dead connection.
+                eprintln!("[kalshi] sub-update {action} send failed -> forcing reconnect");
+                return true;
+            }
         }
     }
+    false
 }
 
 /// pmus WS stream: connect, subscribe the slugs (sharded ≤100), parse each `marketData` frame and push

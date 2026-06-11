@@ -40,9 +40,24 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let mut backend: Box<dyn ExecutionBackend> = match cfg.mode {
-        ExecutionMode::DryRun => Box::new(DryRunBackend),
-        ExecutionMode::Live => Box::new(LiveBackend::new(&cfg)),
+    // C8: disabling the SETTLEMENT-CLEAN gate (the catastrophic both-legs-loss axis) on live+prod is the
+    // single most consequential safety toggle, and unlike the prod gate it had NO informed-consent
+    // backstop — one leftover env var silently removed the last structural guard against an un-reconciled
+    // econ/sports pair trading. Mirror the prod gate: refuse to start unless a second explicit consent env
+    // is set. The per-category `assume_*` flags remain the intended, safer way to enable a category.
+    if cfg.is_live() && cfg.is_prod() && !cfg.require_settle_clean
+        && std::env::var("CROSSARB_I_UNDERSTAND_NO_SETTLE_GATE").as_deref() != Ok("yes")
+    {
+        eprintln!("\nREFUSING TO START: REQUIRE_SETTLE_CLEAN=false on live+prod disables the settlement-identity");
+        eprintln!("gate for ALL categories at once (the catastrophic both-legs-loss axis). Set");
+        eprintln!("CROSSARB_I_UNDERSTAND_NO_SETTLE_GATE=yes to confirm, or prefer the per-category");
+        eprintln!("ASSUME_SPORTS_SETTLED / ASSUME_ECON_SETTLED overrides (safe per-category control).");
+        std::process::exit(2);
+    }
+
+    let backend: std::sync::Arc<dyn ExecutionBackend> = match cfg.mode {
+        ExecutionMode::DryRun => std::sync::Arc::new(DryRunBackend),
+        ExecutionMode::Live => std::sync::Arc::new(LiveBackend::new(&cfg)),
     };
     println!("execution backend : {}\n", backend.label());
 
@@ -53,13 +68,13 @@ async fn main() {
     let force_smoke = std::env::args().any(|a| a == "--smoke");
     match (force_smoke, venue::VenueCreds::from_env()) {
         (false, Ok(creds)) => {
-            run_live(&cfg, backend.as_mut(), std::sync::Arc::new(creds)).await;
+            run_live(&cfg, backend, std::sync::Arc::new(creds)).await;
         }
         (_, Err(why)) if !force_smoke => {
             println!("[startup] venue creds unavailable ({why}) -> running offline smoke instead.\n");
-            smoke(&cfg, backend.as_mut());
+            smoke(&cfg, backend.as_ref());
         }
-        _ => smoke(&cfg, backend.as_mut()),
+        _ => smoke(&cfg, backend.as_ref()),
     }
 }
 
@@ -92,6 +107,10 @@ fn banner(cfg: &Config) {
         "guards            : age<={}s, mid-div<={}c, leg-fill<={}ms, settle-clean={}",
         cfg.max_book_age_s, cfg.mid_divergence_reject_cents, cfg.leg_fill_timeout_ms, cfg.require_settle_clean
     );
+    if !cfg.require_settle_clean {
+        // C8: the settlement-identity gate (the catastrophic axis) is OFF — make it impossible to miss.
+        println!("*** SETTLE-CLEAN GATE DISABLED *** (REQUIRE_SETTLE_CLEAN=false) — every category trades UNVERIFIED");
+    }
     if cfg.kill_switch {
         println!("KILL SWITCH       : ENGAGED (CROSSARB_KILL) - no trading");
     }
@@ -155,12 +174,42 @@ impl PairState {
     }
 }
 
+/// Which kind of submission an outcome belongs to (Entry opens a position; Unwind flattens one).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SubmitKind {
+    Entry,
+    Unwind,
+}
+
+/// The result of a SPAWNED `submit_pair`, sent back to the event loop so ALL position/exposure bookkeeping
+/// happens on the loop's own turn (never on the network task). Decouples the two-leg RTT from the
+/// `select!` so the unwind arm stays hot while an entry is in flight (concurrency-core fix C4/C5/W14/W16).
+struct SubmitOutcome {
+    slug: String,
+    kind: SubmitKind,
+    ack: exec::PairAck,
+    /// Entry only: the position to RECORD if both legs filled (else the reservation is released). `None`
+    /// for an unwind (which REMOVES an existing position on a both-filled flatten).
+    position: Option<Position>,
+    /// Entry only: the pair record (the poll needs its league/date/abbrevs to match statsapi). `None` for unwind.
+    pair: Option<LivePair>,
+    /// Entry only: the per-contract cost the exposure reservation used (so a release decrements the exact amount).
+    cost_per: f64,
+}
+
 /// STAGE-2 live loop: discover the co-listed universe, connect both venue WS streams, maintain a book
 /// per venue for each tracked pair, and on each COMPLETE dual-venue update (L5) build a `Quote`, run
-/// `risk::evaluate`, and `submit_pair` (dry-run default). A periodic refresh task re-discovers and
-/// applies in-place subscribe add/prune. Honors the kill-switch + the already-checked prod-consent gate.
-async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::sync::Arc<venue::VenueCreds>) {
+/// `risk::evaluate`, and SPAWN the `submit_pair` (dry-run default). A periodic refresh task re-discovers
+/// and applies in-place subscribe add/prune. Honors the kill-switch + the already-checked prod-consent gate.
+///
+/// The submission path is SPAWNED + ACKED (never inline): an approved entry / triggered unwind clones the
+/// `Arc<backend>` into a `tokio::spawn`ed task that drives the two-leg POST and reports a `SubmitOutcome`
+/// back over `outcome_rx`; a THIRD `select!` arm does the record/remove/exposure/naked-leg bookkeeping on
+/// the loop's turn. So the event loop NEVER blocks on the network and the unwind arm cannot be starved by
+/// an in-flight entry. Concurrent in-flight work is de-duplicated by `pending_entries`/`flattening`.
+async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, creds: std::sync::Arc<venue::VenueCreds>) {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     let http = reqwest::Client::builder().use_rustls_tls().build().unwrap_or_else(|_| reqwest::Client::new());
@@ -187,9 +236,9 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
     let k_tracked: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let pm_tracked: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     {
-        let mut ps = pairs.lock().unwrap();
-        let mut kt = k_tracked.lock().unwrap();
-        let mut pt = pm_tracked.lock().unwrap();
+        let mut ps = lock(&pairs);
+        let mut kt = lock(&k_tracked);
+        let mut pt = lock(&pm_tracked);
         for p in initial {
             let lp = LivePair::from(p);
             for tk in lp.kalshi_tickers() {
@@ -212,35 +261,58 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
     // be flattened. Shared with the spawned poll task.
     let positions: Arc<Mutex<HashMap<String, postpone::HeldPosition>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // IN-FLIGHT de-dup (C5): a slug with a SPAWNED-but-unacked entry is in `pending_entries`; a slug with a
+    // spawned-but-unacked unwind is in `flattening`. The loop refuses a second entry/unwind for a slug
+    // already in-flight, so a burst of frames (or the poll's per-cycle re-emit) can't double-fire.
+    let mut pending_entries: HashSet<String> = HashSet::new();
+    let mut flattening: HashSet<String> = HashSet::new();
+
+    // RUNTIME halt (W14/C1): set TRUE by a naked-leg-on-live fail-close or a dead supervised task. Distinct
+    // from the config kill-switch — this is tripped at runtime and blocks every NEW entry from here on.
+    let halt = Arc::new(AtomicBool::new(false));
+
+    // PER-PAIR Kalshi freshness (C3): a ticker is "fresh" once a book frame has arrived for it SINCE the
+    // last Kalshi reconnect/seq-gap (which `clear()`s the shared book map). A pair only trades when EVERY
+    // Kalshi ticker it uses is fresh — so a just-cleared book can't be traded against a never-cleared pmus
+    // book on the first rebuilt frame. Cleared wholesale on Kalshi Reconnect/SeqGap.
+    let mut k_fresh: HashSet<String> = HashSet::new();
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<venue::VenueEvent>();
     let (k_subs_tx, k_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
     let (pm_subs_tx, pm_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
     // the postponement-unwind channel: the poll detects a void and sends an UnwindRequest the loop fires.
     let (unwind_tx, mut unwind_rx) = tokio::sync::mpsc::unbounded_channel::<postpone::UnwindRequest>();
+    // the SUBMISSION outcome channel: a spawned submit task reports its PairAck back here for bookkeeping.
+    let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
 
-    tokio::spawn(venue::kalshi_stream(creds.clone(), k_tracked.clone(), kalshi_books.clone(), tx.clone(), k_subs_rx));
-    tokio::spawn(venue::pmus_stream(creds.clone(), pm_tracked.clone(), tx.clone(), pm_subs_rx));
-    tokio::spawn(refresh_loop(
+    // SUPERVISED tasks (C1): a dead collector/refresh/poll must HALT trading (never trade a frozen book),
+    // so we keep their JoinHandles and a `select!` arm treats any of them ending/panicking as FATAL.
+    let mut k_handle = tokio::spawn(venue::kalshi_stream(creds.clone(), k_tracked.clone(), kalshi_books.clone(), tx.clone(), k_subs_rx));
+    let mut pm_handle = tokio::spawn(venue::pmus_stream(creds.clone(), pm_tracked.clone(), tx.clone(), pm_subs_rx));
+    let mut refresh_handle = tokio::spawn(refresh_loop(
         http.clone(),
         cfg.discovery_refresh_s,
         pairs.clone(),
         k_tracked.clone(),
         pm_tracked.clone(),
         kalshi_books.clone(),
+        positions.clone(),
         k_subs_tx,
         pm_subs_tx,
     ));
     // ARM the live postponement-unwind trigger (gated on cfg.auto_unwind). statsapi is public/keyless; the
     // poll runs on the owner's droplet. Disengage with CROSSARB_NO_AUTO_UNWIND=1 (a manual-only fallback).
-    if cfg.auto_unwind {
-        tokio::spawn(postpone::poll_mlb_postponements(
+    let mut poll_handle = if cfg.auto_unwind {
+        Some(tokio::spawn(postpone::poll_mlb_postponements(
             http.clone(),
             positions.clone(),
             unwind_tx.clone(),
             cfg.postpone_poll_s,
             cfg.kalshi_void_window_days,
-        ));
-    }
+        )))
+    } else {
+        None
+    };
     drop(tx); // the spawned tasks hold their own senders; drop ours so rx closes if both ever end
     // KEEP `unwind_tx` alive for the loop's lifetime: if it were dropped while auto_unwind=false (no poll
     // task holds a clone), `unwind_rx` would close and its select arm would return `None` every poll ->
@@ -254,8 +326,9 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
     let (mut k_rebuild, mut pm_rebuild) = (false, false);
 
     loop {
-        // Drive BOTH the venue book stream AND the postponement-unwind channel. A void detection must not
-        // wait behind a quiet book stream, so the unwind arm is co-equal (not polled only between frames).
+        // Drive the venue book stream, the postponement-unwind channel, the submission-outcome channel,
+        // AND the task supervisor — all co-equal. A void detection / a settled ack / a dead collector must
+        // never wait behind a quiet book stream, so none of them is polled only between frames.
         let ev = tokio::select! {
             v = rx.recv() => match v {
                 Some(ev) => ev,
@@ -263,20 +336,33 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
             },
             u = unwind_rx.recv() => {
                 if let Some(req) = u {
-                    handle_unwind(cfg, backend, &positions, &kalshi_books, &pmus_books, &mut exposure, &req.slug);
+                    spawn_unwind(cfg, &backend, &positions, &kalshi_books, &pmus_books, &mut flattening, &outcome_tx, &req.slug);
                 }
                 continue;
             }
+            o = outcome_rx.recv() => {
+                if let Some(out) = o {
+                    apply_outcome(&positions, &mut exposure, &mut pending_entries, &mut flattening, &halt, out);
+                }
+                continue;
+            }
+            // C1 SUPERVISOR: any collector/refresh/poll task ending (clean return OR panic) is FATAL — a
+            // dead data source means a frozen book, so HALT and stop trading rather than trade stale data.
+            r = &mut k_handle, if !k_handle.is_finished() => { supervise_fatal("kalshi_stream", r, &halt); break; }
+            r = &mut pm_handle, if !pm_handle.is_finished() => { supervise_fatal("pmus_stream", r, &halt); break; }
+            r = &mut refresh_handle, if !refresh_handle.is_finished() => { supervise_fatal("refresh_loop", r, &halt); break; }
+            r = poll_opt(&mut poll_handle), if poll_handle.is_some() => { supervise_fatal("poll_mlb_postponements", r, &halt); break; }
         };
         // which pmus slug does this event touch? (book updates first, then evaluate on the complete state)
         let slug = match &ev {
             venue::VenueEvent::Kalshi { ticker } => {
                 k_rebuild = false; // a Kalshi book frame -> its rebuild is flowing again
-                pairs.lock().unwrap().by_ticker.get(ticker).cloned()
+                k_fresh.insert(ticker.clone()); // C3: this ticker's book has a post-reconnect frame
+                lock(&pairs).by_ticker.get(ticker).cloned()
             }
             venue::VenueEvent::Pmus { slug, bids, asks } => {
                 pm_rebuild = false; // a pmus book frame -> its rebuild is flowing again
-                if pm_tracked.lock().unwrap().contains(slug) {
+                if lock(&pm_tracked).contains(slug) {
                     pmus_books.entry(slug.clone()).or_default().apply_snapshot(bids, asks);
                     Some(slug.clone())
                 } else {
@@ -287,7 +373,10 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
             venue::VenueEvent::Reconnect { venue: v, clean } => {
                 println!("[live] {v:?} reconnect (clean={clean}) — pausing entries until its books rebuild");
                 match v {
-                    Venue::Kalshi => k_rebuild = true,
+                    Venue::Kalshi => {
+                        k_rebuild = true;
+                        k_fresh.clear(); // C3: the stream `clear()`s every Kalshi book on reconnect -> none fresh
+                    }
                     Venue::Pmus => pm_rebuild = true,
                 }
                 exposure.stream_paused = k_rebuild || pm_rebuild;
@@ -296,6 +385,7 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
             venue::VenueEvent::SeqGap { seq } => {
                 println!("[live] Kalshi seq gap at {seq} — connection cycling; Kalshi entries paused");
                 k_rebuild = true;
+                k_fresh.clear(); // C3: the gap cycles the connection -> books re-snapshot -> none fresh yet
                 exposure.stream_paused = true;
                 continue;
             }
@@ -304,7 +394,14 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         let Some(slug) = slug else { continue }; // a Kalshi ticker we don't track
         // clone the pair record out so we don't hold the pairs lock across the Quote build / book locks
         // (the refresh task may be mutating the map concurrently).
-        let Some(pair) = pairs.lock().unwrap().by_slug.get(&slug).cloned() else { continue };
+        let Some(pair) = lock(&pairs).by_slug.get(&slug).cloned() else { continue };
+
+        // C3 FRESHNESS GATE: require a post-reconnect frame for EVERY Kalshi ticker this pair uses before
+        // building a Quote. This blocks trading a just-cleared Kalshi book (against a never-cleared pmus
+        // book) until its snapshot rebuilds, while a 1:1 pair whose ticker just arrived trades correctly.
+        if !pair.kalshi_tickers().iter().all(|t| k_fresh.contains(t)) {
+            continue;
+        }
 
         // build the COMPLETE dual-venue Quote (L5: classify on both venues' current state, not one frame).
         // Each touch carries its book's REAL staleness `age` (seconds since its last applied frame), so a
@@ -317,10 +414,10 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
         // SPORTS (kalshi_b.is_some()) is 2-outcome: read pmus + Kalshi-A + Kalshi-B (ALL required) and use
         // the game signal/depth. Weather/econ is 1:1: pmus + the single Kalshi book + the binary signal.
         let (k, k_b, depth_dir, edge) = {
-            let kb = kalshi_books.lock().unwrap();
+            let kb = lock(&kalshi_books);
             let Some(ka_book) = kb.get(&pair.kalshi) else { continue }; // no Kalshi-A book yet -> incomplete
             let k = ka_book.touch();
-            let pmb = pmus_books.get(&slug).unwrap();
+            let Some(pmb) = pmus_books.get(&slug) else { continue }; // W17: guarded re-read, never unwrap
             match &pair.kalshi_b {
                 Some(tb) => {
                     let Some(kb_book) = kb.get(tb) else { continue }; // no Kalshi-B book yet -> incomplete
@@ -352,45 +449,131 @@ async fn run_live(cfg: &Config, backend: &mut dyn ExecutionBackend, creds: std::
             days_to_event: pair.days_to_event,
         };
 
-        match evaluate(cfg, &quote, &edge, &exposure, affordable(cfg, &edge)) {
-            Ok(a) => {
-                // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
-                // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
-                // one-sided book) yields no legs -> skip rather than fire a naked leg.
-                let Some(legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
-                let ack = backend.submit_pair(&legs[0], &legs[1]);
-                // On a both-filled fill: record the held position (so a void can be flattened) AND bump
-                // exposure so the caps actually bind across the session. A partial/failed fill is NOT
-                // tracked here — naked-leg handling is the leg-fill-timeout path (stage-2 legs.rs).
-                if ack.both_filled() {
-                    let pos = position_from_intents(&slug, pair.cat, &pair.cluster, &legs);
-                    track_position(&positions, &pair, pos, &mut exposure, a.cost_per);
-                }
+        // RUNTIME-HALT + IN-FLIGHT de-dup, BEFORE the gate: don't even price a slug that is halted or
+        // already has an entry/unwind in flight (C5 — a second concurrent entry would double-reserve).
+        if halt.load(Ordering::Relaxed) || pending_entries.contains(&slug) || flattening.contains(&slug) {
+            continue;
+        }
+
+        if let Ok(a) = evaluate(cfg, &quote, &edge, &exposure, affordable(cfg, &edge, &exposure)) {
+            // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
+            // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
+            // one-sided book) yields no legs -> skip rather than fire a naked leg.
+            let Some(legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
+            // W6: re-validate the edge from the ROUNDED leg prices (each leg rounds to a whole cent
+            // independently, eroding up to +1c of cost). Skip the fire if the realized net fell under the
+            // floor or the pair would cost >= 100c — the gated edge and the booked edge must agree.
+            if !realized_edge_clears_floor(cfg, &legs) {
+                continue;
             }
-            Err(_r) => {} // rejected by a gate — silent in the live loop; transitions/metrics are stage-2
+            // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
+            // outcome arm keeps the reservation on a both-filled fill (records the position) or releases it.
+            let pos = position_from_intents(&slug, pair.cat, &pair.cluster, &legs);
+            reserve_exposure(&mut exposure, &pos, a.cost_per);
+            pending_entries.insert(slug.clone());
+            spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some(pair.clone()), a.cost_per);
         }
     }
-    println!("[live] both venue streams ended — loop exiting.");
+    if halt.load(Ordering::Relaxed) {
+        println!("[live] HALTED (kill-switch engaged at runtime) — loop exiting; no further entries.");
+    } else {
+        println!("[live] both venue streams ended — loop exiting.");
+    }
 }
 
-/// Record a freshly-filled position + BUMP exposure so the pair/cluster/total/concurrency caps bind across
-/// the session (without this, every fill looks like the first and the caps never engage). For a SPORTS
-/// pair the postponement poll needs league/date/abbrevs: league = `pm_league(slug)`, date = `iso_date(slug)`,
-/// team_a/team_b = the last dash-segment of each Kalshi ticker (`pair.kalshi`/`pair.kalshi_b`). Non-sports
-/// leaves those empty (no postponement concept), so the poll ignores them.
-fn track_position(
-    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
-    pair: &LivePair,
-    pos: Position,
-    exposure: &mut Exposure,
+/// Poison-tolerant `Mutex::lock` for the event-loop path (C1): a thread that panicked WHILE holding a lock
+/// poisons it; `unwrap()` would then cascade-panic the loop. We recover the guard instead — one bad task
+/// must not take down the trading loop. (The data behind the lock is plain book/exposure state; a partial
+/// write is at worst a stale read the gates already tolerate, not a safety invariant.)
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poll an `Option<JoinHandle>` inside `select!` only when it is `Some` (the `if poll_handle.is_some()`
+/// guard gates this). `unwrap` is sound under that guard; `pending()` parks forever when the poll is
+/// disabled so the arm never fires.
+async fn poll_opt(h: &mut Option<tokio::task::JoinHandle<()>>) -> Result<(), tokio::task::JoinError> {
+    match h {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A supervised collector/refresh/poll task ended — log CRITICAL + engage the runtime halt. Any termination
+/// (clean return, error, or panic) of a data-source task means the book it feeds is now frozen, so the only
+/// safe action is to STOP: trading on a frozen book is the failure this guard exists to prevent.
+fn supervise_fatal(name: &str, res: Result<(), tokio::task::JoinError>, halt: &std::sync::atomic::AtomicBool) {
+    halt.store(true, std::sync::atomic::Ordering::Relaxed);
+    match res {
+        Ok(()) => eprintln!("[live] CRITICAL supervised task '{name}' ENDED — halting (a dead data source means a frozen book)"),
+        Err(e) => eprintln!("[live] CRITICAL supervised task '{name}' PANICKED ({e}) — halting"),
+    }
+}
+
+/// SPAWN a `submit_pair` off a cloned `Arc<backend>` and report the `PairAck` back over `outcome_tx`. The
+/// event-loop NEVER calls `submit_pair` inline (it would block the whole `select!` for the two-leg RTT);
+/// this detaches the network I/O so the loop keeps draining the unwind / outcome arms.
+#[allow(clippy::too_many_arguments)]
+fn spawn_submit(
+    backend: &std::sync::Arc<dyn ExecutionBackend>,
+    outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
+    kind: SubmitKind,
+    slug: String,
+    legs: [OrderIntent; 2],
+    position: Option<Position>,
+    pair: Option<LivePair>,
     cost_per: f64,
 ) {
+    let backend = backend.clone();
+    let outcome_tx = outcome_tx.clone();
+    tokio::spawn(async move {
+        // block_in_place requires the multi-thread runtime (#[tokio::main] full); the submit drives the two
+        // signed POSTs concurrently inside it. Running it on a SPAWNED task means only this task parks, not
+        // the event loop.
+        let ack = backend.submit_pair(&legs[0], &legs[1]);
+        let _ = outcome_tx.send(SubmitOutcome { slug, kind, ack, position, pair, cost_per });
+    });
+}
+
+/// RESERVE exposure for an entry the moment it is SPAWNED (not when it acks), so two concurrent in-flight
+/// entries can't both size against the same free room and over-allocate (C5). The outcome arm then either
+/// keeps the reservation (records the position on a both-filled fill) or releases it (any other outcome).
+fn reserve_exposure(exposure: &mut Exposure, pos: &Position, cost_per: f64) {
     let notional = cost_per * pos.size as f64;
     *exposure.per_pair.entry(pos.market.clone()).or_insert(0.0) += notional;
     *exposure.per_cluster.entry(pos.cluster.clone()).or_insert(0.0) += notional;
     exposure.total += notional;
     exposure.open_positions += 1;
+}
 
+/// RELEASE the EXACT reservation `reserve_exposure` made (the precise inverse), for an entry that did not
+/// fully fill. Subtracts `cost_per * size` from each bucket rather than removing the whole per-pair bucket
+/// (`decrement_exposure`), so a release while another position for the same slug is still open does not wipe
+/// that other position's reservation too — the spawn-reserve path can stack on a slug a held position
+/// already contributes to (re-entry), and only THIS attempt's reservation must come back.
+fn release_exposure(exposure: &mut Exposure, pos: &Position, cost_per: f64) {
+    let notional = cost_per * pos.size as f64;
+    if let Some(p) = exposure.per_pair.get_mut(&pos.market) {
+        *p = (*p - notional).max(0.0);
+    }
+    if let Some(c) = exposure.per_cluster.get_mut(&pos.cluster) {
+        *c = (*c - notional).max(0.0);
+    }
+    exposure.total = (exposure.total - notional).max(0.0);
+    exposure.open_positions = exposure.open_positions.saturating_sub(1);
+}
+
+/// Record a freshly-filled position into the shared `positions` map so the postponement poll can see it and
+/// a void can be flattened. The exposure was already RESERVED at spawn (`reserve_exposure`), so this does
+/// NOT touch exposure — it only inserts the held position. C6: if a `HeldPosition` already exists for the
+/// slug (a re-entry, or a same-slug re-fill), PRESERVE its `prev` snapshot (the poll's accumulated status)
+/// and only update the position/size — a blind `insert` would clobber `prev` to `None` and silently defeat
+/// the officialDate-slide detection for a cycle. For a SPORTS pair the poll needs league/date/abbrevs.
+fn track_position(
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    pair: &LivePair,
+    pos: Position,
+) {
     let (league, date, team_a, team_b) = if pair.cat == Cat::Sports {
         let last_seg = |t: &str| t.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
         (
@@ -403,50 +586,121 @@ fn track_position(
         (String::new(), String::new(), String::new(), String::new())
     };
     let slug = pos.market.clone();
-    positions.lock().unwrap().insert(
-        slug,
-        postpone::HeldPosition { pos, league, date, team_a, team_b, prev: None },
-    );
+    use std::collections::hash_map::Entry;
+    match lock(positions).entry(slug) {
+        // C6: preserve the poll's `prev`; never blindly overwrite a live-tracked position's status history.
+        Entry::Occupied(mut e) => {
+            let hp = e.get_mut();
+            hp.pos = pos;
+            hp.league = league;
+            hp.date = date;
+            hp.team_a = team_a;
+            hp.team_b = team_b;
+        }
+        Entry::Vacant(e) => {
+            e.insert(postpone::HeldPosition { pos, league, date, team_a, team_b, prev: None });
+        }
+    }
 }
 
-/// Handle a postponement `UnwindRequest`: look up the held position, price each leg's marketable EXIT from
-/// the live books (SELL YES -> that book's best yes_bid; SELL NO -> 1 - yes_ask), and if BOTH price, fire
-/// the two SELLs; on a both-filled ack remove the position + decrement exposure. A one-sided book (a leg
-/// can't be priced) logs a WARN and leaves the position (the poll re-emits; the idempotent `unwind-…` coids
-/// stop a double-flatten). REDUCE-ONLY: this fires even under the kill-switch — flattening a void REDUCES
-/// risk — and the dry-run backend only LOGS, so it's safe by default.
-fn handle_unwind(
+/// Apply a SPAWNED submission's outcome on the EVENT LOOP's turn (so all position/exposure mutation is
+/// single-threaded). Entry: both-filled => record the position (keep the reservation); else => release the
+/// reservation. Unwind: both-filled => remove the position + decrement exposure; else => leave the position
+/// for the poll to re-emit. Either kind, a non-both-filled outcome with a real (non-simulated) fill is a
+/// NAKED directional leg -> fail-close (W14). Always clears the slug's in-flight marker.
+fn apply_outcome(
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    exposure: &mut Exposure,
+    pending_entries: &mut std::collections::HashSet<String>,
+    flattening: &mut std::collections::HashSet<String>,
+    halt: &std::sync::atomic::AtomicBool,
+    out: SubmitOutcome,
+) {
+    let both = out.ack.both_filled();
+    match out.kind {
+        SubmitKind::Entry => {
+            pending_entries.remove(&out.slug);
+            if both {
+                if let (Some(pos), Some(pair)) = (out.position, out.pair) {
+                    track_position(positions, &pair, pos); // exposure stays RESERVED (keep it)
+                }
+            } else {
+                // release the EXACT reservation made at spawn (the entry did not fully fill)
+                if let Some(pos) = &out.position {
+                    release_exposure(exposure, pos, out.cost_per);
+                }
+                naked_leg_failclose(&out.slug, SubmitKind::Entry, &out.ack, halt);
+            }
+        }
+        SubmitKind::Unwind => {
+            flattening.remove(&out.slug); // a non-flat outcome lets the poll re-emit to retry
+            if both {
+                if let Some(removed) = lock(positions).remove(&out.slug) {
+                    decrement_exposure(exposure, &removed.pos);
+                }
+                println!("[UNWIND] flattened {}", out.slug);
+            } else {
+                println!("[UNWIND] WARN {} did not fully flatten (one leg unfilled); poll re-emits", out.slug);
+                naked_leg_failclose(&out.slug, SubmitKind::Unwind, &out.ack, halt);
+            }
+        }
+    }
+}
+
+/// W14 FAIL-CLOSE: a non-both-filled outcome where exactly one leg actually filled AND the ack is LIVE (not
+/// a simulated dry-run ack) is a naked directional position — the catastrophic case the hedge exists to
+/// prevent. Log CRITICAL, ENGAGE the runtime halt (blocks all new entries), and keep the filled leg visible.
+/// Dry-run acks are simulated -> `both_filled` is always true there, so this never trips in dry-run.
+fn naked_leg_failclose(slug: &str, kind: SubmitKind, ack: &exec::PairAck, halt: &std::sync::atomic::AtomicBool) {
+    let leg_live_filled = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Ok(a) if !a.simulated);
+    let a_naked = leg_live_filled(&ack.a) && ack.b.is_err();
+    let b_naked = leg_live_filled(&ack.b) && ack.a.is_err();
+    if a_naked || b_naked {
+        let filled = if a_naked { &ack.a } else { &ack.b };
+        halt.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[live] CRITICAL NAKED LEG on {kind:?} {slug}: one live leg filled, the other did not ({filled:?}) \
+             -> KILL-SWITCH engaged (no new entries). Filled leg is a directional position — flatten MANUALLY."
+        );
+    }
+}
+
+/// Prepare + SPAWN a postponement unwind: dedupe against an in-flight flatten (`flattening`), look up the
+/// held position, price each leg's marketable EXIT from the live books (SELL YES -> best yes_bid; SELL NO
+/// -> 1 - yes_ask), then SPAWN the two SELLs (the bookkeeping — remove position + decrement exposure —
+/// happens on the outcome arm). A one-sided book (a leg can't be priced) logs a WARN and clears the
+/// in-flight marker so the poll's next re-emit can retry. REDUCE-ONLY: fires even under the kill-switch
+/// (flattening a void REDUCES risk) and the dry-run backend only LOGS, so it is safe by default.
+#[allow(clippy::too_many_arguments)]
+fn spawn_unwind(
     cfg: &Config,
-    backend: &mut dyn ExecutionBackend,
+    backend: &std::sync::Arc<dyn ExecutionBackend>,
     positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
     kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
     pmus_books: &std::collections::HashMap<String, book::PmusBook>,
-    exposure: &mut Exposure,
+    flattening: &mut std::collections::HashSet<String>,
+    outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
     slug: &str,
 ) {
-    let Some(hp) = positions.lock().unwrap().get(slug).cloned() else { return }; // already flattened / gone
+    if flattening.contains(slug) {
+        return; // a flatten for this slug is already in flight -> don't double-fire (C5)
+    }
+    let Some(hp) = lock(positions).get(slug).cloned() else { return }; // already flattened / gone
     if cfg.kill_switch {
         println!("[UNWIND] kill-switch engaged but flattening (reduce-only) {slug}");
     }
     // price each leg's exit from the venue book it sits on (a SELL never blocks on a fresh entry edge).
     let exits = unwind_exit_cents(&hp.pos, |leg| match leg.venue {
-        Venue::Kalshi => kalshi_books.lock().unwrap().get(&leg.market).map(|b| b.touch()),
+        Venue::Kalshi => lock(kalshi_books).get(&leg.market).map(|b| b.touch()),
         Venue::Pmus => pmus_books.get(&leg.market).map(|b| b.touch()),
     });
     let Some(exits) = exits else {
         println!("[UNWIND] WARN one-sided book — cannot price both legs of {slug}; holding (poll re-emits)");
-        return;
+        return; // not marked flattening -> the poll's re-emit retries once a book is two-sided
     };
     let orders = unwind::unwind_orders(&hp.pos, exits);
-    let ack = backend.submit_pair(&orders[0], &orders[1]);
-    if ack.both_filled() {
-        if let Some(removed) = positions.lock().unwrap().remove(slug) {
-            decrement_exposure(exposure, &removed.pos);
-        }
-        println!("[UNWIND] flattened {slug}");
-    } else {
-        println!("[UNWIND] WARN {slug} did not fully flatten (one leg unfilled); poll re-emits");
-    }
+    flattening.insert(slug.to_string());
+    spawn_submit(backend, outcome_tx, SubmitKind::Unwind, slug.to_string(), orders, None, None, 0.0);
 }
 
 /// Decrement exposure when a tracked position is closed (mirror of the bump in `track_position`), so caps
@@ -535,6 +789,7 @@ async fn refresh_loop(
     k_tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pm_tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     kalshi_books: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
+    positions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
     k_subs: tokio::sync::mpsc::UnboundedSender<venue::SubUpdate>,
     pm_subs: tokio::sync::mpsc::UnboundedSender<venue::SubUpdate>,
 ) {
@@ -551,13 +806,21 @@ async fn refresh_loop(
         };
         report_coverage(&fresh);
 
+        // C9: a TRUNCATED catalog (pmus paging hit the cap) means an absent slug may just be off the cut
+        // page, not settled — treat it like a degraded pull FOR PRUNING ONLY: still apply the adds, but skip
+        // the prune step this cycle so a live market isn't torn down because the catalog was incomplete.
+        let prune_ok = !fresh.truncated;
+        if !prune_ok {
+            println!("[refresh] pmus catalog TRUNCATED — no prune this cycle");
+        }
+
         // fresh keys by venue. A sports pair contributes BOTH Kalshi tickers (team A + B).
         let fresh_slugs: HashSet<String> = fresh.pairs.iter().map(|p| p.slug.clone()).collect();
         let fresh_tickers: HashSet<String> = fresh.pairs.iter().flat_map(pair_tickers).collect();
 
         // snapshot the PRE-refresh subscribed set (slugs + each pair's Kalshi ticker(s)) before mutating.
         let (pre_slugs, slug_to_tickers): (HashSet<String>, HashMap<String, Vec<String>>) = {
-            let ps = pairs.lock().unwrap();
+            let ps = lock(&pairs);
             (
                 ps.by_slug.keys().cloned().collect(),
                 ps.by_slug.iter().map(|(s, p)| (s.clone(), p.kalshi_tickers())).collect(),
@@ -565,9 +828,21 @@ async fn refresh_loop(
         };
         let pre_tickers: HashSet<String> = slug_to_tickers.values().flatten().cloned().collect();
 
-        // PRUNE debounce (keyed on the pmus slug = the pair identity); pruned slugs -> their Kalshi
-        // tickers (both teams for a sports pair).
-        let prune_slugs = prune_step(&pre_slugs, &fresh_slugs, &mut absent, 2);
+        // PRUNE debounce (keyed on the pmus slug = the pair identity). W16: never prune a slug with an open
+        // HeldPosition — it must stay subscribed/flattenable until closed (else its Kalshi book is freed and
+        // the unwind can never price the exit -> an un-flattenable held position). A genuinely-settled held
+        // slug still accrues misses in `absent` (the debounce runs), so once its position closes the next
+        // cycle prunes it immediately. C9: on a TRUNCATED catalog, skip the debounce entirely (an off-page
+        // slug must not count as a miss) — still apply the adds below.
+        let held: HashSet<String> = lock(&positions).keys().cloned().collect();
+        let prune_slugs: HashSet<String> = if prune_ok {
+            prune_step(&pre_slugs, &fresh_slugs, &mut absent, 2)
+                .into_iter()
+                .filter(|s| !held.contains(s))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let prune_tickers: HashSet<String> = prune_slugs.iter().filter_map(|s| slug_to_tickers.get(s)).flatten().cloned().collect();
 
         // the in-place WIRE updates: add = fresh keys not already subscribed; del = the pruned keys. Pure
@@ -579,9 +854,9 @@ async fn refresh_loop(
         // mutate it before dispatching so a reconnect-during-refresh stays consistent).
         let mut added = 0usize;
         {
-            let mut ps = pairs.lock().unwrap();
-            let mut kt = k_tracked.lock().unwrap();
-            let mut pt = pm_tracked.lock().unwrap();
+            let mut ps = lock(&pairs);
+            let mut kt = lock(&k_tracked);
+            let mut pt = lock(&pm_tracked);
             for p in &fresh.pairs {
                 if !ps.by_slug.contains_key(&p.slug) {
                     for tk in pair_tickers(p) {
@@ -604,7 +879,7 @@ async fn refresh_loop(
         // free settled Kalshi books so memory stays FLAT over a multi-week run (L20), not only on the next
         // reconnect-clear. (pmus books are freed in the event loop when an untracked frame arrives.)
         if !prune_tickers.is_empty() {
-            let mut kb = kalshi_books.lock().unwrap();
+            let mut kb = lock(&kalshi_books);
             for tk in &prune_tickers {
                 kb.remove(tk);
             }
@@ -627,10 +902,48 @@ async fn refresh_loop(
 }
 
 /// Contracts the bankroll can fund at this pair price — the `affordable` arg to `risk::evaluate`. Derived
-/// from the remaining total-notional room / per-pair cost (the gate then applies all the finer caps).
-fn affordable(cfg: &Config, edge: &Edge) -> u32 {
+/// from the REMAINING total-notional room (W4: subtract already-open `exposure.total`, matching the
+/// docstring "the bankroll can fund" — the raw cap ignored open positions and double-counted once any
+/// position was open; only the gate's `tot_cap` happened to subtract it). The gate still applies all the
+/// finer caps; `cost_per` mirrors the gate's reconstruction (`(1-edge.net).max(0.1)`).
+fn affordable(cfg: &Config, edge: &Edge, exposure: &Exposure) -> u32 {
     let cost_per = (1.0 - edge.net).max(0.1);
-    (cfg.max_total_notional / cost_per).floor().max(0.0) as u32
+    let room = (cfg.max_total_notional - exposure.total).max(0.0);
+    (room / cost_per).floor().max(0.0) as u32
+}
+
+/// W6: recompute the REALIZED net edge from the two ROUNDED leg prices and confirm it still clears the
+/// edge floor (and the pair costs < 100c). `build_legs` rounds each leg's price to a whole cent
+/// independently, so the paid cost (`a_cents + b_cents`) can drift up to +1c above the cost implied by the
+/// gated `edge.net`; without this the booked edge can be materially thinner than the gated edge. The fee
+/// model mirrors `signal`/`game_signal` exactly: each leg pays its venue's at-scale MARGINAL taker fee at
+/// that leg's PAID price (the same per-leg `venue_fee(leg_price)` those functions sum), so this is the
+/// honest "size and price are consistent" check the gate splits across two functions.
+fn realized_edge_clears_floor(cfg: &Config, legs: &[OrderIntent; 2]) -> bool {
+    use crate::ledger::{marginal_taker_fee, KALSHI_TAKER_COEF, PMUS_TAKER_COEF};
+    let leg_fee = |leg: &OrderIntent| {
+        let p = leg.price_cents as f64 / 100.0;
+        if !(0.0 < p && p < 1.0) {
+            return 0.0;
+        }
+        let coef = match leg.venue {
+            Venue::Kalshi => KALSHI_TAKER_COEF,
+            Venue::Pmus => PMUS_TAKER_COEF,
+        };
+        marginal_taker_fee(coef, p)
+    };
+    let cost = (legs[0].price_cents as f64 + legs[1].price_cents as f64) / 100.0;
+    if cost >= 1.0 {
+        return false; // a >= $1 pair pays more than the $1 payout — never book it
+    }
+    let realized_net = round4((1.0 - cost) - leg_fee(&legs[0]) - leg_fee(&legs[1]));
+    realized_net * 100.0 >= cfg.edge_floor_cents
+}
+
+/// 4dp round, matching `signal::round4` / ledger.py — keeps the realized-edge re-check bit-consistent with
+/// the edge the gate approved.
+fn round4(x: f64) -> f64 {
+    (x * 1.0e4).round() / 1.0e4
 }
 
 /// Determine which venue led the current edge by comparing each venue's mid to the prior snapshot: the
@@ -765,8 +1078,9 @@ fn cents(price: Option<f64>) -> Option<u8> {
 }
 
 /// Fire the hedged pair from an already-built pair of legs (the backend fires both concurrently). Thin
-/// wrapper kept for the smoke path; the live loop calls `submit_pair` directly off `build_legs`.
-fn fire_legs(backend: &mut dyn ExecutionBackend, legs: &[OrderIntent; 2]) {
+/// wrapper kept for the OFFLINE smoke path (synchronous, no spawn); the live loop SPAWNS `submit_pair` off
+/// an `Arc<backend>` so the network RTT never blocks its `select!` (see `spawn_submit`).
+fn fire_legs(backend: &dyn ExecutionBackend, legs: &[OrderIntent; 2]) {
     let _ = backend.submit_pair(&legs[0], &legs[1]);
 }
 
@@ -814,7 +1128,7 @@ where
 }
 
 /// Stage-1 smoke: prove the risk+exec spine behaves on real-shaped snapshots (weather/econ/sports).
-fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
+fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
     // a 1:1 LivePair (weather/econ) builder for the smoke (kalshi_b = None).
     let lp = |slug: &str, kalshi: &str, cat: Cat, cluster: &str| LivePair {
         slug: slug.into(), kalshi: kalshi.into(), kalshi_b: None, cat, cluster: cluster.into(),
@@ -934,7 +1248,7 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
     println!();
 }
 
-fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &mut dyn ExecutionBackend) {
+fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &dyn ExecutionBackend) {
     match evaluate(cfg, q, &edge, &Exposure::new(), 1000) {
         Ok(a) => {
             println!("  APPROVED size={}  (edge {:.1}c, dir {:?})", a.size, edge.net * 100.0, edge.dir);
@@ -1173,7 +1487,7 @@ mod tests {
     /// on flatten), and a SPORTS pair derives league/date/abbrevs for the poll while non-sports leaves them
     /// empty.
     #[test]
-    fn track_and_decrement_exposure_round_trips() {
+    fn reserve_track_and_decrement_exposure_round_trips() {
         use std::sync::{Arc, Mutex};
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
@@ -1188,8 +1502,10 @@ mod tests {
             OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs);
-        track_position(&positions, &pair, pos, &mut exp, 0.97);
-        // exposure bumped by cost_per×size = 0.97×4 = 3.88 across pair/cluster/total; one open position.
+        // RESERVE at spawn (exposure bumps) then RECORD on both-filled (exposure stays reserved).
+        reserve_exposure(&mut exp, &pos, 0.97);
+        track_position(&positions, &pair, pos);
+        // exposure reserved by cost_per×size = 0.97×4 = 3.88 across pair/cluster/total; one open position.
         assert!((exp.total - 3.88).abs() < 1e-9);
         assert!((exp.per_pair["aec-mlb-lad-pit-2026-06-16"] - 3.88).abs() < 1e-9);
         assert!((exp.per_cluster["mlb-2026-06-16"] - 3.88).abs() < 1e-9);
@@ -1203,6 +1519,61 @@ mod tests {
         assert!(!exp.per_pair.contains_key("aec-mlb-lad-pit-2026-06-16"));
     }
 
+    /// C6: re-tracking a slug that already has a HeldPosition PRESERVES the poll's accumulated `prev`
+    /// (status history) instead of clobbering it to `None` — the officialDate-slide detection needs `prev`.
+    #[test]
+    fn track_position_preserves_prev_on_retrack() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pair = LivePair {
+            slug: "aec-mlb-lad-pit-2026-06-16".into(),
+            kalshi: "KXMLBGAME-26JUN16-LAD".into(),
+            kalshi_b: Some("KXMLBGAME-26JUN16-PIT".into()),
+            cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0),
+        };
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
+        ];
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs);
+        track_position(&positions, &pair, pos.clone());
+        // the poll has since accumulated a status snapshot on this slug.
+        let snapshot = postpone::GameStatus { detailed_state: "Scheduled".into(), official_date: Some("2026-06-16".into()), ..Default::default() };
+        positions.lock().unwrap().get_mut(&pair.slug).unwrap().prev = Some(snapshot.clone());
+        // a re-entry/re-fill re-tracks the SAME slug — `prev` must survive (was clobbered to None pre-C6).
+        track_position(&positions, &pair, pos);
+        assert_eq!(positions.lock().unwrap().get(&pair.slug).unwrap().prev, Some(snapshot));
+    }
+
+    /// W6: when rounding each leg to a whole cent pushes the realized net under the floor, the fire is
+    /// SKIPPED. A pair whose two book legs round to 49c + 49c = 98c gross 2c, minus marginal fees, nets
+    /// under the 2c floor -> rejected; a clearly-fat pair (cheap legs) clears it.
+    #[test]
+    fn realized_edge_recheck_skips_a_rounded_under_floor_pair() {
+        let cfg = crate::config::Config::test_default(); // edge_floor_cents = 2.0
+        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, client_order_id: "x".into() };
+        // 49 + 49 = 98c -> gross 2c, but marginal taker fees on both legs eat it below the 2c floor -> SKIP.
+        assert!(!realized_edge_clears_floor(&cfg, &[leg(Venue::Pmus, 49), leg(Venue::Kalshi, 49)]));
+        // 5 + 90 = 95c -> gross 5c, fees on the cheap+dear legs leave well over 2c -> FIRE.
+        assert!(realized_edge_clears_floor(&cfg, &[leg(Venue::Pmus, 5), leg(Venue::Kalshi, 90)]));
+        // a >= $1 pair (51 + 50 = 101c) can never be booked -> SKIP.
+        assert!(!realized_edge_clears_floor(&cfg, &[leg(Venue::Pmus, 51), leg(Venue::Kalshi, 50)]));
+    }
+
+    /// W4: `affordable` subtracts already-open `exposure.total` from the total-notional cap (the bankroll
+    /// truly fundable), not the raw cap. With half the cap deployed, affordable halves.
+    #[test]
+    fn affordable_subtracts_open_exposure() {
+        let cfg = crate::config::Config::test_default(); // max_total_notional = 1000
+        let e = Edge { net: 0.0, dir: Dir::PK }; // cost_per = (1-0).max(0.1) = 1.0 -> affordable == room
+        let mut exp = Exposure::new();
+        assert_eq!(affordable(&cfg, &e, &exp), 1000); // nothing open -> full room
+        exp.total = 600.0;
+        assert_eq!(affordable(&cfg, &e, &exp), 400); // 600 deployed -> 400 room (raw cap would say 1000)
+        exp.total = 1200.0; // over-deployed -> clamps at 0, never negative
+        assert_eq!(affordable(&cfg, &e, &exp), 0);
+    }
+
     /// PairState registers BOTH sports tickers in `by_ticker` -> slug, and `remove` frees both (so a
     /// frame on either team's Kalshi book finds the pair, and a pruned pair leaves no dangling index).
     #[test]
@@ -1214,5 +1585,122 @@ mod tests {
         ps.remove("aec-mlb-lad-pit-2026-06-16");
         assert!(!ps.by_ticker.contains_key("K-LAD") && !ps.by_ticker.contains_key("K-PIT"));
         assert!(ps.by_slug.is_empty());
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn sim_ack(coid: &str) -> Result<exec::Ack, exec::ExecError> {
+        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "SIMULATED".into(), simulated: true })
+    }
+    fn live_ack(coid: &str) -> Result<exec::Ack, exec::ExecError> {
+        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "v1".into(), simulated: false })
+    }
+    fn wx_entry_pair() -> (LivePair, Position, f64) {
+        let pair = LivePair {
+            slug: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+            kalshi: "KXHIGHNY-26JUN11-T95".into(),
+            kalshi_b: None, cat: Cat::Weather, cluster: "nychigh-2026-06-11".into(), settle_clean: true, days_to_event: None,
+        };
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "xarb-…-A".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "xarb-…-B".into() },
+        ];
+        (pair.clone(), position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs), 0.97)
+    }
+
+    /// CORE: a BOTH-FILLED entry outcome RECORDS the position and KEEPS the spawn reservation (exposure
+    /// unchanged from the reserve), and clears the slug's `pending_entries` marker.
+    #[test]
+    fn outcome_entry_both_filled_records_and_keeps_reservation() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        // SPAWN-time bookkeeping: reserve + mark pending.
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        let reserved_total = exp.total;
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        apply_outcome(&positions, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!((exp.total - reserved_total).abs() < 1e-9, "both-filled keeps the reservation");
+        assert!(positions.lock().unwrap().contains_key(&slug), "position recorded");
+        assert!(!pending.contains(&slug), "pending marker cleared");
+        assert!(!halt.load(Ordering::Relaxed), "a clean simulated fill never halts");
+    }
+
+    /// CORE: a NON-both-filled entry outcome RELEASES the exact reservation (exposure back to zero) and
+    /// clears `pending_entries`. A SIMULATED partial (dry-run can't produce one, but a transport error can
+    /// in live with keys absent) does NOT trip the naked-leg halt because neither leg actually filled live.
+    #[test]
+    fn outcome_entry_failed_releases_reservation() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // both legs errored (e.g. KeysUnavailable) -> not both_filled, no live fill -> release, no halt.
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: Err(exec::ExecError::KeysUnavailable), b: Err(exec::ExecError::KeysUnavailable) }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        apply_outcome(&positions, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "reservation released exactly");
+        assert!(!positions.lock().unwrap().contains_key(&slug), "no position recorded on a failed entry");
+        assert!(!pending.contains(&slug));
+        assert!(!halt.load(Ordering::Relaxed), "no LIVE leg filled -> no naked-leg halt");
+    }
+
+    /// W14 FAIL-CLOSE: an entry where ONE leg filled LIVE and the other errored is a naked directional
+    /// position -> ENGAGE the runtime halt (blocks all new entries) + still release the reservation.
+    #[test]
+    fn outcome_naked_live_leg_engages_halt() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // leg A filled LIVE, leg B rate-limited -> NAKED -> halt.
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::RateLimited) }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        apply_outcome(&positions, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!(halt.load(Ordering::Relaxed), "a naked LIVE leg must engage the kill-switch");
+        assert!(!pending.contains(&slug));
+        // a SIMULATED-only partial does NOT halt (dry-run safety): one simulated ok + one error.
+        let halt2 = AtomicBool::new(false);
+        naked_leg_failclose("s", SubmitKind::Entry, &exec::PairAck { a: sim_ack("a"), b: Err(exec::ExecError::RateLimited) }, &halt2);
+        assert!(!halt2.load(Ordering::Relaxed), "a simulated partial is not a real naked leg");
+    }
+
+    /// CORE: a BOTH-FILLED unwind outcome REMOVES the held position + decrements exposure + clears the
+    /// `flattening` marker (so the slug is fully closed).
+    #[test]
+    fn outcome_unwind_both_filled_removes_position() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        // an open, recorded position with its reservation, now mid-flatten.
+        reserve_exposure(&mut exp, &pos, cp);
+        track_position(&positions, &pair, pos);
+        flat.insert(slug.clone());
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("u0"), b: sim_ack("u1") }, position: None, pair: None, cost_per: 0.0 };
+        apply_outcome(&positions, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!(!positions.lock().unwrap().contains_key(&slug), "position removed on flatten");
+        assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "exposure decremented on flatten");
+        assert!(!flat.contains(&slug), "flattening marker cleared");
     }
 }
