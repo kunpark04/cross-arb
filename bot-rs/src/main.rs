@@ -221,8 +221,8 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
     let initial = match discovery::discover(&http).await {
         Ok(d) => {
             println!(
-                "[discovery] {} weather + {} econ pairs ({} sports matched, not subscribed in the 1:1 loop)",
-                d.weather_pairs, d.econ_pairs, d.sports_pairs
+                "[discovery] {} weather + {} econ + {} sports pairs tracked ({} total subscribable)",
+                d.weather_pairs, d.econ_pairs, d.sports_pairs, d.pairs.len()
             );
             report_coverage(&d);
             d.pairs
@@ -326,6 +326,13 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
     // vice-versa. `stream_paused` stays true while EITHER venue is mid-rebuild.
     let (mut k_rebuild, mut pm_rebuild) = (false, false);
 
+    // HEALTH HEARTBEAT: a 24/7 live bot must be observable. Every 20s log book/pair counts + the frame
+    // count so a silently-wedged stream (task alive but delivering no frames — which the task supervisor
+    // does NOT catch) is visible. `events` counts venue book frames processed since start.
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+    heartbeat.tick().await; // consume the immediate first tick
+    let mut events: u64 = 0;
+
     loop {
         // C1 (robustness): a supervised task can finish WHILE the loop is in its body — and the guarded
         // `select!` arms below (`if !is_finished()`) are then DISABLED, so that death would never wake the
@@ -359,6 +366,13 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
                 }
                 continue;
             }
+            _ = heartbeat.tick() => {
+                let (kb, pmb) = (lock(&kalshi_books).len(), pmus_books.len());
+                let pn = lock(&pairs).by_slug.len();
+                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={}",
+                         k_fresh.len(), exposure.stream_paused);
+                continue;
+            }
             // C1 SUPERVISOR: any collector/refresh/poll task ending (clean return OR panic) is FATAL — a
             // dead data source means a frozen book, so HALT and stop trading rather than trade stale data.
             r = &mut k_handle, if !k_handle.is_finished() => { supervise_fatal("kalshi_stream", r, &halt); break; }
@@ -366,6 +380,7 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
             r = &mut refresh_handle, if !refresh_handle.is_finished() => { supervise_fatal("refresh_loop", r, &halt); break; }
             r = poll_opt(&mut poll_handle), if poll_handle.is_some() => { supervise_fatal("poll_mlb_postponements", r, &halt); break; }
         };
+        events = events.wrapping_add(1); // a venue book frame fell through the select (heartbeat activity)
         // which pmus slug does this event touch? (book updates first, then evaluate on the complete state)
         let slug = match &ev {
             venue::VenueEvent::Kalshi { ticker } => {

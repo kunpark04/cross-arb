@@ -707,9 +707,14 @@ pub async fn discover(http: &reqwest::Client) -> Result<Discovery, String> {
         .chain(ECON.iter().map(|(_, k, ..)| *k))
         .chain(LEAGUES_ABBREV.iter().map(|(_, k)| *k))
         .collect();
-    for kser in needed {
+    for (i, kser) in needed.iter().enumerate() {
         let markets = pull_kalshi_series(http, kser).await?;
         series_cache.insert(kser.to_string(), markets);
+        // inter-series pacing (ports colisted_map.py's `time.sleep(0.25)`) — a burst across all ~18 series
+        // with no gap trips Kalshi's rate limit (429); the per-call retry above is the backstop.
+        if i + 1 < needed.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
     // today as days-since-epoch (UTC), dep-free: system seconds / 86400. Feeds sports days_to_event.
     let today = std::time::SystemTime::now()
@@ -779,22 +784,46 @@ async fn fetch_markets(http: &reqwest::Client, url: &str, key: &str) -> Result<V
     Ok(v.get(key).and_then(Value::as_array).cloned().unwrap_or_default())
 }
 
-/// GET -> parsed JSON `Value`. Reads the body as text first (like `exec.rs`) so a non-JSON error page
-/// yields a clean error string rather than a decode panic. PUBLIC endpoint — NO auth headers.
+/// GET -> parsed JSON `Value`, with RETRY on 429 + transient 5xx. VERIFIED necessary live (2026-06-11): a
+/// cold-start discovery burst across the ~18 tracked Kalshi series 429s on the first pull without it, and
+/// the `?` propagation then aborts the WHOLE discovery (loop starts empty). Ports `colisted_map.py::get`
+/// (`tries=4`; retry only {429,500,502,503,504} + transport errors; backoff `1.5*(i+1)` s; a 4xx that
+/// isn't 429 is permanent). Reads the body as text first so a non-JSON error page is a clean error, not a
+/// decode panic. PUBLIC endpoint — NO auth headers.
 async fn fetch_json(http: &reqwest::Client, url: &str) -> Result<Value, String> {
-    let resp = http
-        .get(url)
-        .header("User-Agent", "cross-arb/1.0")
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("GET {}: {e}", url.split('?').next().unwrap_or(url)))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("GET {} -> {}", url.split('?').next().unwrap_or(url), status.as_u16()));
+    let short = |u: &str| u.split('?').next().unwrap_or(u).to_string();
+    let tries = 4u32;
+    let mut last = String::new();
+    for attempt in 0..tries {
+        match http
+            .get(url)
+            .header("User-Agent", "cross-arb/1.0")
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    return serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", short(url)));
+                }
+                let code = status.as_u16();
+                last = format!("GET {} -> {}", short(url), code);
+                if !matches!(code, 429 | 500 | 502 | 503 | 504) || attempt == tries - 1 {
+                    return Err(last); // permanent (non-429 4xx) or out of retries
+                }
+            }
+            Err(e) => {
+                last = format!("GET {}: {e}", short(url));
+                if attempt == tries - 1 {
+                    return Err(last);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500 * (attempt as u64 + 1))).await;
     }
-    serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", url.split('?').next().unwrap_or(url)))
+    Err(last)
 }
 
 #[cfg(test)]

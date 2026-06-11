@@ -314,6 +314,7 @@ pub async fn kalshi_stream(
                 } else {
                     backoff = 1; // connected + subscribed OK -> reset backoff
                     clean = true;
+                    eprintln!("[kalshi] connected + subscribed {} tickers", current.len());
                     'read: loop {
                         // FAIR select (no `biased`): a busy frame stream must not starve discovery sub
                         // updates (tokio randomizes poll order each iteration). Adds/deletes apply between
@@ -486,6 +487,7 @@ pub async fn pmus_stream(
                 }
                 if send_ok {
                     backoff = 1;
+                    eprintln!("[pmus] connected + subscribed {} slugs", current.len());
                     'read: loop {
                         // FAIR select (no `biased`) — same rationale as kalshi_stream.
                         let item = tokio::select! {
