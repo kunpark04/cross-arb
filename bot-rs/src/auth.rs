@@ -15,6 +15,16 @@ pub fn canonical(ts_ms: u128, method: &str, path: &str) -> String {
     format!("{ts_ms}{method}{path}")
 }
 
+/// Millis since the Unix epoch — the timestamp both venues require (≤30 s / 5 s skew). Single source so
+/// the WS handshake and the REST POST sign with the same clock convention.
+pub fn now_ms_for_sign() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 // ----------------------------------------------------------------------------------------------
 // polymarket.us — Ed25519
 // ----------------------------------------------------------------------------------------------

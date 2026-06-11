@@ -4,6 +4,29 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
+## bot-rs stage-2 NETWORK LAYER (2026-06-11) — in progress
+
+Build the venue I/O + live transport that completes the Rust bot (compile + unit-test only; live
+connect/orders are the owner's droplet step). Safety spine (42 tests) stays green.
+
+- [x] `venue.rs` — Kalshi WS client (RSA-PSS handshake, `orderbook_delta` sub, snapshot+delta merge into
+      `book::KalshiBook`, single-sid seq-gap → reconnect) + pmus WS client (Ed25519 handshake,
+      `SUBSCRIPTION_TYPE_MARKET_DATA` sub, `marketData` frame → `book::PmusBook`). Supervised reconnect
+      with backoff. Pure frame-PARSERS unit-tested against embedded sample JSON (no live connection).
+- [x] `main.rs` → `#[tokio::main]`; keep dry-run `smoke` (no-creds / `--smoke`); add the live loop:
+      connect both venues, maintain books per pair, build a `Quote` on each dual-venue update,
+      `risk::evaluate`, `exec.submit_pair` (dry-run default). Honors kill-switch + prod-consent gate.
+- [x] `exec.rs` `LiveBackend::submit_pair` — REAL signed POST. Kalshi `POST /portfolio/orders`
+      (auth::kalshi_headers + build_kalshi_payload); BOTH LEGS CONCURRENT (`tokio::join!`). pmus
+      best-effort POST with a loud `// TODO verify pmus POST signing live` (typed error if uncertain).
+      Gated: keys absent → `KeysUnavailable` (never sends in sandbox); dry-run path unchanged; trait dyn-compatible.
+- [x] Full `cargo test` green (53; 42 existing + 11 new venue/payload/leg-pricing) + self-review (artifacts:
+      `tasks/_agent_bus/20260611-0940/`). **Self-review caught + fixed a CRITICAL** (live loop fired the pair
+      cost as the YES-leg limit → NO leg couldn't fill → naked leg; now book-derived per-leg prices + regression test).
+- **Stage-2 follow-ups (out of this run's network scope, must close before real-money arm):** colisted-map
+      DISCOVERY port (fills the live loop's `pairs`); per-venue book `age` (the staleness gate `Reject::StaleBook`
+      is inert while books are fed `age_s=0.0`); pmus POST-body signing live-verify; demo-sandbox session.
+
 > **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
 
 ## Reviewer audit (2026-06-09) — fixes ([reviewer-audit-2026-06-09.md](reviewer-audit-2026-06-09.md))
