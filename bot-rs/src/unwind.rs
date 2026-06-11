@@ -27,7 +27,7 @@ pub struct Postponement {
 /// (hold); anything later or unknown means Kalshi voids while pmus pays the real result (unwind).
 pub fn should_unwind(p: &Postponement, kalshi_void_window_days: f64) -> bool {
     p.reschedule_in_days
-        .map_or(true, |d| d > kalshi_void_window_days)
+        .is_none_or(|d| d > kalshi_void_window_days)
 }
 
 /// The two closing orders to flatten a held pair: SELL each of the position's two legs with the EXACT

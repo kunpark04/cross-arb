@@ -3,6 +3,7 @@
 //!   * demo/sandbox venue unless `VENUE_ENV=prod` (+ an explicit informed-consent env for prod)
 //!   * 1-contract / tiny-notional caps + global kill-switch
 //!   * the read-write key is loaded from the owner's path at RUNTIME; never read/copied by Claude
+//!
 //! Live order submission runs in the OWNER's environment (Claude's sandbox blocks real submission).
 //! See `bot-rs/README.md`.
 #![allow(dead_code)] // stage-1 spine: several domain fields/variants are wired in stage 2 (venue I/O)
@@ -326,6 +327,18 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
     let (mut k_rebuild, mut pm_rebuild) = (false, false);
 
     loop {
+        // C1 (robustness): a supervised task can finish WHILE the loop is in its body — and the guarded
+        // `select!` arms below (`if !is_finished()`) are then DISABLED, so that death would never wake the
+        // select. Re-check at the TOP of every iteration: any finished collector/refresh/poll = FATAL halt
+        // (a dead data source means a frozen book). The guarded arms still cover a death during an idle await.
+        if k_handle.is_finished() || pm_handle.is_finished() || refresh_handle.is_finished()
+            || poll_handle.as_ref().is_some_and(|h| h.is_finished())
+        {
+            halt.store(true, Ordering::Relaxed);
+            eprintln!("[live] CRITICAL a supervised collector/refresh/poll task ended (loop-top check) — halting");
+            break;
+        }
+
         // Drive the venue book stream, the postponement-unwind channel, the submission-outcome channel,
         // AND the task supervisor — all co-equal. A void detection / a settled ack / a dead collector must
         // never wait behind a quiet book stream, so none of them is polled only between frames.
@@ -449,9 +462,16 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
             days_to_event: pair.days_to_event,
         };
 
-        // RUNTIME-HALT + IN-FLIGHT de-dup, BEFORE the gate: don't even price a slug that is halted or
-        // already has an entry/unwind in flight (C5 — a second concurrent entry would double-reserve).
-        if halt.load(Ordering::Relaxed) || pending_entries.contains(&slug) || flattening.contains(&slug) {
+        // RUNTIME-HALT + IN-FLIGHT de-dup, BEFORE the gate: don't even price a slug that is halted, already
+        // has an entry/unwind in flight (C5 — a second concurrent entry would double-reserve), OR already
+        // has an OPEN position. The last clause enforces ONE position per slug: re-entry while held would
+        // stack two exposure reservations against a single tracked position, desyncing the remove-on-unwind
+        // (the reviewer's re-entry WARN). Per-pair notional is already capped; this makes the bound exact.
+        if halt.load(Ordering::Relaxed)
+            || pending_entries.contains(&slug)
+            || flattening.contains(&slug)
+            || lock(&positions).contains_key(&slug)
+        {
             continue;
         }
 
@@ -529,8 +549,19 @@ fn spawn_submit(
     tokio::spawn(async move {
         // block_in_place requires the multi-thread runtime (#[tokio::main] full); the submit drives the two
         // signed POSTs concurrently inside it. Running it on a SPAWNED task means only this task parks, not
-        // the event loop.
-        let ack = backend.submit_pair(&legs[0], &legs[1]);
+        // the event loop. catch_unwind GUARANTEES an outcome is reported even if `submit_pair` panics —
+        // otherwise the slug stays stuck in pending_entries/flattening forever (never re-tradeable / never
+        // re-flattenable). A panic maps to a failed pair, so the outcome arm releases the reservation + slug.
+        let ack = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.submit_pair(&legs[0], &legs[1])
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("[live] CRITICAL submit task panicked for {slug} — reporting a failed pair (slug released)");
+            exec::PairAck {
+                a: Err(exec::ExecError::Rejected("submit panicked".into())),
+                b: Err(exec::ExecError::Rejected("submit panicked".into())),
+            }
+        });
         let _ = outcome_tx.send(SubmitOutcome { slug, kind, ack, position, pair, cost_per });
     });
 }
