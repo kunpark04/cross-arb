@@ -60,12 +60,18 @@ backoff.
 
 ## Build / run
 
-Needs Rust (`rustup`). Stage 1 is **std-only** — no external crates, compiles offline.
+Needs Rust (`rustup`). Stage 2 adds async/TLS/crypto deps (tokio, tokio-tungstenite, reqwest/rustls,
+rsa, ed25519-dalek). **Windows-gnu build note:** the rustup self-contained mingw is too minimal to
+build the `windows-sys` crate (`tokio` pulls it in on Windows) — install a full mingw-w64
+(`winget install BrechtSanders.WinLibs.POSIX.MSVCRT`, which adds `dlltool`/`as`/`gcc` to PATH). The
+deploy target is **Linux**, where none of this applies (no `windows-sys`, no mingw). TLS uses **rustls**
+(not OpenSSL) so there's no OpenSSL build dep.
 
 ```bash
 cd bot-rs
-cargo test          # runs the risk-gate + fee + PnL unit tests
-cargo run           # dry-run smoke (no orders; prints the safety banner + gate decisions)
+cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
+cargo test             # risk gates + fees + PnL + auth round-trips + unwind (22 tests)
+cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
 ```
 
 To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI_RW_KEY_PATH`, and

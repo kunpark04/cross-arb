@@ -7,6 +7,7 @@
 //! See `bot-rs/README.md`.
 #![allow(dead_code)] // stage-1 spine: several domain fields/variants are wired in stage 2 (venue I/O)
 
+mod auth;
 mod config;
 mod exec;
 mod ledger;
@@ -20,6 +21,7 @@ use risk::{evaluate, Exposure};
 use types::*;
 
 fn main() {
+    dotenvy::dotenv().ok(); // load bot-rs/.env (key paths + safety vars) if present
     let cfg = Config::from_env();
     banner(&cfg);
 

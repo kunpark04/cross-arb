@@ -9,14 +9,25 @@ publish = false
 # execution backends, ledger) compiles offline with NO external crates, so there is zero dependency
 # surface in the part that decides and gates trades.
 #
-# Stage 2 (venue I/O + live transport) adds, in the OWNER's environment:
-#   tokio            — async runtime for the two WS streams
-#   tokio-tungstenite— pmus + Kalshi orderbook_delta WebSockets
-#   reqwest          — REST (order POST, trades poll)
-#   ed25519-dalek    — pmus signing
-#   rsa + sha2       — Kalshi RSA-PSS signing
-#   serde + serde_json — config files + venue payloads
+# Stage 2 (venue I/O + live transport). Built locally, transferred to the droplet later. Crypto/async
+# crates are pure-Rust (compile cleanly on windows-gnu); the TLS crates (reqwest/tungstenite) use
+# RUSTLS (ring) — NOT native-tls/OpenSSL — to avoid an OpenSSL build dependency on windows-gnu.
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+ed25519-dalek = "2"            # pmus Ed25519 signing
+rsa = { version = "0.9", features = ["sha2"] }  # Kalshi RSA-PSS signing
+sha2 = "0.10"
+signature = "2"
+rand = "0.8"                   # OsRng for RSA-PSS salt + keygen (rand_core 0.6, matches rsa 0.9)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+dotenvy = "0.15"              # load bot-rs/.env (key paths + safety vars) at startup
+# --- TLS / network (added + compile-checked in the next phase) ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [[bin]]
 name = "cross-arb-bot"

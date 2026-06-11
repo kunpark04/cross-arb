@@ -12,3 +12,7 @@ __pycache__/
 
 # rust (bot-rs) — build artifacts only; src + Cargo.toml + Cargo.lock ARE tracked
 bot-rs/target/
+# bot-rs runtime secrets (keys + env) — NEVER committed; the read-write key lives external
+bot-rs/.env
+bot-rs/*.pem
+bot-rs/*.key
