@@ -11,9 +11,14 @@ venues and **both grade off the identical deterministic public number** (e.g. NW
 price gap is a structurally clean, US-legal arb — buy YES on the cheap venue + NO on the dear venue,
 hold to settlement, collect the gap net of fees.
 
-**Phase: READ-ONLY.** No capital is deployed and no orders are placed. All market data on both venues
-is public (no auth needed for books). We are measuring whether a real, persistent, scalable edge
-exists before wiring up trading keys. The read-only **persistence monitor** (`bot/monitor.py`, todo #10)
+**Phase: READ-ONLY → live-capable (owner override 2026-06-11, [0015](decisions/0015-owner-override-live-trading-phase.md)).**
+The research/monitor work is read-only; on 2026-06-11 the owner **overrode** the read-only governance to
+build the **live trading bot** (`bot-rs/`, Rust). It is **SAFE BY DEFAULT** — dry-run / demo-sandbox /
+1-contract caps / kill-switch — and the same-day readiness audit's **NOT-READY** verdict plus a
+**staged-rollout protest-of-record** stand (dry-run → demo → 1-contract prod → scale only after 0014
+validates). **Live order submission runs in the owner's environment, not here** (the sandbox blocks it;
+the read-write key stays external, never in repo). All market data on both venues
+is public (no auth needed for books). The read-only **persistence monitor** (`bot/monitor.py`, todo #10)
 is **DEPLOYED + LIVE** since 2026-06-09 — running 24/7 on a DigitalOcean droplet as a confined `cross-arb`
 user ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)), collecting the event-date-partitioned
 persistence dataset pulled daily to `Kalshi/data/cross-arb/` ([0009](decisions/0009-event-date-partition-copy-keep-pull.md)).
@@ -182,6 +187,7 @@ doc without linking it here leaves the index incomplete.
 | [research/README.md](research/README.md) | Index of the research briefs + the latency playbook (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
 | [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
+| [bot-rs/README.md](bot-rs/README.md) | **LIVE trading bot (Rust, [0015](decisions/0015-owner-override-live-trading-phase.md))** — safe-by-default model, build/run, staged rollout, stage-1 spine vs stage-2 venue I/O |
 | [docs/architecture.md](docs/architecture.md) | Data-flow diagram (venues → discovery → monitor → transitions → analysis/bot); marks where the clip / position-size lever sits |
 | [deploy/README.md](deploy/README.md) | Droplet deploy artifacts (systemd unit, provision/deploy/pull-logs scripts) + droplet sizing — GATED ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)) |
 
@@ -199,14 +205,17 @@ cross-arb/
 ├─ research/           ← 9 settlement / legality / venue / edge briefs
 ├─ scripts/            ← Python probes + scanners (read-only); _data/ outputs are gitignored
 ├─ bot/                ← ledger.py (PnL core) + monitor.py (dual-stream logger) + kalshi_book.py + colisted_map.py
+├─ bot-rs/             ← LIVE trading bot (Rust, 0015) — safe-by-default (dry-run/demo/caps/kill-switch); stage-1 spine
 ├─ deploy/             ← droplet deploy: systemd unit + provision/deploy/pull-logs scripts + runbook (GATED, 0006)
 └─ requirements.txt    ← pinned runtime deps for the monitor (websockets, cryptography)
 ```
 
 ## Working agreement (project-specific)
 
-- **Read-only until told otherwise.** Do not write order-placement code or commit anything that
-  could place a trade. Auth keys exist only to *verify* read access; `scripts/.env` is gitignored.
+- **Read-only until told otherwise** — **REVERSED 2026-06-11 by the owner ([0015](decisions/0015-owner-override-live-trading-phase.md)):**
+  the live bot `bot-rs/` is authorized. The least-privilege spirit holds (read-write key stays
+  external, never in repo/history), the bot is **dry-run by default**, and **live submission runs in the
+  owner's environment** (this sandbox blocks it). The Python research/monitor side stays read-only.
 - **Deployment is gated.** Live loggers (`bot/monitor.py`) + bot run on a DigitalOcean droplet —
   **consult the owner before any deploy** ([decisions/0006](decisions/0006-deploy-on-digitalocean-consult-first.md)).
   Dev stays local + read-only; `bot/monitor.py --live` is gated. Never push secrets to a remote host.

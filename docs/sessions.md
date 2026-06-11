@@ -6,6 +6,29 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, late) — Owner override → live trading bot in Rust (`bot-rs/`), safe-by-default
+
+Owner explicitly **overrode the read-only governance** ([0015](../decisions/0015-owner-override-live-trading-phase.md)),
+stated they hold the Kalshi read-write key, and directed: build the live bot in Rust. Captured the
+reversal as decision 0015 (with a Claude protest-of-record: the same-session audit/backtest say the
+edge is unvalidated; staged rollout strongly recommended). Built the **stage-1 safety-critical spine**
+of `bot-rs/` (std-only, compiles offline): `types`, `config` (safe defaults), `risk` (every learned
+edge-case gate — kill-switch, reconnect-pause, settlement-identity, crossed/stale book, mid-divergence,
+edge floor, per-pair/cluster/total caps, depth+bankroll sizing, idempotency), `exec` (dry-run backend +
+real Kalshi payload builder; live POST is the owner-env seam), `ledger` (outcome-independent PnL + taker
+fees, parity-vs-`ledger.py` flagged TODO-before-live), `main` (safety banner + hard prod-consent gate).
+
+- **SAFE BY DEFAULT:** dry-run unless `EXECUTION_MODE=live`; demo-sandbox unless `VENUE_ENV=prod`
+  (+ refuses prod without `CROSSARB_I_UNDERSTAND_PROD`); 1-contract / tiny-notional caps; kill-switch.
+  Read-write key referenced by external path, never read/copied by Claude. **Live submission runs in
+  the owner's env** — this sandbox blocks real order submission (verified: it blocked a balance check).
+- **Installed Rust** (rustup + GNU toolchain, no MSVC needed) and verified: `cargo test` **12/12 green**;
+  `cargo run` dry-run smoke behaves — correctly **rejects** the live econ U-3 9¢ gap (settlement not yet
+  verified) and **approves** a clean weather arb at size=1; prod-refusal + kill-switch gates fire.
+- **Stage 2 (owner env):** venue WS + auth ports, matcher/signal port w/ a parity test vs the Python
+  selftests, leg-sequencer/unwind, and the live transport (sign + HTTPS POST). Docs: `bot-rs/README.md`;
+  CLAUDE.md phase/layout/index + working-agreement updated to reflect the 0015 reversal.
+
 ## 2026-06-11 (UTC, late) — Deployment-readiness audit + live econ settlement reconciliation
 
 Owner pushed toward live deployment; reframed to "test everything, find blindspots." 7 parallel

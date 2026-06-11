@@ -9,3 +9,6 @@ scripts/_data/
 # python
 __pycache__/
 *.pyc
+
+# rust (bot-rs) — build artifacts only; src + Cargo.toml + Cargo.lock ARE tracked
+bot-rs/target/

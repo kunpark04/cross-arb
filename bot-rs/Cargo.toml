@@ -1,0 +1,23 @@
+[package]
+name = "cross-arb-bot"
+version = "0.1.0"
+edition = "2021"
+description = "cross-arb live trading bot (Rust) — SAFE BY DEFAULT (dry-run/demo/caps/kill-switch). See decision 0015 + README."
+publish = false
+
+# Stage 1 (this build) is std-only on purpose: the safety-critical spine (types, config, risk gates,
+# execution backends, ledger) compiles offline with NO external crates, so there is zero dependency
+# surface in the part that decides and gates trades.
+#
+# Stage 2 (venue I/O + live transport) adds, in the OWNER's environment:
+#   tokio            — async runtime for the two WS streams
+#   tokio-tungstenite— pmus + Kalshi orderbook_delta WebSockets
+#   reqwest          — REST (order POST, trades poll)
+#   ed25519-dalek    — pmus signing
+#   rsa + sha2       — Kalshi RSA-PSS signing
+#   serde + serde_json — config files + venue payloads
+[dependencies]
+
+[[bin]]
+name = "cross-arb-bot"
+path = "src/main.rs"
