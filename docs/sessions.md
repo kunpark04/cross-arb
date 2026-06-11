@@ -6,6 +6,38 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, latest+4) — Verify-everything pass: live data path + order paths proven; discovery 429 bug fixed; claims audit
+
+Owner pushed back: a false claim ("sandbox blocks venue I/O") proved I'd asserted unverified things —
+so verify everything, complete the open engine items, and pilot live with minimal capital (no demo
+account). Did exactly that. Commits `fff4923` (data-path fixes) + `ad80588` (claim corrections) + docs.
+
+- **Live data path PROVEN** (the biggest unverified surface — the Rust WS clients had NEVER connected,
+  only sample-tested): ran the bot dry-run vs live prod (read-only key, zero orders). Kalshi WS connected +
+  subscribed 153 tickers, pmus WS 113 slugs, ~300 frames/s, 153+112 books built, discovery 60 wx + 13 econ
+  + 40 sports from live catalogs. **Found + fixed a real bug:** `discovery::fetch_json` dropped the Python
+  `get()`'s retry, so a cold-start burst across ~18 series 429'd and aborted ALL discovery — ported the
+  retry (tries=4, {429,5xx}, 1.5*(i+1)s) + the inter-series 250ms pacing. Added connect-success logs + a
+  20s health heartbeat (a silent 24/7 bot was itself a gap).
+- **Kalshi LIVE order round-trip** ✅ — a 1-contract order placed (`[201]` resting, fill_count 0) +
+  cancelled (`[200]`) on the real account, read-write key, $0 used (chose an empty-book future market so a
+  1¢ bid can't fill). RW key authenticates on prod (balance read 200).
+- **`/teams` smoke** ✅ — statsapi's 30 MLB abbrevs == Kalshi's 30 KXMLBGAME suffixes (identical) → no
+  postponement missed on a mismatch. Closes that README residual.
+- **`SELL_*` pmus intents** — could NOT verify within the 1¢/15¢ cap (a resting SELL must price high to
+  avoid filling = >cap; a naked short isn't bounded by price). The classifier correctly blocked a $0.99
+  probe. Left doc-derived (same enum family as the live-verified BUY_LONG/BUY_SHORT; used only to close).
+- **Claims audit** (`tasks/_agent_bus/20260611-claims-audit/`): swept all 14 src files + README — 4 FALSE
+  + 7 unverified + 6 stale, all doc-level. Corrected: the sandbox claim everywhere; a fabricated "148 ms"
+  serial latency (research says 161); the stale fee-parity "no test until stage-2" (the test passes); the
+  now-verified pmus signing + auth acceptance + ack-parse + cancel endpoints; dead `legs.rs` references.
+
+**Net:** the auth/order/data plumbing is now end-to-end-verified live — a genuine blocker retired — and the
+code/docs no longer assert anything unverified. The binding gate is unchanged: the edge itself (0014
+multi-week data; sports recon ~06-23/25). Plumbing proven; edge unproven.
+
+---
+
 ## 2026-06-11 (UTC, latest+3) — LIVE auth verified on BOTH venues; pmus order endpoint corrected; a secret-leak incident (L25)
 
 Owner directed: stop deferring, verify what can be verified now. Outcome — the sandbox-can't-reach-venues

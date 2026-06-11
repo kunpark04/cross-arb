@@ -111,26 +111,32 @@ the concurrency core, the gates, and the transport — see `tasks/_agent_bus/202
   both legs at book-derived exits before Kalshi voids). **Reduce-only** (fires under the kill-switch; dry-run
   logs only; `CROSSARB_NO_AUTO_UNWIND=1` disables). The live statsapi poll is the owner/droplet step.
 
-**Live auth VERIFIED (2026-06-11) — both venues, against the real endpoints:**
-- **Kalshi signing** ✅ (RSA-PSS demo read `[200]`) + **order path** ✅ (demo `POST /portfolio/orders` →
-  `[400] insufficient_balance`, i.e. signature + the exact `build_kalshi_payload` shape + endpoint all
-  accepted; a full rest+cancel just needs you to fund the demo account in the Kalshi demo UI).
-- **pmus full order lifecycle** ✅ — signing (body-less `{ts}POST{path}`, proven by a bad-vs-good-sig
-  control), **create** `POST /v1/orders` + **cancel** `POST /v1/order/{id}/cancel`, with a 1¢ `BUY_LONG`
-  **and** `BUY_SHORT` each placed + cancelled live. This **corrected a real bug** (`exec.rs` had the wrong
-  pmus endpoint+shape). Remaining: the `SELL_*` unwind intents are doc-derived (not live-placed).
+**VERIFIED LIVE (2026-06-11) — against the real venues, not just sample-tested:**
+- **Data path** ✅ — the bot ran dry-run vs live prod (read-only key, zero orders): Kalshi WS connected +
+  subscribed 153 tickers, pmus WS connected + subscribed 113 slugs, ~300 frames/s, 153+112 books built,
+  discovery pulled 60 weather + 13 econ + 40 sports pairs from live catalogs. (Found + fixed a real bug:
+  `discovery::fetch_json` had no retry, so a cold-start burst 429'd and aborted — ported the Python's
+  retry + inter-series pacing. Added connect-success logging + a 20s health heartbeat.)
+- **Kalshi order path** ✅ — a LIVE 1-contract order placed (`[201]`, status `resting`, `fill_count 0`)
+  + cancelled (`[200]`) on the real account with the read-write key. Signing verified on demo + prod.
+- **pmus order lifecycle** ✅ — signing (body-less `{ts}POST{path}`, proven by a bad-vs-good-sig control),
+  **create** `POST /v1/orders` + **cancel** `POST /v1/order/{id}/cancel`, with 1¢ `BUY_LONG` **and**
+  `BUY_SHORT` placed + cancelled live (corrected a real `exec.rs` endpoint+shape bug).
+- **Postpone `/teams` join** ✅ — statsapi's 30 MLB abbreviations == Kalshi's 30 `KXMLBGAME` suffixes
+  (identical set), so no club's postponement is missed on a mismatch.
 
-**Still remains (owner / deferred):**
-- **Funded demo round-trip** (owner): top up the Kalshi demo balance, then a clean place→rest→cancel.
-- **Sports postponement unwind — live `/teams` smoke** (owner): the trigger is BUILT + parity-verified
-  (detection + tracking + firing); the one residual is a one-time live `statsapi /teams` check — the join
-  matches the Kalshi-ticker team suffix to the `/teams` abbreviation, so a club whose two diverge is a MISSED
-  detection (never a wrong-game fire). Non-MLB leagues have no auto-detection source yet (statsapi is MLB).
-- **Sports settlement recon** (owner): endDates ~06-23/25 — until then `ASSUME_SPORTS_SETTLED` is an owner
-  override, not an empirical clean.
-- **Deferred to next session:** **edge-RATE allocation** (`edge ÷ lock-days`, the 0014-H2 arm) + **maker-side
-  execution mode** (rest the cheap leg on Kalshi + taker-hedge pmus — the maker study's +EV config).
+**Still remains (genuinely blocked, not skipped):**
+- **`SELL_*` pmus intents** — doc-derived (same enum family as the live-verified `BUY_*`); can't be live-probed
+  within a tiny-capital cap (a naked short isn't bounded by a 1¢ price). Exercised naturally on the first real unwind.
+- **Naked-leg auto-recovery** — a one-legged live fill currently fail-closes (halt + log); auto-unwinding the
+  filled leg + leg-fill-timeout/partial handling are still TODO.
+- **Sports settlement recon** — endDates ~06-23/25 (date-gated; can't complete now). Non-MLB leagues have no
+  auto-postpone source yet (statsapi is MLB-only).
+- **The dominant gate — edge validation** — the 0014 confirmatory run needs multi-week data that doesn't
+  exist yet. Plumbing is proven; the edge is not.
+- **Deferred features:** edge-RATE allocation (`edge ÷ lock-days`) + maker-side execution mode.
 
-⚠️ **Do not trade real money on the Rust path until** (a) a demo-sandbox session is clean and (b) the 0014
-confirmatory run validates the edge on multi-week data. The signal/fee parity test is green; the defaults
-above make this the natural order of operations.
+⚠️ **Do not scale real money on the Rust path until the 0014 confirmatory run validates the edge on
+multi-week data** — that, not the plumbing, is the binding gate. The auth/order paths + the live data
+pipeline are now verified end-to-end and the signal/fee parity test is green; what's unproven is the
+*edge*. The safe-by-default defaults make a 1-contract armed pilot the natural next rung after the edge data.
