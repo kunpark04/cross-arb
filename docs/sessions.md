@@ -6,6 +6,95 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC) — Probe program: all 10 ranked next-steps probed in one parallel read-only pass
+
+Owner: "probe these" (the 10-item ranked list from session close). 7 parallel probe agents + 1 coding
+agent; synthesis in [research/probe-program-2026-06-11.md](../research/probe-program-2026-06-11.md);
+per-item notes in `tasks/_agent_bus/20260611-probes/`. Data: fresh pull at 01:00 UTC — ~31k
+post-0013-epoch records (~16 h of detection-time ms + `px` + `depth`).
+
+- **Taker not rejected at measured RTT (#2):** naked-leg 17–23% @100–150 ms (n=575 capturable ≥1¢),
+  survivors keep ~1.9¢ median, breakeven naked-unwind ≈4–6¢ vs ~1–3¢ plausible; ~29% of edges die
+  <250 ms (never raceable). The 55.5%@1s figure was the wrong regime for real latency.
+- **Maker study narrowed to ONE config (#1):** rest-on-**Kalshi** + taker-hedge-pmus = +0.14–0.44¢/
+  attempt (bounded); rest-on-pmus structurally toxic (15–16¢ hedge slip); full maker-maker 32%
+  one-leg-naked. Sampling gap measured (~23.8k Kalshi weather prints/day vs 220 visible crossings) →
+  ladder/trade-logging spec written AND implemented (wave-2); rides the next gated redeploy.
+- **Invariant #1 weather EMPIRICALLY CONFIRMED (#4):** 360/360 settled buckets identical (3-way vs
+  NWS CLI, incl. a real revision day). Found+fixed a CRITICAL parse bug — pmus `outcomes[]`/
+  `outcomePrices[]` are not index-aligned (`marketSides` authoritative; 286/286 validation) —
+  **retracting** the published "pmus interim verified WRONG"/"4-YES day" findings ([L23]); corrections
+  landed in CLAUDE.md + settlement-verification + execution-feasibility briefs.
+- **MLB void window is MINUTES, not 2 days (#7):** Kalshi closed voided markets 47–90 min
+  post-scheduled-start (n=3); 5-min statsapi poll detects postponements 5/5 (with reschedule date);
+  pre-game unwind books 1¢-spread deep; unwind ≈ +12–13¢/contract on trigger. Rule spec written.
+- **No-gap build verified ready (#3):** 18/18 + integration green; droplet sha checked vs HEAD; old
+  build censors ~310 episodes/day (~152/day avoidable, 32/32 reconnects on the 309 s cycle-on-add
+  grid). **Redeploy bundle (no-gap + ladders/trades + fee tripwire) awaits the 0006 greenlight.**
+- Cheap items resolved: direction skip-gate NULL overall, weather leg-sequencing signature (18% vs
+  79% toxic, z=4.6) is hypothesis-grade — pre-register (#5); early-exit = **hold-all** (breakeven
+  needs P(flip)>2% vs 0/14 station-days measured; the diverging leg is always the Kalshi leg) (#6);
+  recycle arm **$0** structural (#8); city-date cluster exposure ≤20%, opt-in knob built (#9);
+  `/series/fee_changes` tripwire implemented — laptop half active now (#10).
+- New scripts: `maker_feasibility`, `early_exit_ev`, `probe_mlb_postpone`, `recycle_arm_experiment`
+  (exploratory, outside the 0014 freeze); extended: `shadow_fill` (sub-second grid, `--post-epoch`),
+  `adverse_selection` (at-open gate), `settle_recon` (3-way weather recon, marketSides fix). Lesson
+  [L23] filed. Re-run calendar in the brief (FOMC recon 06-18; sports recon ~06-23/25; U-3/NFP 07-03).
+- **Owner greenlight (same session): flagged fixes + REDEPLOY + commit/push.** Fixes: (a)
+  `pull-data.ps1` recreate-after-delete data-loss hazard — a late-append-recreated archived day is
+  now kept RAW beside its canonical `.gz`, never re-gzipped/overwritten; (b)
+  `weather_spread_snapshot.py` → marketSides-primary read ([L23]); (c) daily post-pull settle-recon
+  (~12:30 Z scheduled pull = inside the previously-unobserved 0–13.5 h pmus-finality window;
+  `ALERT.txt` on DIVERGE, `CA_NO_RECON=1` skips). Gate re-run post-fixes: **19/19**.
+  **Redeployed 02:55 UTC** via `deploy.sh` (0006 owner-greenlit): build **`f8f261298097`**
+  sha-byte-verified on the droplet, session_start self-identified (60 wx / 216 sports / 13 econ,
+  289 pmus / 505 Kalshi), NRestarts=0, zero journal errors; **new streams verified live within one
+  300 s cycle** — `trades-*.jsonl` (real prints w/ venue `vt` + taker side), `ladders-*.jsonl`
+  (`hb` top-5 snapshots both venues), `fee_changes: 0` beacon. Rollback ref: prior HEAD
+  `bfa9e2fccf15`. Work committed in 4 focused units + pushed to `origin/main`.
+
+## 2026-06-10 (UTC, evening) — 0013 open items closed (multi-sub probe → no-gap adds; fee re-pin) + allocation rule PRE-REGISTERED; pipeline verified end-to-end
+
+Owner: "complete the tasks that are doable now, then verify end-to-end pipeline." All three doable-now
+items closed + the full measurement chain verified on freshly pulled post-0013 data.
+
+- **Kalshi multi-subscription semantics PROBED + the cycle-on-add replaced** ([todo](../tasks/todo.md)):
+  `probe_kalshi_ws.py --multisub` (read-only, live) answered all three unknowns decisively — ONE sid per
+  channel per connection (a 2nd `subscribe` MERGES into it; the feared second-seq-counter doesn't exist),
+  control acks themselves consume seq slots (seq stayed contiguous 1..16 across add/overlap-add/delete),
+  `update_subscription add_markets` snapshots only the added tickers. So `monitor.py` now adds tickers
+  **in-place (no-gap)** with a snapshot-confirm (`ADD_CONFIRM_SECS`) → cycle fallback, and
+  `delete_markets`-unsubscribes pruned tickers; genuine seq gaps still cycle. New offline integration
+  test `scripts/test_monitor_nogap.py` (localhost fake-Kalshi WS drives the real `run_live`; happy path +
+  fallback both asserted) added to `selftest_all` → **18/18 green**. Motivation quantified from today's
+  droplet data: 4 cycle-on-add reconnects in ~1 h, each a censored ~650-ticker rebuild. *Droplet still
+  runs the old build — picks this up at the next gated redeploy (0006).*
+- **Fee schedules re-pinned from primary sources** ([research/fee-pin-2026-06-10.md](../research/fee-pin-2026-06-10.md)):
+  all 4 coefficients CONFIRMED (Kalshi taker verbatim via the CFTC-filed schedule — kalshi.com still
+  429s; pmus via docs.polymarket.us/fees + live `feeCoefficient=0.05`). Real finding: **Kalshi maker
+  fees are series-gated — 12/23 tracked series (all 5 weather, esports, ITF, UFC) charge makers $0**,
+  and pmus REBATES makers −0.0125 → a weather maker-maker round-trip is fee-*negative* (~−0.3¢) vs
+  ≈3.5¢ taker-taker, strengthening the queued maker study. `fee_multiplier=1` everywhere;
+  `/series/fee_changes` (live tripwire) empty. `kfee(taker=False)` documented as series-blind
+  (selftest-only today). ledger/audit docs updated.
+- **Allocation rule PRE-REGISTERED before the data exists** ([0014](../decisions/0014-preregistered-allocation-rule.md),
+  [prereg](../research/allocation-prereg-2026-06-10.md)): H1 = 0012-tested reservation semantics +
+  τ=2¢ + category caps 20/10/5%; H2 = edge-rate ordering with lock-day priors frozen in-text. An
+  independent **stats-methodology audit ran pre-freeze**
+  ([report](../tasks/_agent_bus/20260610-prereg/stats-ml-logic-reviewer.md)): 3 CRITICAL / 7 WARN /
+  5 INFO, all incorporated — headline fixes: fold-level inference (the draft's per-position bootstrap
+  was ill-posed for a policy delta), arrival-date one-market-one-fold folds + a market-level ≤33%
+  share gate (closed a single-persistent-market false-pass path), pinned H1 semantics + a code-freeze
+  clause (unimplemented machinery = a tuning channel), trigger moved 14→**21 event-days (K≥7;
+  K=4 was arithmetically incapable of a 95% distribution-free confirmation)**.
+- **End-to-end pipeline VERIFIED**: `selftest_all` 18/18 → `pull-data.ps1` (sha256 mirror; today's
+  live file hit the by-design TOCTOU append-race twice, finalized days gzipped+moved) → post-0013
+  schema confirmed on pulled records (ms detection-time stamps, per-venue `px`, depth ladders,
+  remapped econ twins live, `ws_reconnect` markers) → `analyze_persistence` + `capital_sim` clean
+  over the 1.59 d mirror with the 0013 quarantine firing (36 pre-remap econ records), the −1.25 s
+  lag-correction applying to pre-fix CLOSEs only, and 193 restart-censored episodes excluded.
+  Droplet healthy (sessions.jsonl + transitions fresh to the minute).
+
 ## 2026-06-10 (UTC, later) — Full adversarial review #3 → ALL findings fixed; econ pairing + measurement integrity corrected
 
 Owner asked for a full no-shortcuts review, then "fix everything + clean the docs + full test."

@@ -74,13 +74,19 @@ crossed-book rejection).
    `colisted_map.py` boundary-equality guard (`pm_bounds`/`kbounds`) now **enforces** this on every pair.
 3. **Bucket count/boundary drift** — the guard above refuses (and loudly flags) any future pair whose
    `(floor,cap)` numbers differ, so a venue changing its ladder can no longer silently mispair.
-4. **EMPIRICAL reconciliation — still open; pmus finalization lag discovered (2026-06-09,
-   `scripts/settle_recon.py`, [execution-feasibility brief](execution-feasibility-2026-06-09.md)).** Settlement
-   identity is rules-text-verified but **not yet empirically confirmed** by comparing both venues' actual graded
-   outcomes — because **pmus flips `closed:true` immediately but keeps a `endDate` ~2 weeks in the future and
-   serves an INTERIM `outcomePrices` that can be WRONG** (a verified ATP case had pmus's interim winner wrong,
-   Kalshi correct; a MIA weather day returned "Yes" for 4 disjoint buckets). So the public pmus settled value is
-   **unreliable until finalization** — re-run the recon after markets pass `endDate`.
+4. **EMPIRICAL reconciliation — CLOSED for weather (2026-06-11, `scripts/settle_recon.py`,
+   [probe-program brief](probe-program-2026-06-11.md) §4): 360/360 settled co-listed buckets (60 city-days,
+   2026-05-29→06-09, all 5 cities) graded IDENTICALLY on both venues**, three-way anchored to the independent
+   NWS CLI (incl. the one real revision day in window — MDW 06-09 87→88 overnight, both venues settled to 88).
+   The 2026-06-09 claims that previously lived here — *"pmus interim `outcomePrices` can be WRONG (verified ATP
+   case); a MIA weather day returned Yes for 4 disjoint buckets"* — are **RETRACTED as our own parse bug**
+   ([L23](../tasks/lessons.md)): pmus `outcomes[]` and `outcomePrices[]` are **not index-aligned** — prices
+   follow `marketSides` order, and the self-labeling `marketSides` (label + settled price per side) is the
+   authoritative read (validated 286/286 raw settled objects vs Kalshi; the impossible multi-YES days vanish,
+   and sports interim reads become 56/56 == Kalshi). What **survives** of the old caution: pmus sports
+   `endDate` ≈ D+14 (treat pre-`endDate` sports reads as interim by policy), pmus exposes **no settlement
+   timestamp** (weather finality bracketed at ≤T+13.5 h post-Kalshi-settlement; 0–13.5 h unobserved), and the
+   recon re-runs post-`endDate` for sports (~06-23/25) and post-release for econ (FOMC 06-17; U-3/NFP 07-02).
 
 Re-run any time: `python scripts/verify_settlement.py [--city lax]` (weather) ·
 `python scripts/verify_sports_settlement.py [--league mlb]` (sports — see the sibling brief).

@@ -303,3 +303,26 @@ duration-derived metric, trace the timestamp's origin end-to-end (who calls `tim
 floor: if a pipeline stage holds events for X seconds, no logged interval below X is real, and any analysis
 claiming resolution finer than X is measuring the pipeline, not the market. When retro-correcting, subtract the
 lag at the shared loader (one place), clamped so corrected times can't cross other events.
+
+## L23 — Sibling arrays in one API object are NOT index-aligned by default; validate a pairing convention on cases where the conventions DIVERGE
+
+**Pattern:** pmus market objects carry the settled winner in two encodings: flat sibling arrays
+(`outcomes[]`, `outcomePrices[]`) and self-labeling `marketSides[]` (each side carries its own label +
+settled price). We documented "pair `outcomes[i]` with `outcomePrices[i]`" — wrong: `outcomePrices`
+follows **`marketSides` order**, while `outcomes`' order is cosmetic display noise. The bug manufactured
+22 phantom weather "divergences", 44/70 internally-impossible multi-YES days, and two *published*
+findings — "pmus interim settled data verified WRONG (ATP case)" and "MIA 4-YES day" — i.e., a
+venue-trust conclusion created entirely by our own parser. It survived the 2026-06-09 spot-checks
+because Yes-first objects agree under **both** conventions (the checks only sampled coinciding cases —
+the L17 failure shape again). It was caught when the recon's multi-YES tripwire fired on 44/70 days: an
+*impossible* market outcome indicts the parse, not the market (L3). Corrected read validated 286/286 raw
+settled objects vs Kalshi; weather recon flipped from "22 divergences" to **360/360 identical**.
+
+**Rule:** when one response encodes the same fact twice, prefer the **self-labeling** encoding (the label
+travels *with* the value) over positional sibling arrays — and never assume two flat arrays are
+index-aligned without a primary-doc statement or a divergence test. Validate any pairing convention on
+cases where the candidate conventions **disagree** (here: `["No","Yes"]`-ordered objects); agreement on
+coinciding cases is zero evidence (L17). Build **impossibility tripwires** (e.g. exactly-one-YES per
+exclusive bucket set) into every reconciliation reader — they convert parse bugs into loud errors before
+they become "findings". And retraction discipline: when a published finding dies, retract it at every
+place it was stated (briefs, CLAUDE.md, README indexes), not just where it was born.

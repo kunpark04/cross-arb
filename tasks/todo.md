@@ -116,16 +116,28 @@ backtest pipeline re-run on the corrected pipeline.**
       ms precision, CLI dedup-seeding worked, clean shutdown. (A logged 13¢ U-3 dir-P record was inspected:
       a REAL wide-book dislocation — pmus 0.47/0.69 vs Kalshi 0.84/0.87 on the now-identical ≥4.2 bucket —
       with flat-ladder + age instrumentation attached for fillability analysis; not a settlement phantom.)
-- [ ] **Probe Kalshi multi-subscription semantics** (extend `probe_kalshi_ws.py`: 2nd subscribe on the same
-      channel; `update_subscription` add_markets; seq behavior with 2 sids) → would replace cycle-on-add
-      with a no-gap add.
-- [ ] **Re-pin both venues' fee schedules from primary sources** (Kalshi fee PDF 429'd, pmus fees page is
-      JS-only this session); coefficients currently pinned to the venue audits ([kalshi-venue-audit](../research/kalshi-venue-audit.md) §2.1,
-      [us-legal-overlap-audit](../research/us-legal-overlap-audit.md)). Also check per-series `fee_multiplier`.
+- [x] **Multi-subscription probe RUN + no-gap add SHIPPED (2026-06-10):** `probe_kalshi_ws.py --multisub`
+      live-verified the semantics (ONE sid per channel — a 2nd subscribe MERGES, no 2nd seq counter; control
+      acks consume seq slots so SeqTracker stays contiguous across add/delete; add snapshots only the new
+      tickers). Monitor now adds in-place (`update_subscription add_markets` + snapshot-confirm w/
+      `ADD_CONFIRM_SECS` cycle fallback) and `delete_markets`-unsubscribes pruned tickers; seq gaps still
+      cycle. Offline integration test `scripts/test_monitor_nogap.py` (in `selftest_all`, 18/18 green).
+      Kills the censored ~650-ticker rebuild the old cycle-on-add caused (4 such cycles seen in 1 h of
+      2026-06-10 droplet data). *Shipped to the droplet in the 2026-06-11 redeploy (build `f8f261298097`).*
+- [x] **Fee schedules RE-PINNED from primary sources (2026-06-10, [research/fee-pin-2026-06-10.md](../research/fee-pin-2026-06-10.md)):**
+      all 4 coefficients CONFIRMED (Kalshi taker verbatim via the CFTC-filed schedule — kalshi.com PDF still
+      429s; pmus via docs.polymarket.us/fees eff. 2026-04-03 + live `feeCoefficient=0.05`). Real finding:
+      **Kalshi maker fees exist only on `quadratic_with_maker_fees` series — 12/23 tracked (all 5 weather,
+      esports, ITF, UFC) charge makers $0**, and pmus REBATES makers −0.0125 → a weather maker-maker
+      round-trip is fee-negative (~−0.3¢) vs ~3.5¢ taker-taker. `fee_multiplier=1` all 23 series;
+      `/series/fee_changes` (live tripwire) empty. `kfee(taker=False)` documented as series-blind
+      (selftest-only today; the maker study models `fee_type`).
 - [ ] **Now: let it run ≥ weeks + re-pull**, then re-run on the new-schema data: `shadow_fill`
       (sub-second leg-fill at ~150ms — measurable only on post-0013 data), `adverse_selection` (toxic-close
       share from `px`), `settle_recon` (after pmus markets pass `endDate`), `analyze_persistence`/`capital_sim`
       (multi-day edge), and a first **ECON** persistence/depth read on the 14 identical pairs.
+      *(Weather settle-recon CLOSED 2026-06-11 — 360/360 identical; sports recon unlocks ~06-23/25
+      post-`endDate`; econ recon 06-18 (FOMC) + 07-03 (U-3/NFP) — [probe brief](../research/probe-program-2026-06-11.md).)*
 - [ ] **Still needs the trade layer or in-season data:** (a) the **bot unwind rule** (close MLB before Kalshi's
       2-day window; reads `void_clean`); (b) latency-haircut from a real order-ack study + leg-fill EV (0010 items
       2/3); (c) `p_gap`/`loss_frac` refinement; (d) NBA/NHL settlement read in season; (e) CLI-revision rate.
@@ -135,15 +147,14 @@ backtest pipeline re-run on the corrected pipeline.**
 Owner-reviewed suggestions from the post-0013 policy read (OOS tables in the corrected pipeline).
 Ordered by expected value; none are decisions yet — each is an experiment or spec item.
 
-- [ ] **Pre-register the clip rule BEFORE the multi-week data arrives** (so the next test is
-      confirmatory, not another tuning pass): hard 2¢ *booked*-edge floor (≈3.5¢ touch; also the
-      friction buffer) + per-pair cap ~10–20% **differentiated by category tail** — weather ~20%
-      (identity verified + 1.2d capital + exit window), sports ~10% until the MLB unwind rule exists
-      (a void at 20% clip = −10–20% of bankroll), econ smallest (clean but capital-dead). Validation
-      plan: K-fold over disjoint multi-day windows, per-position bootstrap CIs, friction inside the
-      OOS arm. Rationale: only the *shape* (floor=return, cap=risk, FIFO/batch1s dead — batch1s now
-      ties FIFO exactly) is supported on 0.86 d; the 20%-flat row's marginal PnL is just more notional
-      in the same ~10 arbs, scaling exactly the tails the paper PnL excludes.
+- [x] **Pre-registered (2026-06-10, [0014](../decisions/0014-preregistered-allocation-rule.md),
+      [research/allocation-prereg-2026-06-10.md](../research/allocation-prereg-2026-06-10.md)):** H1 = τ=2¢
+      booked floor + category caps weather 20% / sports 10% / econ 5%, $500 (+$2k robustness), frozen
+      economics; H2 = edge-RATE ordering (lock-days frozen upstream); post-epoch data only, run at ≥14
+      event-days (≥30 candidates or descriptive-only), disjoint 3-day folds, four-cell lever decomposition,
+      per-position bootstrap, friction arm, fixed pass/fail gates. Stats-methodology audit run pre-freeze
+      (findings incorporated; report under `tasks/_agent_bus/`). The 0012 cap sweep is superseded — no
+      swept row may be quoted as the result.
 - [ ] **Edge-RATE ranking (the one real policy upgrade):** reservation on
       `booked_edge / expected_lock_days` instead of edge-level — capital velocity is the binding
       constraint and a flat τ gets categories backwards (13¢ U-3 locking ~22 d = **0.6¢/$-day** vs a
@@ -153,23 +164,84 @@ Ordered by expected value; none are decisions yet — each is an experiment or s
 - [ ] **Maker-side execution study (attacks the gating risk + the fee wall at once):** rest the cheap
       leg as MAKER on the wide/sleepy venue (pmus weather quotes 20¢+ spreads), take the Kalshi side
       only AFTER the maker fill (conditional hedge at the measured ~86–261 ms). Fee asymmetry pays for
-      it: taker round-trip ≈3.5¢ vs maker ≈0.9¢ → widens the +EV universe below the 2¢ taker floor
-      AND shrinks the 55%-naked-@1s tail. Largely simulatable READ-ONLY from book data (quote-presence
-      sim) before any capital.
+      it — **stronger post fee re-pin ([fee-pin brief](../research/fee-pin-2026-06-10.md)): Kalshi weather/
+      esports/ITF/UFC charge makers $0 and pmus REBATES −0.0125, so a weather maker-maker round-trip is
+      fee-negative (~−0.3¢) vs ≈3.5¢ taker-taker** → widens the +EV universe below the 2¢ taker floor
+      AND shrinks the 55%-naked-@1s tail. Must model per-series `fee_type` (kfee is series-blind). Largely
+      simulatable READ-ONLY from book data (quote-presence sim) before any capital.
+      **PROBED 2026-06-11 ([brief](../research/probe-program-2026-06-11.md) §1, `maker_feasibility.py`): the
+      rest-on-pmus premise INVERTS — the sticky wide pmus quote fills only on bucket-death moves Kalshi already
+      repriced (15–16¢ hedge slip, −EV); the one plausibly +EV config is rest-on-KALSHI + taker-hedge-on-pmus
+      (+0.14–0.44¢/attempt, bounded). Trade-print + ladder logging BUILT → becomes a measurement after the
+      next gated redeploy.**
 - [ ] **Fill-contingency rule in the policy spec:** if leg B unfilled within X ms of leg A → exit leg A
       at market immediately (known small insurance premium vs unbounded naked coin-flip); price it into
       the all-in edge filter as 0010's leg-fill EV term. Extend `shadow_fill` to simulate it from `px`.
+      *(Probe #2 priced the inputs 2026-06-11: breakeven naked-unwind ≈4–6¢ @150–261 ms vs ~1–3¢ plausible
+      actual cost; survivors keep ~1.9¢ median — the insurance premium looks affordable.)*
 - [ ] **Adverse-selection gate on direction** (needs accumulated `px`): prefer arbs whose DEAR side
       moved away (benign line-lag) over ones whose CHEAP side led (informed quote — the U-3-style wide
       sleepy book where the tighter venue is righter). Use `adverse_selection.py` toxic-close share.
-- [ ] **Correlated-exposure cap per event cluster** (city-date / game), alongside the per-pair cap — a
+      **PROBED 2026-06-11 (§5): NULL as a skip gate (z=−0.68 overall, n=217/217); weather-only
+      leg-SEQUENCING signature (cheap-made 18% vs dear-made 79% toxic, z=4.6, small cells) —
+      pre-register, then confirm at ~1 wk of post-0013 data (cells n≈150–250).**
+- [x] **Correlated-exposure cap per event cluster** (city-date / game), alongside the per-pair cap — a
       single CLI-revision day hits every same-city weather pair at once; per-pair caps don't bound it.
-- [ ] **Recycle-time re-evaluation in the sims:** when settlement frees capital, re-score all still-open
+      **MEASURED + knob built 2026-06-11 (§9, exploratory): max same-(city,date) share 20% today (one pair
+      at its own category cap); 20/30% caps bind 0 fills; 10% costs −13.6% PnL → pure risk-control. Opt-in
+      `--cluster-cap` lives in `recycle_arm_experiment.py`; size it when `cli_revisions.py` has weeks of data.**
+- [x] **Recycle-time re-evaluation in the sims:** when settlement frees capital, re-score all still-open
       arbs (arrival-or-never skips them today); the live monitor gives this for free — the backtest
       should model what the bot will actually do.
+      **MEASURED $0.00 2026-06-11 (§8, exploratory): structurally starved — skipped arbs die ~1 s median
+      (0% survive ≥1 h) vs hours-to-days skip→settle gaps, and capital never binds under H1. Deprioritized;
+      one-command recheck on the multi-week pull.**
 - [ ] **Weather-first scaling note:** the only category with {identity ✓, fast capital ✓, exit ✓};
       constraint is crossable depth (~157 contracts) → growth = breadth (cities × buckets × days) +
       layering on WIDEN, never bigger clips in one corner ([L16]).
+
+### Probe program — 2026-06-11 UTC (owner directive: "probe these", all read-only) — **DONE, all 10**
+
+Synthesis: [research/probe-program-2026-06-11.md](../research/probe-program-2026-06-11.md); per-item
+notes in `tasks/_agent_bus/20260611-probes/`. Data basis: fresh pull, ~31k post-0013-epoch records
+(~16 h, t ≥ 1781082189) + live API reads. Selftest gate after all changes: **19/19 green**.
+
+- [x] #1 maker-side weather: **config INVERTS** — rest-on-Kalshi + taker-hedge-pmus is the only plausibly
+      +EV mode (+0.14–0.44¢/attempt bounded); rest-on-pmus toxic (15–16¢ slip). Ladder/trade logging
+      spec'd + BUILT (`maker_feasibility.py`, [spec](_agent_bus/20260611-probes/ladder-logging-spec.md))
+- [x] #2 sub-second leg-fill: naked 17–23% @100–150 ms (n=575) — **taker NOT rejected at measured RTT**;
+      ~29% die <250 ms (never raceable); re-read at ~1 wk + first econ release
+- [x] #3 no-gap build: 18/18 + integration green, droplet sha verified vs HEAD; old build censors ~310
+      episodes/day (~152/day avoidable) — **REDEPLOYED 2026-06-11 02:55 UTC (owner-greenlit, 0006)**:
+      droplet on build `f8f261298097` (sha byte-verified = local), session_start self-identified,
+      60 weather + 216 sports + 13 econ tracking, NRestarts=0; rollback ref = HEAD `bfa9e2fccf15`
+- [x] #4 settlement recon weather: **CONFIRMED 360/360** (3-way vs NWS CLI, incl. a real revision day);
+      pmus sibling-array parse bug found+fixed → "interim verified WRONG" RETRACTED ([L23]); sports recon
+      ~06-23/25, econ 06-18 + 07-03
+- [x] #5 direction gate: skip-filter NULL overall; weather leg-sequencing signature (18% vs 79% toxic,
+      z=4.6) → pre-register, confirm at ~1 wk
+- [x] #6 early-exit: **HOLD-ALL** (exit-all ≈ −1.5¢/pair; boundary maker-exit breakeven P(flip)=2% vs
+      0/14 station-days measured); revisit only if `cli_revisions.py` shows P>2% (`early_exit_ev.py`)
+- [x] #7 MLB: window is **MINUTES** (Kalshi closed voided mkts 47–90 min post-start, n=3); 5-min statsapi
+      poll detects 5/5; unwind +12–13¢/contract on trigger; rule spec written (trade-layer item)
+- [x] #8 recycle arm: **$0.00 every cell** (structurally starved) — deprioritized; one-command recheck on
+      the multi-week pull (`recycle_arm_experiment.py`, exploratory)
+- [x] #9 cluster cap: max same-(city,date) exposure 20% today; 20/30% caps bind nothing, 10% costs −13.6%
+      → opt-in risk knob only (same script, exploratory)
+- [x] #10 fee tripwire: **BUILT** — `healthcheck.ps1` poll+alert active now (laptop); monitor-heartbeat
+      half (`fee_changes.jsonl` + beacon field) rides the next gated redeploy
+- [x] **Wave-2 redeploy bundle implemented + tested (19/19):** weather trade prints (Kalshi REST
+      cursor-poll → `trades-<date>.jsonl`), top-5 ladders (`ladders-<date>.jsonl`, detection-time `tr` +
+      delta-suppressed 300 s `hb`), fee tripwire, `pull-data.ps1` finalize/delete extended to the new
+      prefixes; new offline test `test_monitor_trades_ladders.py`; transitions schema untouched
+      (asserted). ≤ +9.5 MB/day raw (~+1.1 gzipped). **Shipped in the 2026-06-11 redeploy.**
+- [x] **Flagged-item fixes (2026-06-11, owner-directed):** (a) `pull-data.ps1` recreate-after-delete
+      hazard FIXED — a late-append-recreated archived day is kept RAW beside its canonical `.gz`
+      (never re-gzipped/overwritten; loaders read both, per-date dedup covers overlap); (b)
+      `weather_spread_snapshot.py` pmus read fixed to marketSides-primary ([L23]); (c) daily
+      settle-recon step added to `pull-data.ps1` (runs at the ~12:30Z scheduled pull = inside the
+      previously-unobserved 0–13.5 h pmus-finality window; ALERT.txt on DIVERGE; `CA_NO_RECON=1`
+      to skip). Selftest gate re-run post-fixes: 19/19.
 
 ## Done (discovery → matcher → scanner → monitor)
 - [x] **1–5. Sports matcher** — Kalshi game structure discovered; robust `(league, date, abbrev)` join

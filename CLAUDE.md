@@ -19,7 +19,7 @@ user ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)), collectin
 persistence dataset pulled daily to `Kalshi/data/cross-arb/` ([0009](decisions/0009-event-date-partition-copy-keep-pull.md)).
 See [deploy/README.md](deploy/README.md).
 
-## Core findings (as of 2026-06-09)
+## Core findings (as of 2026-06-11)
 
 - **Econ (CPI/FOMC/GDP/NFP/U-3) IS live and US-legal on polymarket.us** — 36 live macro markets, each settling
   on the *same* government print Kalshi uses (BLS/BEA/Fed); per [research/us-legal-overlap-audit.md](research/us-legal-overlap-audit.md)
@@ -55,8 +55,13 @@ See [deploy/README.md](deploy/README.md).
   rain-postponed game replayed in that **2-day–2-week gap settles to the real winner on pmus but a fair-price
   void on Kalshi** → the YES/NO legs stop offsetting → **both-legs loss** (and even a symmetric void doesn't
   net: Kalshi *"fair price"* ≠ pmus *"last-traded"*). Esports/WNBA non-completion: pmus → last-price, Kalshi
-  silent. **Mitigation TODO**: don't hold an MLB pair through a postponement (unwind before the 2-day window);
-  model the void EV term (0010). See [research/sports-settlement-verification.md](research/sports-settlement-verification.md).
+  silent. **Mitigation PROBED (2026-06-11): the actionable window is MINUTES, not 2 days** — Kalshi *closed*
+  voided markets **47–90 min after scheduled start** (n=3 live cases), so the rule is "unwind on
+  postponement-detection": a 5-min MLB-statsapi poll surfaces `Postponed` + reschedule date immediately (5/5 in
+  a 30-day scan; 1.2%/game matches 0010's prior), pre-game unwind books are 1¢-spread deep, and unwind ≈
+  **+12–13¢/contract vs holding** through the void EV — rule spec in
+  [research/probe-program-2026-06-11.md](research/probe-program-2026-06-11.md) §7; void EV term modeled (0010).
+  See [research/sports-settlement-verification.md](research/sports-settlement-verification.md).
 - **Edge-location and scale-capacity are DIFFERENT axes.** *Edge* (the gap) lives in **inefficient corners**
   (thin, intermittent — line lag, settlement quirks); *capacity* (deployable size before you walk the book
   past the edge) lives in **depth**, and the efficient deep books (tennis/UFC/ITF) are ~$0 cross-venue
@@ -85,21 +90,39 @@ See [deploy/README.md](deploy/README.md).
   API outage can't masquerade as mass settlement); **single-subscription Kalshi invariant** (seq gap / new
   tickers cycle the connection — a second subscribe's semantics were never probed); doubleheader/duplicate-ticker
   binding guards; maker-fee rounding per the venue audit; `scan_all` now imports the bot's matchers + marginal
-  fees (its private copies had drifted, incl. an L15 violation). Open items in [tasks/todo.md](tasks/todo.md).
+  fees (its private copies had drifted, incl. an L15 violation). **Follow-ups closed 2026-06-10 (same day):**
+  (a) multi-subscription semantics PROBE-VERIFIED (`probe_kalshi_ws.py --multisub`: one sid/channel, control
+  acks consume seq slots, add/delete are no-gap) → the invariant is **retired**: the monitor now does in-place
+  `update_subscription` adds with snapshot-confirm + cycle fallback and delete-on-prune (offline integration
+  test `scripts/test_monitor_nogap.py`; ends the censored ~650-ticker rebuild every cycle-on-add caused);
+  (b) **fees re-pinned from primary sources** ([research/fee-pin-2026-06-10.md](research/fee-pin-2026-06-10.md)):
+  all 4 coefficients confirmed; real finding — Kalshi **maker fees don't exist on 12/23 tracked series (all
+  weather)** + pmus rebates makers −0.0125, so a weather maker-maker round-trip is fee-*negative* (strengthens
+  the queued maker study); (c) the **allocation rule is PRE-REGISTERED** ([0014](decisions/0014-preregistered-allocation-rule.md),
+  [research/allocation-prereg-2026-06-10.md](research/allocation-prereg-2026-06-10.md)): τ=2¢ + category caps
+  20/10/5% frozen with a confirmatory protocol BEFORE the multi-week data exists ([L19] discipline).
+  Open items in [tasks/todo.md](tasks/todo.md).
 - **Execution feasibility — read-only tests run (2026-06-09, [research/execution-feasibility-2026-06-09.md](research/execution-feasibility-2026-06-09.md)).**
   **Latency MEASURED** (~86–261 ms RTT, network-bound → compute language is noise; Rust deferred — see
   [research/latency-playbook.md](research/latency-playbook.md)). **Leg-fill is the gating risk**: shadow-fill shows
   hit-rate collapses with latency — **corrected per [0013](decisions/0013-econ-grid-step-twin-and-measurement-integrity.md): 55.5% naked at 1 s, 62.7% at 2 s, and ~27% of
   capturable ≥1¢ edges die ~instantly** (the published 39%/67% carried the debouncer's flush-stamp lag).
-  The sub-second regime where real fills live needs post-0013 ms data: the old build couldn't log a clean
-  duration under ~1 s *by construction* (CLOSEs now stamp detection time; `px` enables adverse-selection). **Settlement identity empirically
-  OPEN**: `settle_recon.py` found pmus `closed`≠finalized (~2-week lag, unreliable interim outcomes — one verified
-  wrong), so invariant #1 stays rules-verified-only until pmus finalizes. **None of this needs capital — it needs
-  the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*, not yet a go.
+  **First post-0013 sub-second read (16 h, 2026-06-11, [probe brief](research/probe-program-2026-06-11.md) §2):
+  naked-leg 17.0% @100 ms / 23.3% @150 ms / 29.4% @250 ms** (n=575 capturable ≥1¢ episodes) — at the measured
+  RTT, naked taker execution is **not rejected** (breakeven naked-unwind ≈4–6¢ vs ~1–3¢ plausible cost); ~29%
+  of edges die <250 ms (never raceable, simply forgone). Preliminary: one sports-heavy day. **Settlement
+  identity empirically CONFIRMED for weather (2026-06-11): 360/360 settled co-listed buckets graded identically**
+  (three-way vs the independent NWS CLI, incl. one real revision day; 0 divergence). The prior "pmus interim
+  outcomes unreliable — one verified wrong" claim is **retracted: it was our own parse bug** — pmus `outcomes[]`/
+  `outcomePrices[]` are **not index-aligned**; `marketSides` is the authoritative winner encoding ([L23]; under
+  the fix, sports interim reads are 56/56 == Kalshi, though pre-`endDate` sports reads stay interim-by-policy).
+  Sports/econ finalized recon pending (sports endDates ~06-23/25; FOMC 06-17; U-3/NFP 07-02). **None of this
+  needs capital — it needs the next gated deploy + weeks of data.** Reinforces: this is a *measurement rig*,
+  not yet a go.
 - **Capital velocity — MEASURED (2026-06-09, `scripts/exit_liquidity.py` + `capital_velocity.py`).** Velocity,
   not edge, separates the categories. pmus **freezes the order book at resolution** (10/10 resolved markets had
   empty books at `closed=true`) → **no early-exit** → capital locked to the far-future `endDate` (~15d). Weather
-  is the OPPOSITE: it closes **late** (`endDate` ~2 AM ET, after the ~6 PM high-lock), so it HAS an ~8h evening
+  is the OPPOSITE: it closes **late** (`endDate` 1 AM local — corrected 2026-06-11, was "~2 AM ET" — after the ~6 PM high-lock), so it HAS an ~8h evening
   exit window — measured: the winning bucket bids ~0.98-0.99 with thousands of contracts of depth. So **weather
   is doubly capital-efficient** (fast ~1.2d natural settlement + a liquid early-exit), while **sports (~15d, book
   frozen) and econ (weeks-mo, outcome known only at the far release) are capital-locked** — the sports early-exit
@@ -118,6 +141,26 @@ See [deploy/README.md](deploy/README.md).
   ([L19]); a **book-init phantom** (37.7¢ ITF-tennis, `censored=restart`) was 75% of the old in-sample headline
   until `capturable()` dropped restart-censored ([L20]), and the **econ off-by-one phantom** (12.2¢ "U-3 edge" =
   market-priced P(print==T), [L21]) sat in the OOS tables until 0013 quarantined pre-remap econ records.
+- **Probe program — all 10 ranked next-steps probed in one read-only pass (2026-06-11,
+  [research/probe-program-2026-06-11.md](research/probe-program-2026-06-11.md);** first ~16 h of post-0013
+  data + live API reads; per-item notes in `tasks/_agent_bus/20260611-probes/`). Beyond the leg-fill,
+  settlement-recon and MLB headlines folded into the bullets above: **(a) the maker study narrows to ONE
+  config** — rest on **Kalshi** (weather, $0 maker fee) + taker-hedge on pmus, bounded **+0.14–0.44¢/attempt**;
+  rest-on-pmus is structurally toxic (15–16¢ hedge slippage) and full maker-maker carries 32% one-leg-naked —
+  weather **trade-print + ladder logging is built** (spec'd from a measured 2-orders-of-magnitude sampling gap:
+  ~23.8k Kalshi weather prints/day vs 220 visible crossings) and rides the next redeploy to convert bounds into
+  measurements; **(b)** the adverse-selection **skip filter is null** overall, but a weather-only
+  **leg-sequencing** signature (cheap-side-made opens 18% toxic vs dear-side-made 79%, z=4.6, small cells) is
+  hypothesis-grade — pre-register before believing; **(c) early-exit = hold-all** (exit-all ≈ −1.5¢/pair;
+  boundary-day maker-exit breakeven needs P(flip)>2%, measured 0/14 station-days — and the diverging leg is
+  always the Kalshi leg); **(d) recycle-time reconsideration = measured $0** (structurally starved — skipped
+  arbs die in ~1 s median; deprioritized); city-date cluster exposure ≤20% today (opt-in knob built,
+  exploratory); `/series/fee_changes` tripwire implemented (laptop half active now, droplet half rides the
+  redeploy). **No-gap build verified ready** (18/18 + integration green; the old build censors ~310
+  episodes/day, ~152/day avoidable) — **REDEPLOYED 2026-06-11 02:55 UTC (owner-greenlit per 0006)**:
+  droplet on build `f8f261298097` (sha byte-verified), no-gap adds + trade/ladder logging + fee tripwire
+  all live; flagged fixes landed same session (pull-data late-append overwrite hazard,
+  `weather_spread_snapshot` marketSides read, daily ~12:30Z settle-recon step in the pull).
 
 ## Managerial docs index
 
@@ -133,7 +176,7 @@ doc without linking it here leaves the index incomplete.
 | [docs/sessions.md](docs/sessions.md) | Session log / process changelog |
 | [decisions/README.md](decisions/README.md) | Decision-log convention + index of entries |
 | [decisions/template.md](decisions/template.md) | Skeleton for a new decision entry |
-| [research/README.md](research/README.md) | Index of the 12 research briefs + the latency playbook (the evidence base) |
+| [research/README.md](research/README.md) | Index of the research briefs + the latency playbook (the evidence base) |
 | [scripts/README.md](scripts/README.md) | Index of probe/scan scripts + `_data/` outputs |
 | [bot/README.md](bot/README.md) | Accounting core (`ledger.py`) + the dual-stream monitor (`monitor.py`, `kalshi_book.py`, `colisted_map.py`) |
 | [docs/architecture.md](docs/architecture.md) | Data-flow diagram (venues → discovery → monitor → transitions → analysis/bot); marks where the clip / position-size lever sits |

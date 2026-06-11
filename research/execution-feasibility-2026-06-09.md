@@ -59,8 +59,23 @@ important number — your real leg-fill rate at ~150 ms — is still unmeasured.
 > ~27% of capturable ≥1¢ episodes die essentially **instantly** (their entire pre-correction "duration"
 > was the flush lag). The L=0.25/0.5 rows still equal L=0 — int-second-era resolution; the sub-second
 > curve becomes measurable only with post-redeploy ms data **collected by the fixed debouncer**.
+>
+> **First post-0013 sub-second read (16 h, 2026-06-11, [probe-program brief](probe-program-2026-06-11.md) §2):**
+> naked-leg **9.4% @50 ms / 17.0% @100 ms / 23.3% @150 ms / 29.4% @250 ms** (n=575 capturable ≥1¢); survivors
+> keep ~1.9¢ median; ~29% of episodes die <250 ms (confirming the "~27% instant" share); the 1 s / 2 s rows
+> soften ~8 pp (47.3% / 55.0%). At the measured RTT, naked taker execution is **not rejected** — breakeven
+> naked-unwind ≈4–6¢ vs ~1–3¢ plausible. Preliminary (one sports-heavy day).
 
 ## 3. Settlement reconciliation — INCONCLUSIVE + a new pmus finding (`scripts/settle_recon.py`)
+
+> **CORRECTED 2026-06-11 ([probe-program brief](probe-program-2026-06-11.md) §4, [L23]):** the two
+> "unreliable interim data" bullets below were **our parse bug**, not a venue fact — pmus `outcomes[]`/
+> `outcomePrices[]` are **not index-aligned** (prices follow `marketSides` order; the self-labeling
+> `marketSides` is authoritative — validated 286/286 raw objects). Under the fixed reader the weather recon
+> is **CLOSED: 360/360 settled buckets identical, three-way vs the NWS CLI**, and sports interim reads are
+> 56/56 == Kalshi. What **survives** below: `closed:true` ≠ finalized (sports `endDate` ≈ D+14 — still treat
+> pre-`endDate` sports reads as interim) and the absent settlement timestamp. The ATP Diallo–Mannarino case
+> is retro-unadjudicable (today it reads correct under both conventions).
 
 Empirical test of invariant #1 (do both venues grade a co-listed market identically?). **It is not yet answerable**,
 and finding out *why* is itself the result:
@@ -91,7 +106,7 @@ than wait for the far-future pmus finalization (`endDate`). **Measured — and i
   markets had empty books** (the one with a live book was still `closed=false`). So you cannot sell the winning
   leg; capital is locked from resolution to `endDate` (~**15 days**). The early-exit rescue is **refuted** —
   sports is capital-inefficient, deep but slow.
-- **Weather:** the OPPOSITE. pmus closes weather markets **late** (`endDate` ~2 AM ET, well after the ~6 PM
+- **Weather:** the OPPOSITE. pmus closes weather markets **late** (`endDate` 1 AM local — corrected 2026-06-11, was "~2 AM ET" — well after the ~6 PM
   high-lock), so there's an **~8-hour evening window** where the outcome is known AND the book is live. Measured
   the winning bucket at ~8 PM ET 06-09: **MDW 88-89°F bid 0.99 (depth 22,340), LAX 72-73°F bid 0.98 (depth
   3,273)** — a deep bid near $1; losing buckets sit at 0.01/no-bid. So weather **has a liquid early-exit** (~1-2c
@@ -105,6 +120,7 @@ median edges (1.6–2c) a ~2c exit would wipe the edge even if a book existed.
 ## Net
 
 Latency is measured and benign-for-language-choice; **leg-fill is the gating risk and its true magnitude is now
-*instrumentable* but not yet measured** (ms timestamps + the shadow-fill replay); settlement identity is rules-verified
-but empirically open (and pmus's public settled data is unreliable until finalization). None of this needs capital —
+*instrumentable* but not yet measured** (ms timestamps + the shadow-fill replay); settlement identity is
+**empirically CONFIRMED for weather (2026-06-11: 360/360 — the "unreliable interim" scare was a parse bug, [L23])**
+and rules-verified for sports/econ pending their finalization windows. None of this needs capital —
 it needs the next gated deploy of the (now ms-resolution, px-logging) monitor, a few weeks of data, and a re-run.
