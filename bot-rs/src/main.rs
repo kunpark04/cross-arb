@@ -511,7 +511,7 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
             }
             // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
             // outcome arm keeps the reservation on a both-filled fill (records the position) or releases it.
-            let pos = position_from_intents(&slug, pair.cat, &pair.cluster, &legs);
+            let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
             reserve_exposure(&mut exposure, &pos, a.cost_per);
             pending_entries.insert(slug.clone());
             spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some(pair.clone()), a.cost_per);
@@ -792,16 +792,14 @@ fn recover_naked_leg(
     }
 
     // PRICE the filled leg's marketable SELL from its LIVE book. Unpriceable (one-sided book / no book) ->
-    // FALSE so the caller halts: we must NOT leave the filled leg silently naked.
-    // TODO(FIX C parity): the recovery SELL price is whole-cent and NOT quantized to a pmus market's coarse
-    // `orderPriceMinTickSize` (the `Position` doesn't carry the tick). On a coarse-tick pmus market a
-    // whole-cent SELL could reject -> the recovery falls through to the halt backstop (fail-safe, not a
-    // silent naked leg). Thread the tick onto `Position` to quantize the flatten too if such markets appear.
+    // FALSE so the caller halts: we must NOT leave the filled leg silently naked. The flatten is a SELL, so
+    // it FLOOR-quantizes to the leg's pmus tick (W2) — `Position` now carries `pm_min_tick` on the pmus leg —
+    // before the cent floor, so a coarse-tick pmus market doesn't reject the recovery SELL.
     let book = match filled_leg.venue {
         Venue::Kalshi => lock(kalshi_books).get(&filled_leg.market).map(|b| b.touch()),
         Venue::Pmus => pmus_books.get(&filled_leg.market).map(|b| b.touch()),
     };
-    let Some(exit) = book.and_then(|b| cents(exit_price(filled_leg, &b))) else {
+    let Some(exit) = book.and_then(|b| flatten_exit_cents(filled_leg, &b)) else {
         eprintln!("[live] CRITICAL NAKED LEG on {slug}: filled {:?} leg can't be priced for a flatten (one-sided book) -> halting", filled_leg.venue);
         return false;
     };
@@ -1299,12 +1297,13 @@ fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32) -> Option<[OrderI
                     return None;
                 }
             }
-            // quantize to the market's price tick (no-op when a whole cent is already a valid multiple).
-            quantize_to_tick(leg.price, pair.pm_min_tick)
+            // quantize UP (entries are BUYs) to the market's price tick so it stays marketable (W1).
+            quantize_to_tick(leg.price, pair.pm_min_tick, Action::Buy)
         } else {
             leg.price // Kalshi: integer-cent, no per-market tick
         };
-        let pc = cents(Some(price))?;
+        // entries are BUYs -> ceil to the cent (limit >= touch, still crosses); W1.
+        let pc = cents(Some(price), Action::Buy)?;
         out.push(OrderIntent {
             venue: leg.venue,
             market: leg.market,
@@ -1318,25 +1317,50 @@ fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32) -> Option<[OrderI
     Some([out.remove(0), out.remove(0)])
 }
 
-/// Round a price (dollars) to the nearest valid multiple of `tick` (dollars). `None`/non-positive/non-finite
-/// tick -> the price unchanged. Used for the pmus per-market `orderPriceMinTickSize` (FIX C): when the tick
-/// is coarser than a cent (e.g. 0.05) a whole-cent price like 0.07 is snapped to the nearest valid 0.05
-/// multiple; a finer tick (0.001) leaves whole cents unchanged. Since `OrderIntent.price_cents` is whole
-/// cents, a sub-cent tick can only be honored to cent granularity — which is within a ≤0.01 tick anyway.
-fn quantize_to_tick(price: f64, tick: Option<f64>) -> f64 {
+/// Quantize a price (dollars) to a valid multiple of `tick` (dollars) TOWARD-MARKETABLE for `action`: a
+/// BUY ceils (limit >= the touch, still lifts the offer), a SELL floors (limit <= the touch, still hits the
+/// bid). `None`/non-positive/non-finite tick -> the price unchanged. Used for the pmus per-market
+/// `orderPriceMinTickSize` (FIX C/W1): when the tick is coarser than a cent (e.g. 0.05) a whole-cent price
+/// like 0.07 snaps UP to 0.10 for a BUY (DOWN to 0.05 for a SELL); a finer tick (0.001) leaves whole cents
+/// unchanged. Nearest-rounding could move a marketable order to a RESTING limit (W1) — direction-aware
+/// rounding keeps it crossing. Since `OrderIntent.price_cents` is whole cents, sub-cent ticks are then
+/// honored only to cent granularity (W1 FLAG: a bounded <=0.5c precision cost per pmus leg, not a safety bug).
+fn quantize_to_tick(price: f64, tick: Option<f64>, action: Action) -> f64 {
     match tick {
-        Some(t) if t.is_finite() && t > 0.0 => (price / t).round() * t,
+        // EPS snaps a value already within ~1e-6 ticks of a boundary ONTO it before the directional
+        // ceil/floor, so float noise (e.g. 0.10/0.05 = 1.9999999998) can't push an exact multiple a whole
+        // tick the wrong way (the L10 cent-boundary class). 1e-6 << half a tick, so it never crosses a real one.
+        Some(t) if t.is_finite() && t > 0.0 => match action {
+            Action::Buy => (price / t - TICK_EPS).ceil() * t,
+            Action::Sell => (price / t + TICK_EPS).floor() * t,
+        },
         _ => price,
     }
 }
 
-/// Dollars (0..1) -> a valid integer venue tick price in 1..=99 cents, or None if non-finite/out of range.
-fn cents(price: Option<f64>) -> Option<u8> {
+/// Tolerance (in tick/cent multiples) for snapping a near-boundary value onto the boundary before a
+/// directional ceil/floor — guards the L10 float-noise-at-a-cent-boundary class without crossing a real tick.
+const TICK_EPS: f64 = 1e-6;
+
+/// Dollars (0..1) -> a valid integer-cent venue tick price in 1..=99c, rounded TOWARD-MARKETABLE for
+/// `action`: a BUY ceils to the cent (limit >= the touch so it still crosses), a SELL floors (limit <= the
+/// touch). NEAREST-rounding a marketable BUY down (or a SELL up) yields a RESTING limit -> the leg rests ->
+/// the sibling goes naked -> recovery/halt (W1). Kalshi touches are already whole cents so ceil/floor is a
+/// no-op there; this matters for pmus sub-cent book prices. The BUY ceil is safe because
+/// `realized_edge_clears_floor` re-checks the ceil'd cost against the edge floor before firing. `None` if
+/// non-finite or the rounded cent is out of 1..=99.
+fn cents(price: Option<f64>, action: Action) -> Option<u8> {
     let p = price?;
     if !p.is_finite() {
         return None;
     }
-    let c = (p * 100.0).round();
+    // EPS snaps a price already within ~1e-6c of a cent onto it before the directional ceil/floor, so a
+    // whole-cent touch like 0.07 (0.07*100 = 7.0000000000000001) doesn't ceil up to 8c (the L10 class).
+    let cx = p * 100.0;
+    let c = match action {
+        Action::Buy => (cx - TICK_EPS).ceil(),
+        Action::Sell => (cx + TICK_EPS).floor(),
+    };
     if (1.0..=99.0).contains(&c) {
         Some(c as u8)
     } else {
@@ -1353,8 +1377,10 @@ fn fire_legs(backend: &dyn ExecutionBackend, legs: &[OrderIntent; 2]) {
 
 /// The HELD position the live loop derives from a both-filled entry: build a `Position` straight from the
 /// two entry `OrderIntent`s (each leg = its venue/market/side; the pair `market` = the pmus slug). The two
-/// intents are the exact legs we now own, so the unwind SELLs back the same (venue, market, side).
-fn position_from_intents(slug: &str, cat: Cat, cluster: &str, legs: &[OrderIntent; 2]) -> Position {
+/// intents are the exact legs we now own, so the unwind SELLs back the same (venue, market, side). `pm_tick`
+/// (the pair's pmus `orderPriceMinTickSize`) is recorded ONLY on the pmus leg (FIX W2) so a later recovery
+/// SELL can floor-quantize its flatten price to a valid tick; Kalshi legs carry `None`.
+fn position_from_intents(slug: &str, cat: Cat, cluster: &str, pm_tick: Option<f64>, legs: &[OrderIntent; 2]) -> Position {
     Position {
         market: slug.to_string(),
         cat,
@@ -1363,6 +1389,7 @@ fn position_from_intents(slug: &str, cat: Cat, cluster: &str, legs: &[OrderInten
             market: legs[i].market.clone(),
             side: legs[i].side,
             venue_order_id: String::new(), // filled from the fill ack in `apply_outcome` before tracking
+            pm_min_tick: if legs[i].venue == Venue::Pmus { pm_tick } else { None },
         }),
         size: legs[0].qty,
         cluster: cluster.to_string(),
@@ -1380,6 +1407,16 @@ fn exit_price(leg: &PositionLeg, book: &Book) -> Option<f64> {
     }
 }
 
+/// Price a held leg's RECOVERY-flatten SELL to a valid integer-cent tick (W1/W2): take the marketable exit
+/// from `book`, FLOOR-quantize it to this leg's pmus `pm_min_tick` (a SELL floors — limit <= touch stays
+/// marketable; W2), then FLOOR to the cent. `None` when the leg can't be priced (one-sided book) OR the
+/// floor lands outside 1..=99c -> the caller halts rather than fire a rejecting/mispriced flatten. A
+/// coarse-tick pmus market would otherwise reject a whole-cent SELL and bounce the recovery to the halt.
+fn flatten_exit_cents(leg: &PositionLeg, book: &Book) -> Option<u8> {
+    let p = quantize_to_tick(exit_price(leg, book)?, leg.pm_min_tick, Action::Sell);
+    cents(Some(p), Action::Sell)
+}
+
 /// Price BOTH legs of a held position to exit `cents`, reading each leg's book from `book_of` (the live
 /// per-venue books). `None` if EITHER leg can't be priced or rounds outside the venue tick — the caller
 /// then logs a WARN and holds (the poll re-emits; the idempotent `unwind-…` coids prevent a double-flatten).
@@ -1390,7 +1427,8 @@ where
     let mut out = [0u8; 2];
     for (i, leg) in pos.legs.iter().enumerate() {
         let book = book_of(leg)?;
-        out[i] = cents(exit_price(leg, &book))?;
+        // an unwind SELLs both legs -> floor to the cent (limit <= touch, still hits the bid); W1.
+        out[i] = cents(exit_price(leg, &book), Action::Sell)?;
     }
     Some(out)
 }
@@ -1631,31 +1669,44 @@ mod tests {
         assert_eq!(kp[1].market, "aec-mlb-lad-pit-2026-06-16");
     }
 
-    /// `cents` rounds to the nearest tick and rejects prices that round outside the 1..=99 range or are
-    /// non-finite/absent (0.5c rounds UP to a valid 1c tick; 0.4c rounds to 0c -> rejected).
+    /// `cents` rounds TOWARD-MARKETABLE (W1): a BUY ceils to the cent (limit >= touch -> still crosses), a
+    /// SELL floors (limit <= touch). It rejects prices that round outside 1..=99 or are non-finite/absent.
+    /// The whole-cent Kalshi-touch cases (exact multiples) are unchanged by direction.
     #[test]
-    fn cents_validates_tick_range() {
-        assert_eq!(cents(Some(0.075)), Some(8)); // 7.5c rounds to 8c
-        assert_eq!(cents(Some(0.005)), Some(1)); // 0.5c rounds up to the 1c floor tick
-        assert_eq!(cents(Some(0.004)), None); // 0.4c rounds to 0c -> below the valid range
-        assert_eq!(cents(Some(0.0)), None); // free -> not a tradeable tick
-        assert_eq!(cents(Some(1.0)), None); // 100c -> out of range
-        assert_eq!(cents(None), None);
-        assert_eq!(cents(Some(f64::NAN)), None);
+    fn cents_rounds_toward_marketable() {
+        // W1 core: a BUY at a sub-cent book price ceils UP (0.074 -> 8c); a SELL floors DOWN (0.076 -> 7c)
+        // so each stays marketable. Nearest-rounding would have rested the BUY at 7c / the SELL at 8c.
+        assert_eq!(cents(Some(0.074), Action::Buy), Some(8)); // BUY ceils 7.4c -> 8c (still lifts the offer)
+        assert_eq!(cents(Some(0.076), Action::Sell), Some(7)); // SELL floors 7.6c -> 7c (still hits the bid)
+        // whole-cent (Kalshi) touches are exact multiples -> direction is a no-op.
+        assert_eq!(cents(Some(0.07), Action::Buy), Some(7));
+        assert_eq!(cents(Some(0.07), Action::Sell), Some(7));
+        assert_eq!(cents(Some(0.90), Action::Buy), Some(90));
+        // a BUY at <0.5c still ceils to the 1c floor tick; a SELL at <1c floors to 0c -> rejected.
+        assert_eq!(cents(Some(0.004), Action::Buy), Some(1)); // BUY ceils up to the 1c floor tick
+        assert_eq!(cents(Some(0.004), Action::Sell), None); // SELL floors to 0c -> below the valid range
+        assert_eq!(cents(Some(0.0), Action::Buy), None); // free -> not a tradeable tick
+        assert_eq!(cents(Some(0.995), Action::Buy), None); // BUY ceils 99.5c -> 100c -> out of range
+        assert_eq!(cents(Some(0.995), Action::Sell), Some(99)); // SELL floors 99.5c -> 99c -> valid
+        assert_eq!(cents(Some(1.0), Action::Buy), None); // 100c -> out of range
+        assert_eq!(cents(None, Action::Buy), None);
+        assert_eq!(cents(Some(f64::NAN), Action::Buy), None);
     }
 
-    /// FIX C — per-market pmus tick + min-size in the leg builder. (1) a configured size BELOW the pmus
+    /// FIX C/W1 — per-market pmus tick + min-size in the leg builder. (1) a configured size BELOW the pmus
     /// `minimumTradeQty` skips the WHOLE pair (sub-min would reject -> naked leg). (2) a coarse pmus price
-    /// tick quantizes the pmus leg's price to the nearest valid multiple; a fine tick (0.001) is a no-op.
-    /// Kalshi legs are never quantized. `quantize_to_tick` is also checked directly.
+    /// tick quantizes the pmus leg's BUY price UP to a valid multiple (W1 toward-marketable); a fine tick
+    /// (0.001) is a no-op. Kalshi legs are never quantized. `quantize_to_tick` direction is checked directly.
     #[test]
     fn pmus_min_qty_skips_and_tick_quantizes_the_pmus_leg() {
-        // quantize_to_tick: 0.07 on a 0.05 tick -> 0.05 (nearest multiple); on a 0.001 tick -> 0.07; None -> as-is.
-        assert!((quantize_to_tick(0.07, Some(0.05)) - 0.05).abs() < 1e-9);
-        assert!((quantize_to_tick(0.08, Some(0.05)) - 0.10).abs() < 1e-9); // 0.08 rounds UP to 0.10
-        assert!((quantize_to_tick(0.07, Some(0.001)) - 0.07).abs() < 1e-9); // finer tick: whole cent unchanged
-        assert!((quantize_to_tick(0.07, None) - 0.07).abs() < 1e-9); // no tick known -> unchanged
-        assert!((quantize_to_tick(0.07, Some(0.0)) - 0.07).abs() < 1e-9); // non-positive tick ignored
+        // quantize_to_tick toward-marketable: a BUY at 0.07 on a 0.05 tick ceils UP to 0.10; a SELL floors to
+        // 0.05. A finer tick (0.001) and None/0 ticks leave the price unchanged either direction.
+        assert!((quantize_to_tick(0.07, Some(0.05), Action::Buy) - 0.10).abs() < 1e-9); // BUY ceils up
+        assert!((quantize_to_tick(0.07, Some(0.05), Action::Sell) - 0.05).abs() < 1e-9); // SELL floors down
+        assert!((quantize_to_tick(0.10, Some(0.05), Action::Buy) - 0.10).abs() < 1e-9); // exact multiple: no-op
+        assert!((quantize_to_tick(0.07, Some(0.001), Action::Buy) - 0.07).abs() < 1e-9); // finer tick: whole cent unchanged
+        assert!((quantize_to_tick(0.07, None, Action::Buy) - 0.07).abs() < 1e-9); // no tick known -> unchanged
+        assert!((quantize_to_tick(0.07, Some(0.0), Action::Sell) - 0.07).abs() < 1e-9); // non-positive tick ignored
 
         // (1) min-qty skip: pmus minimumTradeQty = 2, configured size 1 -> the pmus leg is sub-min -> None.
         let mut pair = wx_pair();
@@ -1663,11 +1714,12 @@ mod tests {
         assert!(build_legs(&pair, &q_pk(), Dir::PK, 1).is_none(), "size below pmus minimumTradeQty -> skip the pair");
         assert!(build_legs(&pair, &q_pk(), Dir::PK, 2).is_some(), "size at the minimum is allowed");
 
-        // (2) tick quantization: pmus tick 0.05; dir PK leg A = YES@pmus @ pm_ask 0.07 -> snaps to 0.05 = 5c.
+        // (2) tick quantization: pmus tick 0.05; dir PK leg A = YES@pmus (a BUY) @ pm_ask 0.07 -> ceils UP to
+        // 0.10 = 10c (stays marketable; nearest-rounding to 5c would have rested it below the 7c offer).
         let mut pair2 = wx_pair();
         pair2.pm_min_tick = Some(0.05);
         let pk = build_legs(&pair2, &q_pk(), Dir::PK, 1).unwrap();
-        assert_eq!((pk[0].venue, pk[0].price_cents), (Venue::Pmus, 5), "pmus leg quantized to the 0.05 tick");
+        assert_eq!((pk[0].venue, pk[0].price_cents), (Venue::Pmus, 10), "pmus BUY leg ceils UP to the 0.05 tick (marketable)");
         // the Kalshi NO leg (1 - 0.10 = 0.90) is NOT quantized by the pmus tick -> stays 90c.
         assert_eq!((pk[1].venue, pk[1].price_cents), (Venue::Kalshi, 90), "Kalshi leg is integer-cent, untouched");
     }
@@ -1745,7 +1797,7 @@ mod tests {
             OrderIntent { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 7, client_order_id: "xarb-…-A".into() },
             OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 7, client_order_id: "xarb-…-B".into() },
         ];
-        let pos = position_from_intents("aec-mlb-lad-pit-2026-06-16", Cat::Sports, "mlb-2026-06-16", &legs);
+        let pos = position_from_intents("aec-mlb-lad-pit-2026-06-16", Cat::Sports, "mlb-2026-06-16", None, &legs);
         assert_eq!(pos.market, "aec-mlb-lad-pit-2026-06-16"); // pair identity = the pmus slug
         assert_eq!(pos.size, 7);
         assert_eq!(pos.cluster, "mlb-2026-06-16");
@@ -1804,7 +1856,7 @@ mod tests {
             OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, client_order_id: "a".into() },
             OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
         ];
-        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs);
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         // RESERVE at spawn (exposure bumps) then RECORD on both-filled (exposure stays reserved).
         reserve_exposure(&mut exp, &pos, 0.97);
         track_position(&positions, &pair, pos);
@@ -1839,7 +1891,7 @@ mod tests {
             OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, client_order_id: "a".into() },
             OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
         ];
-        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs);
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         track_position(&positions, &pair, pos.clone());
         // the poll has since accumulated a status snapshot on this slug.
         let snapshot = postpone::GameStatus { detailed_state: "Scheduled".into(), official_date: Some("2026-06-16".into()), ..Default::default() };
@@ -1910,7 +1962,7 @@ mod tests {
             OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "xarb-…-A".into() },
             OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "xarb-…-B".into() },
         ];
-        (pair.clone(), position_from_intents(&pair.slug, pair.cat, &pair.cluster, &legs), 0.97)
+        (pair.clone(), position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs), 0.97)
     }
 
     /// A test harness for `apply_outcome` that supplies the FIX-A recovery args (backend + books + outcome
@@ -2133,6 +2185,73 @@ mod tests {
         let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
         assert_eq!(recovered.kind, SubmitKind::Recovery, "the flatten routes back as a Recovery outcome");
         assert!(matches!(&recovered.ack.a, Ok(a) if a.filled), "leg a is the SELL and the dry-run flatten fills");
+    }
+
+    /// FIX W2 — the recovery-flatten SELL FLOOR-quantizes to the held pmus leg's coarse `orderPriceMinTickSize`
+    /// so a coarse-tick pmus market doesn't REJECT it (which would bounce the recovery to a needless halt). A
+    /// SELL floors (limit <= touch -> still hits the bid). Directly on the pure pricer + end-to-end on the
+    /// recovery path: a YES@pmus leg with a 0.05 tick, book YES bid 0.93 -> floors to 0.90 = 90c (not 93c).
+    #[test]
+    fn flatten_sell_floors_to_the_pmus_tick() {
+        // a pmus YES leg carrying a coarse 0.05 tick; book best YES bid 0.93 (not a 0.05 multiple).
+        let coarse = PositionLeg { venue: Venue::Pmus, market: "tc-temp-nychigh-2026-06-11-gte95f".into(), side: Side::Yes, pm_min_tick: Some(0.05), ..Default::default() };
+        let book = Book { yes_bid: Some(0.93), yes_ask: Some(0.95), age_s: 0.0 };
+        // SELL floors 0.93 -> the 0.05 tick 0.90 -> 90c (a 93c SELL would reject on a 0.05-tick market).
+        assert_eq!(flatten_exit_cents(&coarse, &book), Some(90), "the recovery SELL floors to a valid coarse tick");
+        // a NO@pmus leg on the same tick: exit = 1 - yes_ask(0.95) = 0.05 -> floors to the 0.05 tick = 5c.
+        let coarse_no = PositionLeg { side: Side::No, ..coarse.clone() };
+        assert_eq!(flatten_exit_cents(&coarse_no, &book), Some(5), "NO-leg flatten also floors to the tick");
+        // no pmus tick (Kalshi/weather/econ leg) -> just the cent floor, unchanged: 0.93 -> 93c.
+        let fine = PositionLeg { pm_min_tick: None, ..coarse.clone() };
+        assert_eq!(flatten_exit_cents(&fine, &book), Some(93), "no tick -> cent-granularity floor, no tick snap");
+        // a one-sided book (no YES bid for a YES leg) -> None so the caller halts rather than misprice.
+        assert_eq!(flatten_exit_cents(&coarse, &Book { yes_bid: None, yes_ask: Some(0.95), age_s: 0.0 }), None);
+    }
+
+    /// FIX W2 end-to-end: a one-leg-filled entry whose FILLED leg is a coarse-tick pmus market still RECOVERS
+    /// (the floored SELL is a valid tick, so the flatten is priceable and recovery launches) — it does NOT
+    /// fall through to the halt backstop the way an un-quantized whole-cent SELL would on a coarse market.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coarse_tick_pmus_leg_still_recovers() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        // a weather PK pair whose pmus market has a coarse 0.05 tick -> the held pmus leg carries it (W2).
+        let pair = LivePair {
+            slug: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+            kalshi: "KXHIGHNY-26JUN11-T95".into(),
+            kalshi_b: None, cat: Cat::Weather, cluster: "nychigh-2026-06-11".into(), settle_clean: true, days_to_event: None,
+            pm_min_tick: Some(0.05), pm_min_qty: None,
+        };
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 10, qty: 2, client_order_id: "xarb-…-A".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 88, qty: 2, client_order_id: "xarb-…-B".into() },
+        ];
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
+        // the tick is recorded ONLY on the pmus leg (W2); the Kalshi leg carries None.
+        assert_eq!(pos.legs[0].pm_min_tick, Some(0.05), "pmus leg carries the tick");
+        assert_eq!(pos.legs[1].pm_min_tick, None, "Kalshi leg carries no pmus tick");
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, 0.97);
+        pending.insert(slug.clone());
+        // the pmus book for the FILLED leg quotes a YES bid of 0.93 (not a 0.05 multiple) -> the flatten SELL
+        // floors to 0.90 = 90c (a valid tick) and recovery launches; un-quantized it would have been 93c.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.93, 500.0)], &[(0.95, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: 0.97 };
+        let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
+        // RECOVERY launched (not the halt backstop): the coarse-tick SELL was priceable.
+        assert!(!halt.load(Ordering::Relaxed), "a coarse-tick pmus leg recovers -> does NOT halt");
+        assert!(flat.contains(&slug), "recovery launched (slug marked flattening)");
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
+        assert_eq!(recovered.kind, SubmitKind::Recovery, "the floored flatten fires and routes back as Recovery");
     }
 
     /// FIX A — the FAILED-recovery safety net (the self-review CRITICAL): when the recovery flatten SELL

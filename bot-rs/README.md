@@ -64,6 +64,21 @@ when the flatten can't be priced (one-sided book) or the recovery SELL itself do
 naked → `SubmitKind::Recovery` arm engages the kill-switch for a manual flatten). Still TODO: a leg-fill
 TIMEOUT (cancel a slow-but-not-yet-rejected resting leg before it fills late) and true partial-fill sizing.
 
+**Price rounding is direction-aware (W1/W2).** A marketable limit rounds TOWARD-MARKETABLE so it still
+crosses: an entry **BUY** ceils to the cent/tick (limit ≥ the touch), a flatten/unwind **SELL** floors
+(limit ≤ the touch). Nearest-rounding a BUY down (or a SELL up) would have placed a *marketable* order at a
+*resting* limit → the leg rests → the sibling goes naked → recovery/halt. Kalshi touches are whole cents so
+ceil/floor is a no-op there; it matters for pmus sub-cent book prices (and the `realized_edge_clears_floor`
+re-check guards a ceil'd BUY from eroding the edge below the floor). The recovery SELL also FLOOR-quantizes
+to the held pmus leg's `orderPriceMinTickSize` (`PositionLeg::pm_min_tick`), so a coarse-tick pmus market
+can't reject the flatten and bounce recovery to a needless halt.
+
+**Execution edge cases — price granularity (FOLLOW-UP, not a safety bug).** `OrderIntent.price_cents` is a
+whole-cent `u8`, coarser than pmus's 0.001 tick — so a pmus leg loses up to ~0.5c of price precision per leg
+(a bounded COST; the ceil/floor keeps the order marketable, so it never silently rests). TODO before pmus is
+armed past dry-run: a finer price representation (sub-cent) for pmus legs. Dormant today (all live pmus ticks
+are 0.001, where whole cents are already valid multiples).
+
 ## Build / run
 
 Needs Rust (`rustup`). Stage 2 adds async/TLS/crypto deps (tokio, tokio-tungstenite, reqwest/rustls,

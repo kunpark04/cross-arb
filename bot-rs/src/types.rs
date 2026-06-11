@@ -145,7 +145,9 @@ pub struct OrderIntent {
 /// old yes_venue/no_venue pair so a SPORTS hedge — whose two legs can be two YES legs on two different
 /// Kalshi tickers (dir PK: YES@pmus + YES@Kalshi-B) — is represented faithfully, not forced into a
 /// yes-leg/no-leg shape. The unwind SELLs each leg with this exact (venue, market, side).
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+// No `Eq`: `pm_min_tick: Option<f64>` is only `PartialEq` (f64 has no total order). `PartialEq` is all the
+// `assert_eq!`s and the (non-`Eq`) `Position` need.
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct PositionLeg {
     pub venue: Venue,
     pub market: String, // venue-native id: Kalshi ticker for a Kalshi leg, pmus slug for a pmus leg
@@ -153,6 +155,11 @@ pub struct PositionLeg {
     /// The exchange-assigned order id from this leg's fill ack, persisted so the leg can be CANCELLED
     /// (Kalshi by id-in-path; pmus by id + `market`). Empty until the entry acks (set in `apply_outcome`).
     pub venue_order_id: String,
+    /// pmus per-market `orderPriceMinTickSize` for this leg (FIX W2), carried from the `LivePair` so the
+    /// naked-leg RECOVERY SELL can FLOOR-quantize its flatten price to a valid tick — a coarse-tick pmus
+    /// market would otherwise reject a whole-cent SELL and bounce the recovery to the halt backstop. `None`
+    /// for Kalshi/weather/econ legs (no pmus tick) -> the flatten price is left at cent granularity.
+    pub pm_min_tick: Option<f64>,
 }
 
 /// A held, hedged cross-arb position — the two legs we own. Used by the unwind logic to close out
