@@ -12,6 +12,13 @@ pub enum Side {
     No,
 }
 
+/// Order direction. Entries are `Buy`; an unwind (closing a held leg) is `Sell`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Buy,
+    Sell,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cat {
     Weather,
@@ -98,10 +105,10 @@ pub struct Quote {
     /// sighting. For WEATHER, a DEAR-led edge is ~79% toxic vs ~17% cheap-led (H1, weather-only) — the
     /// toxicity-direction signal. Stage-2 populates this by diffing against the prior book snapshot.
     pub led_by: Option<Venue>,
-    /// Days until the game starts (sports only), for the game-proximity entry gate — don't lock
-    /// capital days before the game. `None` = unknown / N/A (weather/econ). Stage-2 computes it from
-    /// the game date in the market key.
-    pub days_to_game: Option<f64>,
+    /// Days until the settlement EVENT (the game for sports, the release for econ; ~0 for weather).
+    /// Feeds the event-proximity entry gate — don't lock capital long before the event settles.
+    /// `None` = unknown -> gate dormant. Stage-2 computes it from the event date in the market key.
+    pub days_to_event: Option<f64>,
 }
 
 /// A priced cross-venue edge, net of fees, per `$1` of payout.
@@ -116,9 +123,22 @@ pub struct Edge {
 pub struct OrderIntent {
     pub venue: Venue,
     pub market: String,
+    pub action: Action, // Buy on entry; Sell on unwind/close
     pub side: Side,
     pub price_cents: u8, // 1..=99
     pub qty: u32,
     /// Idempotency key — the venue dedupes on this, so a retry can't double-fire a leg.
     pub client_order_id: String,
+}
+
+/// A held, hedged cross-arb position — the two legs we own. Used by the unwind logic to close out
+/// (e.g. a postponement that would break the hedge).
+#[derive(Clone, Debug)]
+pub struct Position {
+    pub market: String,
+    pub cat: Cat,
+    pub yes_venue: Venue, // where we hold the long YES leg
+    pub no_venue: Venue,  // where we hold the NO leg
+    pub size: u32,
+    pub cluster: String,
 }

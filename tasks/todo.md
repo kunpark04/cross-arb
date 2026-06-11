@@ -142,6 +142,21 @@ backtest pipeline re-run on the corrected pipeline.**
       2-day window; reads `void_clean`); (b) latency-haircut from a real order-ack study + leg-fill EV (0010 items
       2/3); (c) `p_gap`/`loss_frac` refinement; (d) NBA/NHL settlement read in season; (e) CLI-revision rate.
 
+## NEXT SESSION — bot-rs features deferred 2026-06-11 (owner directive)
+
+Two strategy features designed + reviewed this session but explicitly deferred to next session for
+implementation in `bot-rs` (the rest of the rust-review/strategy-test findings are already built):
+
+- [ ] **Edge-RATE allocation layer** — `bot-rs` evaluates each arb in isolation; add a cross-arb
+      prioritization that ranks/sizes by `booked_edge ÷ expected_lock_days` (the frozen 0014-H2 arm).
+      The lock-day priors changed this session (the "14-day pmus lock" was corrected — sports/econ
+      settle ~at grade), so re-derive the per-category lock-days first. Pairs with the new
+      event-proximity gate.
+- [ ] **Maker-side execution mode** — `bot-rs` is taker-only; add a maker/conditional-hedge mode that
+      rests the cheap leg on Kalshi (weather maker fee $0) + taker-hedges pmus — the maker study's only
+      +EV config ([research/probe-program-2026-06-11.md](../research/probe-program-2026-06-11.md) §1).
+      Needs the trade-print/ladder data (now logging) to model fill rates, and per-series `fee_type`.
+
 ## Next-session explorations — policy + strategy upgrades (queued 2026-06-10)
 
 Owner-reviewed suggestions from the post-0013 policy read (OOS tables in the corrected pipeline).

@@ -113,9 +113,13 @@ impl LiveBackend {
             Side::Yes => "yes",
             Side::No => "no",
         };
+        let action = match intent.action {
+            Action::Buy => "buy",
+            Action::Sell => "sell", // an unwind closes the leg we hold
+        };
         format!(
-            "{{\"action\":\"buy\",\"side\":\"{}\",\"ticker\":\"{}\",\"count\":{},\"type\":\"limit\",\"yes_price\":{},\"client_order_id\":\"{}\"}}",
-            side, intent.market, intent.qty, intent.price_cents, intent.client_order_id
+            "{{\"action\":\"{}\",\"side\":\"{}\",\"ticker\":\"{}\",\"count\":{},\"type\":\"limit\",\"yes_price\":{},\"client_order_id\":\"{}\"}}",
+            action, side, intent.market, intent.qty, intent.price_cents, intent.client_order_id
         )
     }
 }
@@ -155,6 +159,7 @@ mod tests {
         let a = OrderIntent {
             venue: Venue::Kalshi,
             market: "KXHIGHNY-26JUN11-T95".into(),
+            action: Action::Buy,
             side: Side::Yes,
             price_cents: 8,
             qty: 1,
@@ -163,6 +168,7 @@ mod tests {
         let b = OrderIntent {
             venue: Venue::Pmus,
             market: "tc-temp-nychigh-2026-06-11-gte95f".into(),
+            action: Action::Buy,
             side: Side::No,
             price_cents: 90,
             qty: 1,
@@ -192,7 +198,9 @@ mod tests {
             fat_edge_size_factor: 0.5,
             skip_dear_led_weather: true,
             assume_sports_settled: false,
-            sports_max_days_to_game: 2.0,
+            assume_econ_settled: false,
+            max_days_to_event: 2.0,
+            kalshi_void_window_days: 2.0,
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             kill_switch: false,
@@ -201,13 +209,14 @@ mod tests {
         let intent = OrderIntent {
             venue: Venue::Kalshi,
             market: "KXHIGHNY-26JUN11-T95".into(),
+            action: Action::Buy,
             side: Side::No,
             price_cents: 14,
             qty: 1,
             client_order_id: "coid-1".into(),
         };
         let body = bk.build_kalshi_payload(&intent);
-        assert!(body.contains("\"side\":\"no\"") && body.contains("\"count\":1"));
+        assert!(body.contains("\"action\":\"buy\"") && body.contains("\"side\":\"no\"") && body.contains("\"count\":1"));
         assert!(bk.kalshi_base().contains("demo")); // sandbox default
         let r = bk.submit_pair(&intent, &intent);
         assert_eq!(r.a, Err(ExecError::TransportNotWired)); // never sends here

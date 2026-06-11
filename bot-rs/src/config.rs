@@ -39,7 +39,9 @@ pub struct Config {
     pub fat_edge_size_factor: f64,        // size multiplier above the knee (1.0 = OFF, to test speed-capture)
     pub skip_dear_led_weather: bool,      // H1 toxicity-direction gate: skip dear-led WEATHER edges (~79% toxic)
     pub assume_sports_settled: bool,      // owner override: treat SPORTS as settlement-reconciled (else gated)
-    pub sports_max_days_to_game: f64,     // game-proximity gate: skip sports arbs >this many days pre-game (<=0 = off)
+    pub assume_econ_settled: bool,        // owner override: treat ECON as settlement-reconciled (else gated)
+    pub max_days_to_event: f64,           // event-proximity gate: skip arbs >this many days before settlement (<=0 = off)
+    pub kalshi_void_window_days: f64,     // postponement-unwind: Kalshi voids if reschedule is past this (~2d)
     pub leg_fill_timeout_ms: u64,         // unwind leg A if leg B isn't filled in time
     pub require_settle_clean: bool,       // only trade settlement-verified pairs (econ/sports)
 
@@ -74,7 +76,9 @@ impl Config {
             fat_edge_size_factor: env_f64("FAT_EDGE_SIZE_FACTOR", 0.5),
             skip_dear_led_weather: env_bool("SKIP_DEAR_LED_WEATHER", true),
             assume_sports_settled: env_bool("ASSUME_SPORTS_SETTLED", false),
-            sports_max_days_to_game: env_f64("SPORTS_MAX_DAYS_TO_GAME", 2.0),
+            assume_econ_settled: env_bool("ASSUME_ECON_SETTLED", false),
+            max_days_to_event: env_f64("MAX_DAYS_TO_EVENT", 2.0),
+            kalshi_void_window_days: env_f64("KALSHI_VOID_WINDOW_DAYS", 2.0),
             leg_fill_timeout_ms: env_u64("LEG_FILL_TIMEOUT_MS", 500),
             require_settle_clean: env_bool("REQUIRE_SETTLE_CLEAN", true),
 

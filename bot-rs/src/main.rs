@@ -12,6 +12,7 @@ mod exec;
 mod ledger;
 mod risk;
 mod types;
+mod unwind;
 
 use config::{Config, ExecutionMode, VenueEnv};
 use exec::{DryRunBackend, ExecutionBackend, LiveBackend};
@@ -90,7 +91,7 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         settle_clean: false,
         cluster: "u3-2026-07-02".into(),
         led_by: None,
-        days_to_game: None,
+        days_to_event: None,
     };
     println!("[smoke] econ U-3 9c gap, settlement NOT yet verified:");
     report(cfg, &econ, Edge { net: 0.09, dir: Dir::PK }, 75, backend);
@@ -105,7 +106,7 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         settle_clean: true,
         cluster: "nychigh-2026-06-11".into(),
         led_by: Some(Venue::Pmus), // cheap venue (dir PK) led -> benign
-        days_to_game: None,
+        days_to_event: None,
     };
     println!("[smoke] weather arb, verified, 3c edge, cheap-led (benign):");
     report(cfg, &wx, Edge { net: 0.03, dir: Dir::PK }, 7, backend);
@@ -128,14 +129,32 @@ fn smoke(cfg: &Config, backend: &mut dyn ExecutionBackend) {
         settle_clean: false, // not actually reconciled — assumed via config
         cluster: "mlb-lad-pit-2026-06-16".into(),
         led_by: None,
-        days_to_game: Some(5.0),
+        days_to_event: Some(5.0),
     };
-    println!("[smoke] sports arb (assumed-settled), 5 days pre-game -> game-proximity gate:");
+    println!("[smoke] sports arb (assumed-settled), 5 days pre-game -> event-proximity gate:");
     report(&sc, &sport, Edge { net: 0.03, dir: Dir::PK }, 55, backend);
     let mut sport_soon = sport.clone();
-    sport_soon.days_to_game = Some(1.0);
+    sport_soon.days_to_event = Some(1.0);
     println!("[smoke] sports arb (assumed-settled), 1 day pre-game -> within window:");
     report(&sc, &sport_soon, Edge { net: 0.03, dir: Dir::PK }, 55, backend);
+
+    // (5) postponement unwind: a held MLB pair + a postponement with an unknown/late reschedule ->
+    //     flatten BOTH legs (SELL) before Kalshi voids. (Stage-2 wires live statsapi detection.)
+    let held = types::Position {
+        market: "aec-mlb-lad-pit-2026-06-16".into(), cat: Cat::Sports,
+        yes_venue: Venue::Pmus, no_venue: Venue::Kalshi, size: 10,
+        cluster: "mlb-lad-pit-2026-06-16".into(),
+    };
+    let postponed = vec![unwind::Postponement {
+        market: held.market.clone(), reschedule_in_days: None, // makeup unknown -> Kalshi will void
+    }];
+    println!("[smoke] postponement unwind (held MLB pair, makeup unknown):");
+    for pair in unwind::postponement_unwinds(&[held], &postponed, cfg.kalshi_void_window_days) {
+        for o in &pair {
+            println!("  UNWIND {:?} {:?} {:?} {}x  market={}", o.action, o.venue, o.side, o.qty, o.market);
+        }
+    }
+    println!();
 }
 
 fn report(cfg: &Config, q: &Quote, edge: Edge, buy_price_cents: u8, backend: &mut dyn ExecutionBackend) {
@@ -148,12 +167,12 @@ fn report(cfg: &Config, q: &Quote, edge: Edge, buy_price_cents: u8, backend: &mu
                 Dir::KP => (Venue::Kalshi, Venue::Pmus),
             };
             let leg_yes = OrderIntent {
-                venue: yes_venue, market: q.market.clone(), side: Side::Yes,
+                venue: yes_venue, market: q.market.clone(), action: Action::Buy, side: Side::Yes,
                 price_cents: buy_price_cents, qty: a.size,
                 client_order_id: format!("smoke-{}-Y", q.market),
             };
             let leg_no = OrderIntent {
-                venue: no_venue, market: q.market.clone(), side: Side::No,
+                venue: no_venue, market: q.market.clone(), action: Action::Buy, side: Side::No,
                 price_cents: 100u8.saturating_sub(buy_price_cents).max(1), qty: a.size,
                 client_order_id: format!("smoke-{}-N", q.market),
             };

@@ -25,8 +25,9 @@ of least resistance, because the readiness audit + backtest concluded the edge i
 | Fat-edge haircut | `FAT_EDGE_SIZE_FACTOR` / `FAT_EDGE_KNEE_CENTS` | 0.5 / 6c | size **down** above the knee — fat edges are ~66% toxic & die ~0.5s (readiness audit + rust review); **set factor=1.0 to test** whether a sub-0.5s concurrent fill can capture them |
 | Econ twin divergence | `ECON_TWIN_MAX_DIVERGENCE_CENTS` | 15c | tighter divergence bound for settlement-identical econ twins (vs the 40c cross-category guard) — the 18c U-3 phantom must not sail through |
 | Toxicity-direction gate | `SKIP_DEAR_LED_WEATHER` | true | **H1** (the one tested strategy idea with a signal) — skip **dear-led weather** edges (~79% toxic vs ~17% cheap-led, Fisher p=2.7e-6); **weather-only** (sports null); dormant until stage-2 supplies `led_by` |
-| Assume sports settled | `ASSUME_SPORTS_SETTLED` | false | owner override: treat **sports** as settlement-reconciled (else gated until the ~June 23 recon). The residual void/postpone tail is handled by the (stage-2) unwind rule, not this flag |
-| Game-proximity gate | `SPORTS_MAX_DAYS_TO_GAME` | 2.0 | capital velocity — skip a **sports** arb more than this many days before the game (don't freeze capital early; monitoring is free). All sports; weather/econ exempt; dormant until stage-2 supplies `days_to_game`. `<=0` disables |
+| Assume settled (per category) | `ASSUME_SPORTS_SETTLED` / `ASSUME_ECON_SETTLED` | false | owner override: treat sports / econ as settlement-reconciled (else gated until recon ~June 23 / July 2). The residual void/postpone tail is handled by the unwind rule, not this flag |
+| Event-proximity gate | `MAX_DAYS_TO_EVENT` | 2.0 | capital velocity — skip **any** arb more than this many days before its settlement event (game for sports, release for econ); weather (event ~now) is naturally exempt. Category-agnostic; dormant until stage-2 supplies `days_to_event`. `<=0` disables |
+| Postponement unwind | `KALSHI_VOID_WINDOW_DAYS` | 2.0 | flatten a held **sports** pair (SELL both legs) when a postponement's makeup is past Kalshi's void window (or unknown) — before Kalshi voids. Logic in `unwind.rs`; stage-2 wires live statsapi detection |
 | Settle-clean | `REQUIRE_SETTLE_CLEAN` | true | only trade settlement-verified pairs (weather; econ/sports per recon) |
 | Key path | `KALSHI_RW_KEY_PATH` | unset | external path to the read-write key — loaded at runtime, never copied into the repo |
 
@@ -37,8 +38,10 @@ after the 0014 confirmatory run passes on multi-week data and the naked-unwind c
 ## Edge cases enforced (pre-trade gates, `src/risk.rs`)
 
 Kill-switch · WS-reconnect/seq-gap pause (never trade a rebuilding book) · **settlement-identity**
-(invariant #1 — econ/sports must be empirically verified, or sports via `ASSUME_SPORTS_SETTLED`) ·
-**game-proximity** (skip a sports arb >N days pre-game — capital velocity; all sports) · crossed/locked book (L12) · staleness (L13)
+(invariant #1 — econ/sports must be empirically verified, or via `ASSUME_{SPORTS,ECON}_SETTLED`) ·
+**event-proximity** (skip ANY arb >N days before its settlement event — capital velocity; weather
+exempt) · **postponement unwind** (flatten a held sports pair before Kalshi voids — `unwind.rs`) ·
+crossed/locked book (L12) · staleness (L13)
 · cross-venue **mid-divergence** (L1 bad-join/stale guard; **tighter category bound for econ twins**) ·
 non-positive edge (L11) · opt-in edge floor (L15) · **fat-edge toxicity haircut** (size down above the
 ~6c knee — fat edges are adversely-selected; knob to test speed-capture) · **toxicity-DIRECTION gate**
@@ -70,15 +73,19 @@ To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI
 
 ## What's built (stage 1) vs. next (stage 2)
 
-- **Built (this commit), std-only, safety-critical spine:** `types` (domain), `config` (safe defaults),
-  `risk` (all pre-trade gates + tests), `exec` (dry-run backend + the real Kalshi order-payload builder;
-  live POST is the seam), `ledger` (outcome-independent PnL + taker fees, ⚠️ fee parity-vs-`ledger.py`
-  still TODO before live), `main` (banner + hard prod gate + smoke).
+- **Built, std-only, safety-critical spine:** `types` (domain), `config` (safe defaults), `risk` (all
+  pre-trade gates + tests), `exec` (dry-run backend + the real Kalshi order-payload builder, pair-shaped
+  `submit_pair`; live POST is the seam), `ledger` (outcome-independent PnL + taker fees, ⚠️ fee
+  parity-vs-`ledger.py` still TODO before live), `unwind` (postponement-unwind decision + closing
+  orders), `main` (banner + hard prod gate + smoke).
 - **Stage 2 (owner env, adds tokio/tungstenite/reqwest/ed25519-dalek/rsa/serde):** the two venue WS
-  clients + auth (port `bot/kalshi_book.py` + the signers), the colisted matcher + signal port
-  (`bot/colisted_map.py` + `bot/ledger.py`, with a **parity test** asserting the Rust signal/fees match
-  the Python selftest vectors), the leg-sequencer/unwind, and the **live transport** (RSA-PSS/Ed25519
-  sign + HTTPS POST) that the owner runs with the read-write key.
+  clients + auth (port `bot/kalshi_book.py` + the signers, O(1) price-indexed book), the colisted
+  matcher + signal port (`bot/colisted_map.py` + `bot/ledger.py`, with a **parity test** asserting the
+  Rust signal/fees match the Python selftest vectors), the live inputs that wake the dormant gates
+  (`led_by` from book-history, `days_to_event` from event dates, live statsapi postponement detection),
+  the leg-sequencer, the **live transport** (RSA-PSS/Ed25519 sign + HTTPS POST), and — deferred to next
+  session — **edge-RATE allocation** (rank arbs by `edge ÷ lock-days`, the 0014-H2 arm) + **maker-side
+  execution mode** (rest the cheap leg on Kalshi + taker-hedge pmus — the maker study's +EV config).
 
 ⚠️ **Do not trade real money on the Rust path until** (a) the fee/signal parity test vs `bot/ledger.py`
 is green, (b) a demo-sandbox session is clean, and (c) the 0014 data validates the edge. The defaults
