@@ -55,9 +55,10 @@ Execution is **pair-shaped**: `ExecutionBackend::submit_pair` fires BOTH legs as
 backend fires them *concurrently* over two warm connections — serial legging ~doubles latency, the one
 in-code latency lever). Reviews: `tasks/_agent_bus/20260611-rust-review/`.
 
-Execution-time edge cases (stage 2, `legs.rs`): leg-fill timeout → **unwind leg A** at market; **MLB
-postponement** kill before Kalshi's void window; partial-fill handling; venue rejection / rate-limit
-backoff.
+Execution-time edge cases: **MLB postponement** kill before Kalshi's void window — BUILT (`postpone.rs`
++ `unwind.rs` + `main::handle_unwind`); venue rate-limit/5xx backoff — BUILT (`discovery::fetch_json`
+retry). NOT yet built (the naked-leg auto-recovery TODO): leg-fill-timeout retry + partial-fill handling
+— a one-legged live fill currently fail-closes (halt + log) rather than auto-unwinding the filled leg.
 
 ## Build / run
 

@@ -1,7 +1,8 @@
 //! Pre-trade risk gates — every edge case the project has learned, enforced BEFORE a single order is
 //! sent. These are the SYNCHRONOUS gates (evaluated on a complete dual-venue snapshot). The
-//! execution-TIME edge cases (leg-fill timeout -> unwind, MLB postponement kill, fill/partial
-//! handling) live in `legs.rs` (stage 2) and are referenced where relevant.
+//! execution-TIME edge cases live elsewhere: MLB-postponement detection + unwind in `postpone.rs` +
+//! `unwind.rs` + `main::handle_unwind` (BUILT); a one-legged live fill fail-closes in `main` (halt + log).
+//! Leg-fill-timeout retry / partial-fill handling are NOT yet built (the naked-leg auto-recovery TODO).
 
 use crate::config::Config;
 use crate::types::*;

@@ -3,9 +3,10 @@
 //! `"{ts_ms}{METHOD}{path}"`; the timestamp is millis since epoch. Keys load from external paths/env
 //! (never embedded). These produce the auth headers for both the WS handshakes and REST orders.
 //!
-//! ⚠️ Signature correctness is validated here by round-trip (sign -> verify), but ACCEPTANCE by the
-//! live venue (exact PSS salt length, header names) is confirmed only against the real endpoint —
-//! a stage-2 / owner-on-droplet check. The scheme matches the Python byte-for-byte (PSS salt = the
+//! Signature correctness is validated by round-trip (sign -> verify) AND acceptance is VERIFIED live
+//! (2026-06-11): the Kalshi RSA-PSS headers were accepted on demo + prod (signed balance reads + a live
+//! placed/cancelled order) and the pmus Ed25519 headers on GET + POST (proven by a bad-sig->401 vs
+//! good-body-less-sig->past-auth control). The scheme matches the Python byte-for-byte (PSS salt = the
 //! SHA-256 digest length, 32).
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};

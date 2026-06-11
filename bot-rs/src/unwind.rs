@@ -8,8 +8,9 @@
 //! So: on a postponement whose reschedule isn't CONFIRMED inside Kalshi's window, **unwind both legs at
 //! market before Kalshi voids.**
 //!
-//! Stage-1 (here): the DECISION + the closing orders — pure and tested. Stage-2 wires live detection
-//! (statsapi poll, `probe_mlb_postpone.py`), the held-position tracking, and the actual firing.
+//! This module: the DECISION + the closing orders — pure and tested. The live detection (statsapi poll,
+//! `postpone.rs`), held-position tracking (`main`), and the actual firing (`main::handle_unwind`) are
+//! BUILT + wired. The statsapi /teams abbrev join was verified live (30/30 MLB clubs match, 2026-06-11).
 
 use crate::types::*;
 

@@ -5,10 +5,11 @@
 //! pair = `1 - cost_yes - cost_no` regardless of how the world resolves. `Pnl::book_pair` asserts that
 //! self-verifying property (the same invariant `bot/ledger.py` proves).
 //!
-//! ⚠️ FEES — VERIFY BEFORE LIVE. The coefficients below match `research/fee-pin-2026-06-10.md` and the
-//! venue audit, but `bot/ledger.py` remains the source of truth until a parity test asserts these Rust
-//! fees reproduce its selftest vectors (a stage-2 task). Do NOT trade real money on the Rust fee path
-//! until that parity check is green — a wrong fee silently turns a +EV arb into a loss (L10/L15).
+//! FEES — PARITY TEST IS GREEN. The coefficients below match `research/fee-pin-2026-06-10.md` + the
+//! venue audit, AND `signal::tests::fee_parity_with_ledger_py` + this module's tests assert the Rust fees
+//! reproduce `bot/ledger.py`'s selftest vectors (Kalshi 100@.5=175c, pmus=125c, the marginal-vs-ceil
+//! split, pmus linear-no-ceil). A wrong fee silently turns a +EV arb into a loss (L10/L15), so the parity
+//! test is the standing gate — keep it green.
 
 /// Per-contract taker coefficient `f`: fee(dollars) = `f * p * (1-p)` per contract. Kalshi taker
 /// 0.07 -> 1.75c at p=0.5; pmus taker 0.05 -> 1.25c at p=0.5 (fee-pin 2026-06-10). The per-ORDER rounding

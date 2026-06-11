@@ -4,8 +4,9 @@
 //!   * 1-contract / tiny-notional caps + global kill-switch
 //!   * the read-write key is loaded from the owner's path at RUNTIME; never read/copied by Claude
 //!
-//! Live order submission runs in the OWNER's environment (Claude's sandbox blocks real submission).
-//! See `bot-rs/README.md`.
+//! Live order submission is a deliberate OWNER action gated by the safe-by-default rails above — NOT
+//! because the sandbox blocks it (verified 2026-06-11: this environment reaches both venues with auth
+//! and placed+cancelled live 1¢ orders). See `bot-rs/README.md`.
 #![allow(dead_code)] // stage-1 spine: several domain fields/variants are wired in stage 2 (venue I/O)
 
 mod auth;

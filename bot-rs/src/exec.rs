@@ -57,7 +57,7 @@ impl PairAck {
 /// `&mut self`. Shared- access correctness is preserved because no method mutates backend state.
 pub trait ExecutionBackend: Send + Sync {
     /// Fire BOTH legs of a hedged pair. The unit of execution is the PAIR — callers must NEVER
-    /// serialize the legs: serial legging ~doubles effective latency (measured serial floor p50 148 ms
+    /// serialize the legs: serial legging ~doubles effective latency (measured serial floor p50 161 ms
     /// vs ~86 ms concurrent). The LIVE backend fires them CONCURRENTLY over two warm, pre-authed
     /// connections (stage-2, `tokio::join!`); the dry-run backend logs both. This pair-shaped signature
     /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
@@ -235,7 +235,7 @@ impl LiveBackend {
 
     /// Send ONE signed leg to its venue and parse the ack. Async; the two legs are joined concurrently
     /// by `submit_pair`. A Kalshi leg signs RSA-PSS over `{ts}POST{path}`; a pmus leg signs Ed25519 over
-    /// the same canonical string (body-signing unverified — see `build_pmus_payload`).
+    /// the same canonical string (body-less `{ts}POST{path}` signing VERIFIED live for POST 2026-06-11).
     async fn post_leg(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
         let keys = self.keys.as_ref().ok_or(ExecError::KeysUnavailable)?;
         let ts = crate::auth::now_ms_for_sign();
@@ -288,7 +288,8 @@ impl LiveBackend {
         if !status.is_success() {
             return Err(ExecError::Rejected(format!("{} {}", status.as_u16(), text.chars().take(160).collect::<String>())));
         }
-        // parse the venue order id out of the ack (Kalshi: {"order":{"order_id":..}}; pmus varies).
+        // parse the venue order id out of the ack — VERIFIED live 2026-06-11 (Kalshi: {"order":{"order_id":..}}
+        // parsed from a real placed order; pmus: top-level {"id":..} from a real BUY_LONG/BUY_SHORT).
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         let venue_order_id = v
             .get("order")
@@ -310,7 +311,7 @@ impl LiveBackend {
     /// runtime otherwise) — keeping `submit_pair` synchronous + the trait dyn-compatible.
     fn run_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
         let fut = async {
-            // CONCURRENT — never serial: serial legging ~doubles effective latency (148ms vs ~86ms p50).
+            // CONCURRENT — never serial: serial legging ~doubles effective latency (161ms vs ~86ms p50).
             let (ra, rb) = tokio::join!(self.post_leg(a), self.post_leg(b));
             PairAck { a: ra, b: rb }
         };
@@ -330,9 +331,10 @@ impl LiveBackend {
 impl ExecutionBackend for LiveBackend {
     fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
         // Fire BOTH legs CONCURRENTLY (tokio::join! inside run_pair) — each RSA-PSS (Kalshi) / Ed25519
-        // (pmus) signed. Concurrency is the one latency lever the code owns (serial ~148 ms p50 ->
+        // (pmus) signed. Concurrency is the one latency lever the code owns (serial ~161 ms p50 ->
         // concurrent ~86 ms). Returns KeysUnavailable per-leg when the signing keys aren't loaded
-        // (Claude's sandbox / a dry-run-only build), so this never sends real money here.
+        // (a dry-run/no-creds build) — that absence, plus the dry-run default, is what keeps real money
+        // unsent (NOT a sandbox: the environment can reach the venues — verified live).
         if self.keys.is_none() {
             return PairAck {
                 a: Err(ExecError::KeysUnavailable),
@@ -342,9 +344,10 @@ impl ExecutionBackend for LiveBackend {
         self.run_pair(a, b)
     }
     fn cancel(&self, client_order_id: &str) -> Result<(), ExecError> {
-        // Kalshi cancel is DELETE /portfolio/orders/{order_id}; the live unwind/leg-fill-timeout path
-        // (stage-2 legs.rs) will need the venue order_id from the ack, not the client id. Until that
-        // tracking exists, refuse loudly rather than pretend success.
+        // Cancel endpoints VERIFIED live 2026-06-11: Kalshi `DELETE /trade-api/v2/portfolio/orders/{order_id}`
+        // (200) and pmus `POST /v1/order/{orderId}/cancel` with a `{marketSlug}` body (200). What's still
+        // unbuilt is the venue-order-id TRACKING (the ack's id isn't yet stored per position), so this
+        // refuses loudly rather than pretend — wiring the id store is the remaining cancel work.
         let _ = client_order_id;
         Err(ExecError::Rejected("cancel needs venue order_id (stage-2 leg tracking)".into()))
     }
