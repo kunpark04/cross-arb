@@ -22,6 +22,9 @@ use crate::matcher::{self, Ineq};
 use crate::types::Cat;
 use serde_json::Value;
 
+// The gateway catalog host (public, no-auth). SLUG IDENTITY VERIFIED LIVE (2026-06-11), not assumed: a
+// `slug` discovered here is the SAME `marketSlug` the ORDER endpoint (`api.polymarket.us/v1/orders`,
+// `exec::LiveBackend::pmus_base`) accepts — gateway-catalog slugs placed real BUY_LONG/BUY_SHORT orders.
 const PM_MARKETS: &str = "https://gateway.polymarket.us/v1/markets";
 // Unify on the bot's Kalshi host (CLAUDE.md: "unify Kalshi host"; venue.rs uses api.elections.kalshi.com).
 const KALSHI_MARKETS: &str = "https://api.elections.kalshi.com/trade-api/v2/markets";
@@ -45,6 +48,12 @@ pub struct Pair {
     pub cluster: String,     // correlated-exposure key (city-date / family-period / game)
     pub settle_clean: bool,  // weather=true (empirically verified); econ/sports=false (recon open)
     pub days_to_event: Option<f64>,
+    /// pmus `orderPriceMinTickSize` (a number, e.g. 0.001) — the price tick a pmus ORDER must be a multiple
+    /// of. `None` when the catalog omits it (the leg builder then keeps the whole-cent price unquantized).
+    pub pm_min_tick: Option<f64>,
+    /// pmus `minimumTradeQty` (can be < 1 or > 1) — the minimum order size pmus accepts. A configured qty
+    /// below this would REJECT (leaving a naked leg), so the leg builder skips the fire. `None` = no minimum known.
+    pub pm_min_qty: Option<f64>,
 }
 
 /// What a discovery pass produces. `pairs` is the subscribable 1:1 set; the rest is the coverage report
@@ -500,6 +509,7 @@ where
             let Some(kbuckets) = kby.get(&date) else { continue };
             match matcher::match_weather(&slug, kbuckets, city, &date) {
                 Some(m) => {
+                    let (pm_min_tick, pm_min_qty) = pm_order_constraints(pm);
                     d.pairs.push(Pair {
                         slug,
                         kalshi: m.kalshi,
@@ -508,6 +518,8 @@ where
                         cluster: m.cluster,
                         settle_clean: m.settle_clean,
                         days_to_event: m.days_to_event,
+                        pm_min_tick,
+                        pm_min_qty,
                     });
                     d.weather_pairs += 1;
                 }
@@ -555,6 +567,7 @@ where
             };
             match matcher::match_econ(&q, floors, labels) {
                 Some(m) => {
+                    let (pm_min_tick, pm_min_qty) = pm_order_constraints(pm);
                     d.pairs.push(Pair {
                         slug,
                         kalshi: m.kalshi,
@@ -563,6 +576,8 @@ where
                         cluster: m.cluster,
                         settle_clean: m.settle_clean,
                         days_to_event: m.days_to_event,
+                        pm_min_tick,
+                        pm_min_qty,
                     });
                     d.econ_pairs += 1;
                 }
@@ -624,6 +639,7 @@ where
                 (Some(today), Some(game)) => Some((game - today) as f64),
                 _ => None,
             };
+            let (pm_min_tick, pm_min_qty) = pm_order_constraints(pm);
             d.pairs.push(Pair {
                 slug,
                 kalshi: ta,
@@ -632,6 +648,8 @@ where
                 cluster: format!("{league}-{date}"),
                 settle_clean: false, // only a game that COMPLETES on schedule settles identically (void tail)
                 days_to_event,
+                pm_min_tick,
+                pm_min_qty,
             });
             d.sports_pairs += 1;
         }
@@ -689,6 +707,15 @@ fn field_f64(m: &Value, key: &str) -> Option<f64> {
 }
 fn field_i64(m: &Value, key: &str) -> Option<i64> {
     field_f64(m, key).map(|f| f.round() as i64)
+}
+
+/// The pmus market object's order constraints: `(orderPriceMinTickSize, minimumTradeQty)` — both a number
+/// (the catalog sends `orderPriceMinTickSize` e.g. 0.001, and `minimumTradeQty` which can be <1 or >1). A
+/// missing/non-positive value -> `None` (the leg builder then leaves the price unquantized / skips the
+/// min-qty check). Threaded onto `Pair` -> `LivePair` so the leg builder can quantize + size-check a pmus leg.
+fn pm_order_constraints(m: &Value) -> (Option<f64>, Option<f64>) {
+    let pos = |v: Option<f64>| v.filter(|x| x.is_finite() && *x > 0.0);
+    (pos(field_f64(m, "orderPriceMinTickSize")), pos(field_f64(m, "minimumTradeQty")))
 }
 
 // ============================================================================================
@@ -978,6 +1005,34 @@ mod tests {
         // COVERAGE: philadelphia is the unmapped climate city.
         assert_eq!(d.weather_cities_unmapped, vec!["phl".to_string()]);
         assert!(!d.truncated);
+    }
+
+    /// FIX C: the pmus market object's `orderPriceMinTickSize` + `minimumTradeQty` are parsed onto the Pair
+    /// (threaded to the leg builder so a pmus leg can be quantized + size-checked). A market omitting them
+    /// yields `None` (leg builder leaves the price unquantized / skips the min-qty check). Checked on weather.
+    #[test]
+    fn assemble_threads_pmus_order_constraints_onto_pair() {
+        // a weather bucket WITH order constraints (tick 0.001, min qty 5) + one WITHOUT them.
+        let pm_cat = vec![
+            pm("tc-temp-sfohigh-2026-06-09-gte64lt65f", "climate", r#""orderPriceMinTickSize":0.001,"minimumTradeQty":5"#),
+            pm("tc-temp-sfohigh-2026-06-09-gte72f", "climate", ""),
+        ];
+        fn stub(series: &str) -> Vec<Value> {
+            if series == "KXHIGHTSFO" {
+                vec![
+                    serde_json::from_str(r#"{"ticker":"KXHIGHTSFO-26JUN09-B64","floor_strike":64,"cap_strike":65,"yes_sub_title":"64 to 65"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXHIGHTSFO-26JUN09-T72","floor_strike":71,"yes_sub_title":"72 or above"}"#).unwrap(),
+                ]
+            } else {
+                vec![]
+            }
+        }
+        let d = assemble(&pm_cat, false, None, stub);
+        let with = d.pairs.iter().find(|p| p.slug.ends_with("gte64lt65f")).expect("constrained bucket paired");
+        assert_eq!(with.pm_min_tick, Some(0.001), "orderPriceMinTickSize parsed");
+        assert_eq!(with.pm_min_qty, Some(5.0), "minimumTradeQty parsed (can be >1)");
+        let without = d.pairs.iter().find(|p| p.slug.ends_with("gte72f")).expect("plain bucket paired");
+        assert_eq!((without.pm_min_tick, without.pm_min_qty), (None, None), "absent constraints -> None");
     }
 
     /// GDP keys on the FULL-DATE period (YYMMMDD) on BOTH sides — the Kalshi period parser must keep the

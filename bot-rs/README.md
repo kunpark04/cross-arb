@@ -57,8 +57,12 @@ in-code latency lever). Reviews: `tasks/_agent_bus/20260611-rust-review/`.
 
 Execution-time edge cases: **MLB postponement** kill before Kalshi's void window — BUILT (`postpone.rs`
 + `unwind.rs` + `main::handle_unwind`); venue rate-limit/5xx backoff — BUILT (`discovery::fetch_json`
-retry). NOT yet built (the naked-leg auto-recovery TODO): leg-fill-timeout retry + partial-fill handling
-— a one-legged live fill currently fail-closes (halt + log) rather than auto-unwinding the filled leg.
+retry). **Naked-leg AUTO-RECOVERY — BUILT** (`main::recover_naked_leg`): a one-legged live fill CANCELS the
+resting leg (`backend.cancel`) + FLATTENS the filled leg with a single marketable SELL read from its live
+book (the new single-leg `ExecutionBackend::submit`), recording NO hedge; the halt is the BACKSTOP only —
+when the flatten can't be priced (one-sided book) or the recovery SELL itself doesn't fill (the leg stays
+naked → `SubmitKind::Recovery` arm engages the kill-switch for a manual flatten). Still TODO: a leg-fill
+TIMEOUT (cancel a slow-but-not-yet-rejected resting leg before it fills late) and true partial-fill sizing.
 
 ## Build / run
 
@@ -72,7 +76,7 @@ deploy target is **Linux**, where none of this applies (no `windows-sys`, no min
 ```bash
 cd bot-rs
 cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
-cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind (112 tests)
+cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind + naked-leg recovery (123 tests)
 cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
 cargo run -- --smoke   # force the offline smoke even with creds present
 ```
@@ -82,7 +86,7 @@ To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI
 
 ## What's built (stages 1–2.5, complete) vs. what remains (owner env)
 
-**Built + tested (112 tests, all green, clippy-clean; dry-run-default, live gated). A full-engine
+**Built + tested (123 tests, all green, clippy-clean; dry-run-default, live gated). A full-engine
 adversarial review (5 parallel subsystem reviewers + an independent review of the loop rewrite) hardened
 the concurrency core, the gates, and the transport — see `tasks/_agent_bus/20260611-engine-review/`:**
 - **Safety-critical spine (std-only):** `types`, `config` (safe defaults), `risk` (all pre-trade gates
@@ -127,9 +131,11 @@ the concurrency core, the gates, and the transport — see `tasks/_agent_bus/202
 
 **Still remains (genuinely blocked, not skipped):**
 - **`SELL_*` pmus intents** — doc-derived (same enum family as the live-verified `BUY_*`); can't be live-probed
-  within a tiny-capital cap (a naked short isn't bounded by a 1¢ price). Exercised naturally on the first real unwind.
-- **Naked-leg auto-recovery** — a one-legged live fill currently fail-closes (halt + log); auto-unwinding the
-  filled leg + leg-fill-timeout/partial handling are still TODO.
+  within a tiny-capital cap (a naked short isn't bounded by a 1¢ price). Exercised naturally on the first real
+  unwind OR the first naked-leg recovery flatten (both fire `SELL_*`).
+- **Naked-leg auto-recovery — BUILT** (was TODO): a one-legged live fill cancels the resting leg + flattens the
+  filled leg (single-leg `submit` SELL), halt as the backstop. Still TODO: a leg-fill TIMEOUT (cancel a slow
+  resting leg before a LATE fill) + true partial-fill sizing (today a partial counts as not-filled → recovery).
 - **Sports settlement recon** — endDates ~06-23/25 (date-gated; can't complete now). Non-MLB leagues have no
   auto-postpone source yet (statsapi is MLB-only).
 - **The dominant gate — edge validation** — the 0014 confirmatory run needs multi-week data that doesn't

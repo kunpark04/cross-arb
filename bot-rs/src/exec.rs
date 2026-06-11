@@ -27,9 +27,10 @@ pub struct Ack {
     pub venue_order_id: String,
     /// TRUE iff the FULL requested qty actually FILLED — a 2xx create is acceptance, NOT a fill. Set by
     /// parsing the venue body (`post_leg`): Kalshi reports fill synchronously (order `status`=executed +
-    /// fill count >= count); pmus needs `synchronousExecution` and reports fills/`executions[]`. A
-    /// resting/working/0-fill leg is `false` — it is NOT a completed hedge leg. Simulated (dry-run) acks
-    /// are `true` (treated as filled, unchanged).
+    /// fill count >= count); pmus needs `synchronousExecution` and reports it via `cumQuantity` /
+    /// `leavesQuantity==0` / summed `executions[].lastShares` / `state`=ORDER_STATE_FILLED (field names
+    /// pinned to the OpenAPI orders-schema — see `pmus_order_filled`). A resting/working/0-fill leg is
+    /// `false` — it is NOT a completed hedge leg. Simulated (dry-run) acks are `true` (unchanged).
     pub filled: bool,
     pub simulated: bool,
 }
@@ -84,6 +85,11 @@ pub trait ExecutionBackend: Send + Sync {
     /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
     /// highest-leverage latency item from the rust review, and the only latency lever the code controls.
     fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
+    /// Fire ONE leg on its own. The pair is the normal unit (`submit_pair`); this single-leg primitive
+    /// exists for the NAKED-LEG RECOVERY (`main::recover_naked_leg`): when only one entry leg filled, the
+    /// other is cancelled and the filled leg is FLATTENED with a single marketable SELL — there is no second
+    /// leg to fire. Same per-leg signing/parse as one half of `submit_pair`.
+    fn submit(&self, intent: &OrderIntent) -> Result<Ack, ExecError>;
     /// Cancel a resting order by its persisted venue order id (Kalshi `DELETE /portfolio/orders/{id}`;
     /// pmus `POST /v1/order/{id}/cancel` with a `{marketSlug}` body). Needs the `CancelTarget` (venue + id
     /// + slug) the ack persisted — a `client_order_id` alone can't reach either endpoint.
@@ -116,6 +122,9 @@ impl ExecutionBackend for DryRunBackend {
             a: self.log_leg(a),
             b: self.log_leg(b),
         }
+    }
+    fn submit(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
+        self.log_leg(intent) // single-leg recovery flatten: logs + returns a simulated filled ack
     }
     fn cancel(&self, target: &CancelTarget) -> Result<(), ExecError> {
         println!("[DRY-RUN] would cancel: {:?} order_id={} market={}", target.venue, target.venue_order_id, target.market);
@@ -194,40 +203,48 @@ fn kalshi_order_filled(v: &serde_json::Value, qty: u32) -> bool {
 
 /// Did the PMUS order FILL the full requested `qty`? With `synchronousExecution` (set in
 /// `build_pmus_payload`) the create blocks until the order resolves. A bare 2xx WITHOUT fill evidence is
-/// acceptance only ("accepted" != "filled"). FILLED iff the cumulative filled qty >= `qty`, read from
-/// whichever fill field the synchronous body carries: `cumQuantity`, or `quantity - remainingQty`, or the
-/// summed `executions[].{shares,lastShares,quantity}`, or a terminal `FILL` status. ANY of those proving a
-/// full fill -> true; otherwise (the documented `{orderId,intent,...}` accept-only body) -> false.
+/// acceptance only ("accepted" != "filled"). FILLED iff ANY of these prove the full requested qty filled:
+/// (1) `cumQuantity >= qty` (cumulative filled qty); (2) `leavesQuantity == 0 AND cumQuantity > 0` (nothing
+/// left unfilled, and something did fill); (3) summed `executions[].lastShares` (or `shares`/`quantity`)
+/// `>= qty`; (4) a terminal `ORDER_STATE_FILLED` `state` (not `PARTIALLY_FILLED`).
+/// Otherwise (the accept-only `{id,intent,...}` body, or any ambiguity) -> false (FAIL SAFE — absence of
+/// fill evidence must NEVER be read as a fill on the money path; a spurious "not filled" only trips a halt,
+/// a fabricated "filled" leaves a real naked hedge). A top-level `{"order":{..}}` wrapper is unwrapped first.
 ///
-/// DOC NOTE (context7 /websites/polymarket_us, 2026-06-11): the *documented* single-create success body is
-/// `{orderId,intent,outcomeSide,action}` with NO inline `executions[]`; per-order fill/accept/reject events
-/// are authoritatively delivered on the ORDER STREAM (`orderSubscriptionUpdate.execution`, field
-/// `lastShares`; execution `type` FILL/PARTIAL_FILL). Treating absence-of-fill-evidence as `false` is the
-/// SAFE reading either way. TODO(stage-2): reconcile the authoritative fill via the order-stream/positions
-/// endpoint rather than the synchronous create body alone before scaling past 1 contract.
+/// DOC NOTE (OpenAPI orders-schema.json, docs.polymarket.us, 2026-06-11): authoritative field names PINNED.
+/// `Order` carries `cumQuantity`/`leavesQuantity`/`quantity` (all number/double) + `state` (enum:
+/// `ORDER_STATE_FILLED`/`ORDER_STATE_PARTIALLY_FILLED`/…); `GetOrderResponse` wraps it as `{"order":{..}}`.
+/// The synchronous `CreateOrderResponse` is `{"id":string,"executions":[Execution]}` with `executions`
+/// present "if synchronous execution was requested" — each `Execution.lastShares` is a STRING (live-verified
+/// 2026-06-11: `BUY_LONG`/`BUY_SHORT` created on `/v1/orders` returned `{id,executions:[{lastShares,lastPx}]}`).
+/// (The schema does NOT define `remainingQty` or `orderStatus`; `leavesQuantity`/`state` are the real names.)
 fn pmus_order_filled(v: &serde_json::Value, qty: u32) -> bool {
     let q = qty as f64;
-    // 1) explicit cumulative filled qty.
+    let v = v.get("order").unwrap_or(v); // tolerate the GetOrderResponse `{"order":{..}}` wrapper
+    // 1) explicit cumulative filled qty (Order.cumQuantity).
     if let Some(cum) = v.get("cumQuantity").and_then(num_or_str) {
         if cum >= q {
             return true;
         }
     }
-    // 2) quantity - remainingQty (fully filled when nothing remains of the requested qty).
-    if let Some(rem) = v.get("remainingQty").and_then(num_or_str) {
-        let req = v.get("quantity").and_then(num_or_str).unwrap_or(q);
-        if rem <= 0.0 && req >= q {
+    // 2) leavesQuantity == 0 AND cumQuantity > 0: nothing left unfilled and at least some fill occurred
+    //    (a brand-new resting order has cumQuantity 0, so the cumQuantity>0 guard keeps acceptance != fill).
+    //    `remainingQty` is accepted as a defensive alias (not in the schema, but harmless if a body carries it).
+    if let Some(leaves) = v.get("leavesQuantity").or_else(|| v.get("remainingQty")).and_then(num_or_str) {
+        let cum = v.get("cumQuantity").and_then(num_or_str).unwrap_or(0.0);
+        if leaves <= 0.0 && cum > 0.0 && cum >= q {
             return true;
         }
     }
-    // 3) sum the executions' shares (the task-named array; tolerate share-field aliases, string or number).
+    // 3) sum the executions' shares (the synchronous CreateOrderResponse array; `lastShares` is the schema
+    //    field — a STRING — with `shares`/`quantity` tolerated as aliases, number or string).
     if let Some(execs) = v.get("executions").and_then(|e| e.as_array()) {
         if !execs.is_empty() {
             let total: f64 = execs
                 .iter()
                 .filter_map(|e| {
-                    e.get("shares")
-                        .or_else(|| e.get("lastShares"))
+                    e.get("lastShares")
+                        .or_else(|| e.get("shares"))
                         .or_else(|| e.get("quantity"))
                         .and_then(num_or_str)
                 })
@@ -237,15 +254,16 @@ fn pmus_order_filled(v: &serde_json::Value, qty: u32) -> bool {
             }
         }
     }
-    // 4) a terminal FILL status string, if the body carries one.
-    let status = v
-        .get("orderStatus")
+    // 4) a terminal FILLED `state` (the schema enum field), if the body carries one. `ORDER_STATE_FILLED`
+    //    contains "FILL" and not "PARTIAL"; `ORDER_STATE_PARTIALLY_FILLED` contains "PARTIAL" -> not a full fill.
+    let state = v
+        .get("state")
+        .or_else(|| v.get("orderStatus"))
         .or_else(|| v.get("status"))
-        .or_else(|| v.get("executionType"))
         .and_then(|s| s.as_str())
         .unwrap_or("")
         .to_ascii_uppercase();
-    status.contains("FILL") && !status.contains("PARTIAL")
+    state.contains("FILL") && !state.contains("PARTIAL")
 }
 
 impl LiveBackend {
@@ -293,6 +311,11 @@ impl LiveBackend {
 
     /// The pmus authenticated REST base (orders host). Demo/prod share the same host on pmus's retail
     /// surface; the sandbox/prod distinction is the Kalshi side (pmus has no documented demo host).
+    ///
+    /// SLUG IDENTITY — VERIFIED LIVE (2026-06-11), not assumed: the `marketSlug` discovery pulls from the
+    /// GATEWAY catalog (`gateway.polymarket.us/v1/markets`, see `discovery::PM_MARKETS`) is the SAME slug the
+    /// ORDER endpoint here (`api.polymarket.us/v1/orders`) accepts — gateway-catalog slugs placed real
+    /// `BUY_LONG`/`BUY_SHORT` orders on `api.polymarket.us`. So a discovered slug is order-routable as-is.
     pub fn pmus_base(&self) -> &'static str {
         "https://api.polymarket.us"
     }
@@ -486,6 +509,19 @@ impl LiveBackend {
         }
     }
 
+    /// Drive ONE signed POST to completion off the ambient runtime (same dyn-compat pattern as `run_pair`)
+    /// — the single-leg recovery flatten. No fabricated concurrency: it's intrinsically one order.
+    fn run_one(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
+        let fut = self.post_leg(intent);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt.block_on(fut),
+                Err(_) => Err(ExecError::TransportNotWired),
+            },
+        }
+    }
+
     /// The cancel HTTP request line + body for `target` — PURE (no signing, no I/O) so it is unit-testable
     /// without keys. Kalshi: `DELETE /trade-api/v2/portfolio/orders/{id}`, empty body. pmus: `POST
     /// /v1/order/{id}/cancel` with a `{"marketSlug":..}` body (the marketSlug is REQUIRED by the schema and
@@ -577,6 +613,14 @@ impl ExecutionBackend for LiveBackend {
             };
         }
         self.run_pair(a, b)
+    }
+    fn submit(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
+        // single-leg recovery flatten. KeysUnavailable when keys aren't loaded (dry-run/no-creds build) —
+        // same gate as submit_pair, so a sandbox build never sends and the recovery falls back to halt.
+        if self.keys.is_none() {
+            return Err(ExecError::KeysUnavailable);
+        }
+        self.run_one(intent)
     }
     fn cancel(&self, target: &CancelTarget) -> Result<(), ExecError> {
         // Cancel endpoints VERIFIED live 2026-06-11: Kalshi `DELETE /trade-api/v2/portfolio/orders/{order_id}`
@@ -852,32 +896,43 @@ mod tests {
         assert!(kalshi_order_filled(&flat, 2));
     }
 
-    /// FIX 1: a pmus create that returns ONLY an accept body (`{orderId,intent,..}` — no executions/cum
-    /// qty) parses to `filled:false` ("accepted" != "filled"). Bodies that DO prove a full fill (cumQuantity,
-    /// remainingQty==0, summed executions shares, or a terminal FILL status) parse to `filled:true`.
+    /// FIX B: pmus fill-detection pinned to the OpenAPI schema field names (orders-schema.json, 2026-06-11).
+    /// REALISTIC bodies: the synchronous `CreateOrderResponse` (`{id,executions:[{lastShares,lastPx}]}`) and
+    /// the `Order` object (`cumQuantity`/`leavesQuantity`/`state`, wrapped `{"order":{..}}` by GetOrderResponse).
+    /// Fully-filled -> true; accepted-but-0 -> false; partial (`cumQuantity < qty`) -> false.
     #[test]
     fn pmus_accepted_without_executions_is_not_filled() {
-        // the documented accept-only success body — no fill evidence -> not filled (the core bug guard).
-        let accepted: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","intent":"ORDER_INTENT_BUY_LONG","outcomeSide":"OUTCOME_SIDE_YES","action":"ORDER_ACTION_BUY"}"#).unwrap();
+        // the documented accept-only CreateOrderResponse — id only, no executions -> not filled (core bug guard).
+        let accepted: serde_json::Value = serde_json::from_str(r#"{"id":"o1","intent":"ORDER_INTENT_BUY_LONG","outcomeSide":"OUTCOME_SIDE_YES","action":"ORDER_ACTION_BUY"}"#).unwrap();
         assert!(!pmus_order_filled(&accepted, 2), "a bare accept body is not a fill");
         // an explicitly empty executions array is also not a fill.
-        let empty_exec: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","executions":[]}"#).unwrap();
+        let empty_exec: serde_json::Value = serde_json::from_str(r#"{"id":"o1","executions":[]}"#).unwrap();
         assert!(!pmus_order_filled(&empty_exec, 1), "empty executions[] is not a fill");
-        // cumQuantity >= requested -> filled.
-        let cum: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","cumQuantity":"2"}"#).unwrap();
+        // 1) cumQuantity >= requested -> filled (number, per the schema's double type).
+        let cum: serde_json::Value = serde_json::from_str(r#"{"id":"o1","cumQuantity":2}"#).unwrap();
         assert!(pmus_order_filled(&cum, 2));
         assert!(!pmus_order_filled(&cum, 3), "cumQuantity below requested is a partial, not full");
-        // quantity - remainingQty: nothing remains of the requested qty -> filled.
-        let rem: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","quantity":2,"remainingQty":0}"#).unwrap();
-        assert!(pmus_order_filled(&rem, 2));
-        // summed executions shares (the task-named array) >= requested -> filled.
-        let execs: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","executions":[{"shares":"1"},{"shares":"1"}]}"#).unwrap();
+        // 2) leavesQuantity == 0 AND cumQuantity > 0 -> filled (the schema's remaining-qty field).
+        let leaves: serde_json::Value = serde_json::from_str(r#"{"id":"o1","quantity":2,"cumQuantity":2,"leavesQuantity":0}"#).unwrap();
+        assert!(pmus_order_filled(&leaves, 2));
+        // leavesQuantity 0 but cumQuantity 0 (a never-filled state) is NOT a fill — acceptance != fill.
+        let leaves0: serde_json::Value = serde_json::from_str(r#"{"id":"o1","cumQuantity":0,"leavesQuantity":0}"#).unwrap();
+        assert!(!pmus_order_filled(&leaves0, 1), "leaves=0 with cum=0 is not a fill");
+        // 3) summed executions.lastShares (STRING per the schema) >= requested -> filled (the live create shape).
+        let execs: serde_json::Value = serde_json::from_str(r#"{"id":"o1","executions":[{"lastShares":"1","lastPx":{"value":"0.07","currency":"USD"}},{"lastShares":"1","lastPx":{"value":"0.07","currency":"USD"}}]}"#).unwrap();
         assert!(pmus_order_filled(&execs, 2));
-        // a terminal FILL status -> filled; PARTIAL_FILL -> not a full fill.
-        let fill: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","orderStatus":"ORDER_STATUS_FILLED"}"#).unwrap();
+        assert!(!pmus_order_filled(&execs, 3), "summed lastShares below requested is a partial");
+        // 4) terminal state ORDER_STATE_FILLED -> filled; ORDER_STATE_PARTIALLY_FILLED -> not a full fill.
+        let fill: serde_json::Value = serde_json::from_str(r#"{"id":"o1","state":"ORDER_STATE_FILLED"}"#).unwrap();
         assert!(pmus_order_filled(&fill, 5));
-        let partial: serde_json::Value = serde_json::from_str(r#"{"orderId":"o1","executionType":"EXECUTION_TYPE_PARTIAL_FILL"}"#).unwrap();
+        let partial: serde_json::Value = serde_json::from_str(r#"{"id":"o1","state":"ORDER_STATE_PARTIALLY_FILLED","cumQuantity":2}"#).unwrap();
         assert!(!pmus_order_filled(&partial, 5), "a partial fill is not the full requested qty");
+        // the GetOrderResponse `{"order":{..}}` wrapper is unwrapped (an Order with a full cumQuantity -> filled).
+        let wrapped: serde_json::Value = serde_json::from_str(r#"{"order":{"cumQuantity":2,"leavesQuantity":0,"state":"ORDER_STATE_FILLED"}}"#).unwrap();
+        assert!(pmus_order_filled(&wrapped, 2), "the {{order:..}} wrapper must be unwrapped");
+        // remainingQty is still accepted as a defensive alias (a body that happens to carry it).
+        let rem: serde_json::Value = serde_json::from_str(r#"{"id":"o1","cumQuantity":2,"remainingQty":0}"#).unwrap();
+        assert!(pmus_order_filled(&rem, 2));
     }
 
     /// FIX 1: `both_filled()` requires BOTH legs Ok AND filled. One Ok-but-resting (accepted, not filled)
