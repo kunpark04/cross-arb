@@ -350,3 +350,20 @@ orientation (L21 applied to *analysis*, not just the matcher). When a quick scri
 production, **suspect the script first** — here all 10 "divergences" were the script's `≥` assumption, 0
 were real. Interrogate the raw object before believing a divergence (L3/L18/L21/L23 — the reflex held: the
 single-YES-bucket pattern indicted the parse, not the venues).
+
+## L25 — A "masking" command can leak the very secret it masks; never route key material through stdout
+
+While locating creds I ran a one-liner that *intended* to mask values — for lines without `=` it printed
+only `l[:12]+'...'`. But the pmus Ed25519 **secret is base64 and ends in `=` padding**, so the line *did*
+contain `=`; the code took `l.split('=')[0]`, which returned the entire ~87-char secret body and printed it
+to the terminal — straight into the conversation transcript. The mask was defeated by the data's own
+format. The key had to be treated as compromised and rotated.
+
+**Rule:** **never run a command that passes secret material through stdout at all** — not even "masked."
+Masking logic is one format-quirk away from failing open (here, base64 `=`). To USE a key: load it
+**file → env/var** inside a script that prints *nothing* about the value (only "wrote X to .env" / a status
+code), exactly as `verify_pmus_auth.py` does (it prints `secret length N, not shown` + a masked key-id,
+never the bytes). To inspect a key file's *shape*, print line COUNT and field NAMES only, never a slice of
+any value. If a secret is ever exposed: **say so immediately and unmistakably, and recommend rotation** —
+don't bury it or assume a slice was safely partial (base64 padding makes "partial" recoverable). Reading
+`.pem`/secret files with `ls` (sizes) is fine; `cat`/`head`/`grep`-context on them is not.

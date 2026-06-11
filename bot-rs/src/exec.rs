@@ -1,10 +1,13 @@
 //! Execution backends.
 //!
 //! `DryRunBackend` is the DEFAULT and never touches the network — it logs the intent and returns a
-//! simulated ack. `LiveBackend` builds the REAL venue order payload AND (stage 2) fires the signed
-//! HTTPS POST — but it is run only in the **owner's** environment with the read-write key, because
-//! Claude's sandbox blocks real-money submission. Decision 0015 seam: the decision/gating logic is
-//! real and testable; the live send is gated to `EXECUTION_MODE=live` and never exercised here.
+//! simulated ack. `LiveBackend` builds the REAL venue order payload AND fires the signed HTTPS POST.
+//! Real-money submission is a deliberate OWNER action — **NOT** because a sandbox prevents it: the
+//! 2026-06-11 verification proved this environment CAN reach both venues with auth (Kalshi demo+prod
+//! signed reads, and a 1¢ pmus BUY_LONG/BUY_SHORT placed+cancelled live). The guardrail is therefore
+//! the CODE — `EXECUTION_MODE` defaults to dry-run, prod needs explicit consent, and the pmus live leg
+//! is gated behind `PMUS_POST_SIGNING_VERIFIED` — not an external wall. Decision 0015 seam: the
+//! decision/gating logic is real and testable; the live send stays gated to `EXECUTION_MODE=live`.
 //!
 //! ## dyn-compatibility of the async transport (the design choice)
 //! `ExecutionBackend` is used as `Box<dyn ExecutionBackend>`, and `submit_pair` is SYNCHRONOUS (an
@@ -201,30 +204,30 @@ impl LiveBackend {
         .to_string()
     }
 
-    /// Build a pmus CreateOrder body (best-effort shape). ⚠️ The pmus POST-body signing convention is
-    /// UNVERIFIED (the auth brief flags it: the documented sample signs only `{ts}{method}{path}`, body
-    /// inclusion unconfirmed), so this is sent only when a pmus leg is actually required and is treated
-    /// as needing live verification before any real-money pmus order.
+    /// Build a pmus CreateOrder body — the VERIFIED shape for `POST /v1/orders`
+    /// (docs.polymarket.us/api-reference/orders/create-order). LIVE-VERIFIED against the real venue
+    /// 2026-06-11: a 1¢ `BUY_LONG` and a 1¢ `BUY_SHORT` each placed (`[200] {"id":..}`) + cancelled.
+    /// (The prior `{slug,action,side,size,price}` @ `/v1/portfolio/orders` was a guess and 404'd.)
+    /// `(action, side)` maps to the `OrderIntent` enum on the SAME `marketSlug`: Buy-YES=`BUY_LONG`,
+    /// Buy-NO=`BUY_SHORT` (both live-verified — the bot's two ENTRY directions); Sell-YES=`SELL_LONG`,
+    /// Sell-NO=`SELL_SHORT` (doc-derived, used only by the unwind path — verify before relying on them).
+    /// Built with `serde_json` (never `format!`) so a `"`/`\` in the venue slug/coid is escaped, not spliced.
     pub fn build_pmus_payload(&self, intent: &OrderIntent) -> String {
-        let side = match intent.side {
-            Side::Yes => "yes",
-            Side::No => "no",
+        let order_intent = match (intent.action, intent.side) {
+            (Action::Buy, Side::Yes) => "ORDER_INTENT_BUY_LONG",   // live-verified
+            (Action::Buy, Side::No) => "ORDER_INTENT_BUY_SHORT",   // live-verified
+            (Action::Sell, Side::Yes) => "ORDER_INTENT_SELL_LONG", // doc-derived (unwind only)
+            (Action::Sell, Side::No) => "ORDER_INTENT_SELL_SHORT", // doc-derived (unwind only)
         };
-        let action = match intent.action {
-            Action::Buy => "buy",
-            Action::Sell => "sell",
-        };
-        // Built with `serde_json` (never `format!`) so a `"`/`\` in the venue-supplied slug/coid is
-        // escaped, not spliced raw (a crafted slug could otherwise alter the body). price as a 2dp dollar
-        // STRING (pmus money objects use a string {value}); qty as a bare whole-shares number — same wire
-        // shape the old format! emitted, now safe for dirty input.
-        let price = format!("{:.2}", (intent.price_cents as f64) / 100.0);
+        // price is a 2dp dollar STRING inside the {value,currency} Amount object; quantity a bare number.
+        let value = format!("{:.2}", (intent.price_cents as f64) / 100.0);
         serde_json::json!({
-            "slug": intent.market,
-            "action": action,
-            "side": side,
-            "size": intent.qty,
-            "price": price,
+            "marketSlug": intent.market,
+            "intent": order_intent,
+            "type": "ORDER_TYPE_LIMIT",
+            "price": {"value": value, "currency": "USD"},
+            "quantity": intent.qty,
+            "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
             "clientOrderId": intent.client_order_id,
         })
         .to_string()
@@ -248,16 +251,20 @@ impl LiveBackend {
                 (format!("{}/portfolio/orders", self.kalshi_base()), self.build_kalshi_payload(intent), h)
             }
             Venue::Pmus => {
-                // GATE: refuse a pmus LIVE leg until the owner confirms the POST-body signing scheme
-                // (default OFF). The auth brief marks body inclusion UNCONFIRMED; firing anyway would
-                // 401 *after* the Kalshi leg fills => a systematic naked leg. An explicit env unlock turns
-                // that silent leg-out generator into a deliberate, loud opt-in.
+                // GATE (default OFF): a deliberate pmus-LIVE opt-in. The original reason — "POST-body
+                // signing unverified" — is now RESOLVED: live control test 2026-06-11 proved a BAD sig
+                // 401s while a body-less `{ts}POST{path}` sig passes auth on POSTs (auth precedes routing),
+                // and a 1¢ BUY_LONG + BUY_SHORT each placed+cancelled on `/v1/orders`. So signing + both
+                // ENTRY intents + the endpoint are verified; the gate remains as the explicit pmus-live
+                // arming switch (the SELL_* unwind intents are still doc-only, and the edge is unvalidated).
                 if !pmus_post_signing_verified() {
                     return Err(ExecError::Rejected(
-                        "pmus POST-body signing unverified — set PMUS_POST_SIGNING_VERIFIED=yes".into(),
+                        "pmus live leg gated — set PMUS_POST_SIGNING_VERIFIED=yes to arm (signing+endpoint verified 2026-06-11)".into(),
                     ));
                 }
-                let path = "/v1/portfolio/orders";
+                // VERIFIED endpoint (was the guessed `/v1/portfolio/orders`, which 404'd). Cancel (stage-2
+                // wiring) is POST `/v1/order/{orderId}/cancel` with a `{marketSlug}` body (also verified).
+                let path = "/v1/orders";
                 let h = crate::auth::pmus_headers(&keys.pmus_ed25519, &keys.pmus_access_key, ts, "POST", path);
                 (format!("{}{}", self.pmus_base(), path), self.build_pmus_payload(intent), h)
             }
@@ -467,9 +474,19 @@ mod tests {
             qty: 2,
             client_order_id: "coid-pm".into(),
         };
-        let body = bk.build_pmus_payload(&intent);
-        assert!(body.contains("\"slug\":\"tc-temp-nychigh-2026-06-11-gte95f\""));
-        assert!(body.contains("\"side\":\"yes\"") && body.contains("\"size\":2") && body.contains("\"price\":\"0.07\""));
+        // VERIFIED `/v1/orders` shape (live-verified 2026-06-11): marketSlug + intent + Amount price.
+        let v: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&intent)).unwrap();
+        assert_eq!(v["marketSlug"], "tc-temp-nychigh-2026-06-11-gte95f");
+        assert_eq!(v["intent"], "ORDER_INTENT_BUY_LONG"); // Buy+Yes
+        assert_eq!(v["type"], "ORDER_TYPE_LIMIT");
+        assert_eq!(v["quantity"], 2);
+        assert_eq!(v["price"]["value"], "0.07");
+        assert_eq!(v["price"]["currency"], "USD");
+        // Buy+No maps to BUY_SHORT (the other live-verified ENTRY direction); Sell maps to the SELL_* intents.
+        let no = OrderIntent { side: Side::No, ..intent.clone() };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&bk.build_pmus_payload(&no)).unwrap()["intent"], "ORDER_INTENT_BUY_SHORT");
+        let sell = OrderIntent { action: Action::Sell, side: Side::Yes, ..intent.clone() };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&bk.build_pmus_payload(&sell)).unwrap()["intent"], "ORDER_INTENT_SELL_LONG");
     }
 
     /// CRITICAL C2 regression: a venue-supplied `market`/`coid` containing a `"` (or `\`) must NOT malform
@@ -523,12 +540,12 @@ mod tests {
         assert_eq!(kv["ticker"], evil);
         assert_eq!(kv["count"], 1); // the injected "count":9999 did NOT take effect
         assert_eq!(kv["client_order_id"], evil);
-        // pmus: same — slug re-parses to the literal evil string, size is the real qty.
+        // pmus: same — marketSlug re-parses to the literal evil string, quantity is the real qty.
         let pintent = OrderIntent { venue: Venue::Pmus, ..intent };
         let pbody = bk.build_pmus_payload(&pintent);
         let pv: serde_json::Value = serde_json::from_str(&pbody).expect("pmus body is valid JSON");
-        assert_eq!(pv["slug"], evil);
-        assert_eq!(pv["size"], 1);
+        assert_eq!(pv["marketSlug"], evil);
+        assert_eq!(pv["quantity"], 1);
     }
 
     /// WARN D: the pmus LIVE leg is gated behind `PMUS_POST_SIGNING_VERIFIED` (default OFF). Until it's
