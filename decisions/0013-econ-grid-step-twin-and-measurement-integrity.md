@@ -74,5 +74,9 @@ The same review found two measurement-integrity defects and one unverified-proto
 - **Open**: probe Kalshi multi-subscription semantics (would remove the cycle-on-add); re-pin both
   venues' fee schedules from primary sources (web fetch blocked this session); `session_start` now logs
   a `build` hash + argv so deploys and crashes are distinguishable in sessions.jsonl.
+  *(Both closed 2026-06-10 same day: multi-sub probe-verified → no-gap `update_subscription` adds shipped
+  with cycle fallback + `test_monitor_nogap.py`, retiring the single-subscription invariant; fees re-pinned
+  from primary sources — coefficients confirmed, Kalshi maker fees series-gated —
+  [research/fee-pin-2026-06-10.md](../research/fee-pin-2026-06-10.md).)*
 - Lessons [L21] (threshold number ≠ inequality semantics) and [L22] (a smoothing layer in front of a
   logger biases the measurement) recorded.

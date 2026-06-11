@@ -71,9 +71,15 @@ Absent from polymarket.us. A Kalshi×Polymarket crypto pair exists only via inte
 ---
 
 ## Fees (both legs, US-legal venues)
-- **Kalshi:** taker `ceil(0.07 × N × P × (1−P))` (fee_multiplier=1 on all these series); maker = 25% of taker.
-- **polymarket.us:** taker `0.05 × C × P × (1−P)`; maker rebate `−0.0125`.
-- Round-trip both-taker at P≈0.5 ≈ **~3¢/contract** + spread ⇒ practical edge floor **~3–5¢**. Maker-on-both cuts the fee piece by ~75% but adds fill risk.
+> **Primary-source re-pin 2026-06-10** ([fee-pin-2026-06-10.md](fee-pin-2026-06-10.md)): all coefficients
+> below CONFIRMED (pmus via docs.polymarket.us/fees eff. 2026-04-03 + live `feeCoefficient=0.05`; Kalshi
+> via the CFTC-filed schedule). One refinement: Kalshi **maker fees exist only on
+> `fee_type=quadratic_with_maker_fees` series** — on weather/esports/ITF/UFC a resting Kalshi order pays **$0**.
+- **Kalshi:** taker `ceil(0.07 × N × P × (1−P))` (fee_multiplier=1 on all these series); maker = 25% of
+  taker **on MLB/WNBA/NBA/NHL/ATP/WTA/econ only; $0 on the `quadratic` series (incl. all weather)**.
+- **polymarket.us:** taker `0.05 × C × P × (1−P)` (banker's-rounded to nearest cent); maker rebate `−0.0125`.
+- Round-trip both-taker at P≈0.5 ≈ **~3¢/contract** + spread ⇒ practical edge floor **~3–5¢**. Maker-on-both
+  adds fill risk but on a **weather** pair the fee piece goes ~negative (Kalshi maker $0 + pmus −0.0125 rebate).
 
 ## Verdict / prioritization
 1. **Econ (CPI/U-3/GDP/NFP/Fed)** — only structurally clean, US-legal arb. Build here first. Episodic; edge is event-driven.

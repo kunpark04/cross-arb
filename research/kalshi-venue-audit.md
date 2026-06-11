@@ -118,6 +118,14 @@ Endpoint: `POST /portfolio/orders` [VERIFIED]
 
 ### 2.1 Trading Fees
 
+> **RE-PINNED FROM PRIMARY SOURCES 2026-06-10** ([fee-pin-2026-06-10.md](fee-pin-2026-06-10.md)): taker
+> formula + trade-level cent-ceil + no-settlement-fee confirmed **verbatim** from the CFTC-filed Kalshi
+> fee schedule (kalshi.com PDF still 429s); maker formula confirmed — **but maker fees exist ONLY on
+> `fee_type=quadratic_with_maker_fees` series** (MLB/WNBA/NBA/NHL/ATP/WTA + econ). Plain `quadratic`
+> series — **all 5 weather**, esports, ITF, UFC (12/23 tracked) — charge resting orders **$0**, so the
+> "maker-only ~0.88¢ round-trip" below over-states weather maker cost (it's $0 + pmus pays a −0.0125
+> rebate). Live check: all 23 tracked series `fee_multiplier=1`; `/series/fee_changes` empty.
+
 **Taker fee formula** [VERIFIED]:
 ```
 taker_fee_per_contract = ceil(0.07 × N × P × (1 − P))
@@ -351,8 +359,8 @@ The API partitions data into **live** (recent 3 months) and **historical** (>3 m
 
 | Item | Status | Action needed |
 |---|---|---|
-| Exact fee PDF (kalshi.com/docs/kalshi-fee-schedule.pdf) | HTTP 429 at audit time — could not fetch directly | Verify formula `ceil(0.07 × N × P × (1−P))` from PDF before live use |
-| Category-specific fee multipliers (e.g., Crypto > 0.07) | Inferred from third-party sources | Check `fee_multiplier` field in market API response |
+| Exact fee PDF (kalshi.com/docs/kalshi-fee-schedule.pdf) | **RESOLVED 2026-06-10** via the CFTC-filed schedule (verbatim formula + rounding + no settlement fee) — the kalshi.com PDF itself still 429s | [fee-pin-2026-06-10.md](fee-pin-2026-06-10.md); owner can capture the live PDF from a residential browser for the current maker-section text |
+| Category-specific fee multipliers (e.g., Crypto > 0.07) | **CHECKED 2026-06-10**: `fee_multiplier=1` on all 23 tracked series; `/series/fee_changes` empty; maker fees gated by `fee_type` (12/23 series maker-free) | Re-check `fee_type`/`fee_multiplier` + `/series/fee_changes` before any sizing decision (crypto ≈0.08 stays unconfirmed — out of universe) |
 | Candlestick granularity options (`period_interval` values) | Not confirmed | Check openapi.yaml `period_interval` enum |
 | Sports settlement source agencies per contract | Framework verified; per-contract source not checked | Read `rules` field per market object before trading |
 | Nevada / NJ legal status | Appeals courts favor Kalshi as of audit date | Monitor quarterly |
