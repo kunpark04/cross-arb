@@ -1427,8 +1427,9 @@ where
     let mut out = [0u8; 2];
     for (i, leg) in pos.legs.iter().enumerate() {
         let book = book_of(leg)?;
-        // an unwind SELLs both legs -> floor to the cent (limit <= touch, still hits the bid); W1.
-        out[i] = cents(exit_price(leg, &book), Action::Sell)?;
+        // route through flatten_exit_cents so the postpone-unwind SELL gets the SAME pmus tick FLOOR (W2)
+        // the recovery SELL has — a coarse-tick pmus market would otherwise reject a whole-cent unwind.
+        out[i] = flatten_exit_cents(leg, &book)?;
     }
     Some(out)
 }
