@@ -70,7 +70,7 @@ deploy target is **Linux**, where none of this applies (no `windows-sys`, no min
 ```bash
 cd bot-rs
 cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
-cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind (98 tests)
+cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind (112 tests)
 cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
 cargo run -- --smoke   # force the offline smoke even with creds present
 ```
@@ -80,7 +80,9 @@ To arm (owner env only): set `EXECUTION_MODE=live` (+ `VENUE_ENV`, caps, `KALSHI
 
 ## What's built (stages 1–2.5, complete) vs. what remains (owner env)
 
-**Built + tested (98 tests, all green; dry-run-default, live gated):**
+**Built + tested (112 tests, all green, clippy-clean; dry-run-default, live gated). A full-engine
+adversarial review (5 parallel subsystem reviewers + an independent review of the loop rewrite) hardened
+the concurrency core, the gates, and the transport — see `tasks/_agent_bus/20260611-engine-review/`:**
 - **Safety-critical spine (std-only):** `types`, `config` (safe defaults), `risk` (all pre-trade gates
   + tests), `exec` (dry-run backend + real Kalshi order-payload builder, pair-shaped `submit_pair`),
   `ledger` (outcome-independent PnL + taker fees), `unwind` (postponement-unwind), `main` (banner + hard

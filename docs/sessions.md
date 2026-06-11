@@ -6,6 +6,39 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, latest+2) — `bot-rs`: full-engine adversarial review → 9 CRITICAL + ~17 WARN fixed (112 tests, clippy clean)
+
+Holistic adversarial review of the WHOLE live engine (5,735 lines / 14 modules) — the incremental builds
+each had a self-review + targeted parity checks, but nothing had reviewed the *whole* thing for cross-module
+bugs, races, and integration errors. Five parallel subsystem reviewers (pricing-math / risk-config /
+discovery / transport-auth / loop-concurrency) → findings in `tasks/_agent_bus/20260611-engine-review/`.
+Fixed in two disjoint passes + a post-review robustness pass; committed `72ac418` + `fd5a186`.
+
+- **Concurrency core (the loop's submission path, rewritten):** all order submits (entries AND unwinds)
+  now route OFF the event loop onto spawned tasks that report a `SubmitOutcome` to a 3rd `select!` arm —
+  so the network RTT never stalls the co-equal unwind arm (it did before). `pending_entries`/`flattening`
+  in-flight sets kill double-fire; exposure is reserved-on-spawn + released-on-fail (exact inverse);
+  a naked live one-leg fill fail-closes (halt + log). An independent review of the rewrite:
+  **SOUND, 0 CRITICAL** (`tasks/_agent_bus/20260611-loop-refactor-review/`) — its 3 WARNs then closed
+  (loop-top task-death check, panic-safe submit, one-position-per-slug).
+- **Loop guards:** a per-pair `k_fresh` gate so a just-reconnected (cleared) Kalshi book can't trade
+  half-rebuilt against a stale pmus book (the C3 integration bug no single-module review could see);
+  supervised spawned tasks (a dead collector HALTS instead of trading a frozen book); poison-tolerant locks.
+- **Gates:** the sports away-team book `k_b` is now divergence-checked (was a 2-leg-fire blindspot);
+  `REQUIRE_SETTLE_CLEAN=false` on live+prod now needs explicit consent + a loud banner; a truncated catalog
+  pull no longer prunes live markets; NaN `days_to_event` fails the proximity gate closed; a post-tick-
+  rounding realized-edge re-check.
+- **Transport/parse/math:** order JSON via `serde_json` (was `format!` string-splice → injection/malformed
+  body); a clock-before-epoch now panics loud (was a silent 401); the pmus live leg is gated behind
+  `PMUS_POST_SIGNING_VERIFIED`; Kalshi cursor pagination bounded; pmus booked fee made linear (ledger.py
+  parity); the weather `gte`-decoy backtrack + release-period/CPI month-pick parity; deterministic
+  doubleheader bind.
+
+Net: 98 → **112 tests** (+14 regression), **clippy 0**. The engine is materially hardened — but the safety
+posture is unchanged: still dry-run-default, still gated, and the edge itself is still the gate on real money.
+
+---
+
 ## 2026-06-11 (UTC, latest+1) — `bot-rs`: postponement-unwind TRIGGER armed (held-position tracking + MLB statsapi + fire)
 
 Armed the postponement-unwind rule — the #1 remaining sports risk (a game postponed past Kalshi's ~2-day
