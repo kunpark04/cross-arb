@@ -6,6 +6,45 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-11 (UTC, latest+5) — Venue-contract order bugs (a real unintended live position) → autonomous fix loop → CLEAN money path; Context7 security review
+
+The owner pressed on meticulousness ("be more meticulous — you missed this even after several passes") and
+then "do not stop fixing." A new **venue-contract review lens** (verify what the venue actually does, not the
+code's internal logic) caught a class of real-money bugs five prior reviews missed. Fixed in an autonomous
+fix→review loop until the money-path review came back CLEAN + doc-verified. Decision [0016](../decisions/0016-live-venue-contract-verification.md);
+lessons L25/L26/L27. Commits `34ee18d` (NO-leg pricing) → `061c35f` (outcome) → `989a291` (recovery) →
+`dc8a2c3` (rounding) → `6eb7893` (unwind), all pushed.
+
+- **The bug that drew blood — NO-leg pricing.** A 1¢ `BUY_SHORT` probe meant to rest "opened an unintended
+  live short" on a pmus futures market (`tec-nhl-hart…nikkuc`, −1 "No", $0.54): pmus runs `BUY_SHORT` as a
+  **sell-YES priced in YES terms**, so "buy NO @ 1¢" = "sell YES @ 1¢", marketable, filled at the ~54¢ bid.
+  The fill was **async** (the create response said `executions:[]`), so my cancel hit an already-filled order
+  and I **falsely reported the account clean** — exactly the unverified-assertion failure the owner had just
+  called out. Order records (`side=SELL, cumQuantity=1`) confirmed it was mine. Couldn't flatten (66¢-wide
+  illiquid book; `close-position` 500'd); **left open** per the owner (settles itself June 30). The fix:
+  pmus NO legs price `1 − NO` (YES-denominated); Kalshi `side:no` uses `no_price` not `yes_price`.
+- **Three more same-class bugs (all order-OUTCOME side, all missed by prior passes):** a 2xx create read as a
+  FILL → phantom hedges + a blinded naked-leg guard (now `Ack.filled` parsed per venue, fail-safe; pmus sends
+  `synchronousExecution`); pmus has **no idempotency** (code claimed it did); `cancel` was an unwired stub.
+- **Autonomous fix loop (owner: "don't wait for my command"):** naked-leg **auto-recovery** (cancel resting +
+  flatten filled, halt backstop); pmus fill-fields pinned to the OpenAPI schema; per-market tick/min threaded;
+  **direction-aware rounding** (BUY ceils / SELL floors so a marketable leg can't round to a resting price).
+  Each fix got a meticulous review; the final money-path review = **CLEAN, 0 CRITICAL, verified vs the live
+  pmus docs** (112 → **125 tests**, clippy clean).
+- **Context7 security review** (owner-requested): a docs tool result told the fix-agent to run
+  `npx ctx7 setup …`. Investigated — **not malicious**: both `@upstash/context7-mcp` (the configured server)
+  and `ctx7` (npm author: Upstash) are legitimate; it was Context7's own onboarding nudge, intermittent (3
+  clean re-queries). The point that mattered: it's a **prompt-injection PATTERN**, and the defense held — the
+  agent + I treated tool output as DATA, ran nothing. (`.env` footgun also fixed: `VENUE_ENV` prod→demo.)
+
+**Net:** the order/execution money path is now **live-and-doc-verified clean** — multiple critical
+venue-contract bugs that no code review caught are fixed. Remaining are non-code/gated/data: `SELL_*` live
+verification (can't bound a naked short to the cap), leg-fill-timeout/IOC (a flagged strategy choice, recovery
+is the backstop), whole-cent price precision (≤0.5¢/leg, bounded), the open position, and the binding gate —
+the **edge** itself, still unproven and still needing the weeks of data.
+
+---
+
 ## 2026-06-11 (UTC, latest+4) — Verify-everything pass: live data path + order paths proven; discovery 429 bug fixed; claims audit
 
 Owner pushed back: a false claim ("sandbox blocks venue I/O") proved I'd asserted unverified things —
