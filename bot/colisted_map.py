@@ -273,9 +273,12 @@ def econ_twin(thr, step):
     '>= T' == '> T-step', and Kalshi 'Above F' is strict, so the twin has floor F = T - step (0013)."""
     return round(thr - step, 6)
 
-def econ_colisted(allm, errs=None):
+def econ_colisted(allm, errs=None, k_sink=None):
     """Full econ discovery -> (entries, flags). Only SAME-orientation pairs whose settlement-IDENTICAL
-    Kalshi twin is listed: pmus '>= T' <-> Kalshi 'Above T-step' (econ_twin), + Fed categorical."""
+    Kalshi twin is listed: pmus '>= T' <-> Kalshi 'Above T-step' (econ_twin), + Fed categorical.
+    `k_sink` (optional {ticker: market-dict}) collects the FULL Kalshi market dicts pulled here so the
+    caller can gate each pair on the already-fetched objects (the list endpoint carries rules_primary/
+    floor_strike/strike_type) — no per-pair re-fetch (settlement-identity verdict attach)."""
     macro = [m for m in allm if m.get("category") == "macro"]
     bypre = collections.defaultdict(list)
     for m in macro: bypre[str(m.get("slug", "")).split("-")[0]].append(m)
@@ -287,6 +290,7 @@ def econ_colisted(allm, errs=None):
         for m in kd.get("markets", []):
             tk = str(m.get("ticker", "")); pm_ = re.search(r"-(\d{2}[A-Z]{3}\d{0,2})-", tk)
             per = pm_.group(1) if pm_ else None
+            if k_sink is not None and tk: k_sink[tk] = m
             if m.get("floor_strike") is not None:
                 kby[per][round(float(m["floor_strike"]), 6)] = tk
             klab[per][str(m.get("yes_sub_title", "")).lower()] = tk
@@ -321,12 +325,83 @@ def pm_catalog(errs=None):
         off += 500
     return allm
 
+def _attach_settle_verdicts(colisted, pm_by_slug, k_by_ticker):
+    """Stamp each discovered pair record with its settlement-identity verdict {settle_status,
+    tail_cost_cents} (invariant #1 made automatic — owner directive). PURE COMPUTE on the dicts
+    build_colisted_map already pulled (the pmus catalog + the Kalshi series lists, which carry
+    rules_primary/floor_strike/strike_type/yes_sub_title) — no extra fetch per pair. Reuses the
+    scripts/settlement_identity.py gate verbatim (never re-implements the verdict logic) and maps
+    slug/ticker -> market dict EXACTLY as that module's --audit does. The gate may make a small bounded
+    number of CACHED per-SERIES source fetches (settlement_sources, one per series); it degrades to []
+    on a miss, so the verdict still resolves from the rules text alone. The verdict is METADATA — every
+    pair is still tracked; DIVERGENT is flagged by the consumer (monitor), never auto-dropped here.
+    Returns counts-by-status per category for the coverage report. Best-effort: if the gate import fails
+    (e.g. scripts/ not importable), records are left unstamped and an error note is returned."""
+    summary = {}
+    try:
+        _scripts = os.path.join(os.path.dirname(__file__), "..", "scripts")
+        if _scripts not in sys.path:                  # guard: rest_heartbeat calls this every cycle — an
+            sys.path.insert(0, _scripts)              # unguarded insert would grow sys.path unboundedly
+        from settlement_identity import settlement_identity
+    except Exception as ex:
+        return {"_error": f"settlement_identity gate unavailable ({ex!r}) — pairs left unstamped"}
+    for cat in ("weather", "sports", "soccer3", "econ"):
+        c = collections.Counter()
+        for e in colisted.get(cat, []):
+            pm = pm_by_slug.get(e.get("slug"), {"slug": e.get("slug")})
+            try:
+                if cat == "sports":                       # two team-leg tickers -> the two Kalshi dicts
+                    kalshi = [k_by_ticker.get(e.get("kalshi_a"), {}), k_by_ticker.get(e.get("kalshi_b"), {})]
+                    gate_cat = "sports"
+                else:                                     # weather/econ/soccer3 are 1:1 binary (one ticker);
+                    kalshi = k_by_ticker.get(e.get("kalshi"), {})   # soccer3 gates via the _sports path
+                    gate_cat = "econ" if cat == "econ" else ("weather" if cat == "weather" else "sports")
+                r = settlement_identity(pm, kalshi, gate_cat)
+            except Exception as ex:
+                r = {"status": "NEEDS_MANUAL", "tail_cost_cents": 0.0, "reasons": [f"gate eval error {ex!r}"]}
+            e["settle_status"] = r["status"]
+            e["tail_cost_cents"] = r.get("tail_cost_cents", 0.0)
+            c[r["status"]] += 1
+        summary[cat] = dict(c)
+    return summary
+
+
+def settle_verdict_line(summary):
+    """One-line human summary of a settle_verdict_summary: total + per-status counts + any DIVERGENT
+    callout (a DIVERGENT co-listed pair = a both-legs-loss trap). Used by the monitor's discovery log
+    and the --live banner. Empty/missing -> a short note (so a gate-import failure is visible, not silent)."""
+    if not summary or "_error" in (summary or {}):
+        return f"settle-verdict: UNAVAILABLE ({(summary or {}).get('_error', 'no summary')})"
+    agg = collections.Counter()
+    for c in summary.values():
+        agg.update(c)
+    parts = " / ".join(f"{agg.get(s, 0)} {s}" for s in ("IDENTICAL", "TAIL", "DIVERGENT", "NEEDS_MANUAL"))
+    return f"settle-verdict: {parts}"
+
+
+def settle_divergent_pairs(colisted):
+    """Every discovered pair whose verdict is DIVERGENT (settlement provably differs STRUCTURALLY -> a
+    'locked' pair can lose BOTH legs; must never be silently tracked as a clean arb). Returns
+    [(cat, slug, reason-tag)] for the monitor to flag loudly. Tracking is unaffected — this is a WARNING."""
+    out = []
+    for cat in ("weather", "sports", "soccer3", "econ"):
+        for e in colisted.get(cat, []):
+            if e.get("settle_status") == "DIVERGENT":
+                out.append((cat, e.get("slug"), e.get("city") or e.get("league") or e.get("family") or "?"))
+    return out
+
+
 def build_colisted_map():
     """Full discovery -> ({weather:[...], sports:[...], econ:[...]}, coverage_report). No books fetched
     (fast). report['fetch_errors'] lists every failed venue pull — a NON-EMPTY list means this pass is
-    DEGRADED (missing markets are fetch failures, not settlements; the monitor must not prune on it)."""
+    DEGRADED (missing markets are fetch failures, not settlements; the monitor must not prune on it).
+    Each pair record also carries its settlement-identity verdict {settle_status, tail_cost_cents}
+    (invariant #1, gated via scripts/settlement_identity.py on the already-pulled dicts); the report's
+    `settle_verdict_summary` counts statuses per category."""
     errs = []
     allm = pm_catalog(errs=errs)
+    k_by_ticker = {}                                 # ticker -> FULL Kalshi market dict (from the series lists
+                                                     # below) so each pair gets gated without a per-pair re-fetch
     weather, sports, soccer, bucket_misaligned = [], [], [], []   # bucket_misaligned: pm buckets w/o an identical-bounds twin
 
     # ---- WEATHER (pm slug <-> kalshi ticker, 1:1 per bucket, joined on IDENTICAL canonical bounds) ----
@@ -341,7 +416,9 @@ def build_colisted_map():
         kd = get(f"{KAL}?series_ticker={kser}&limit=1000", errs=errs); time.sleep(0.25)
         kby = collections.defaultdict(list)
         for m in kd.get("markets", []):
-            dm = re.search(r"-(\d{2}[A-Z]{3}\d{2})", str(m.get("ticker")))
+            tk = str(m.get("ticker", ""))
+            if tk: k_by_ticker[tk] = m
+            dm = re.search(r"-(\d{2}[A-Z]{3}\d{2})", tk)
             if dm: kby[ktok_iso(dm.group(1))].append(m)
         for date in sorted(set(bydate) & set(kby)):
             pairs, flags = pair_weather_date(bydate[date], kby[date])   # bounds-dict join, never index-zip
@@ -364,6 +441,7 @@ def build_colisted_map():
         byev, evd = collections.defaultdict(dict), {}
         for m in kd.get("markets", []):
             ev = m.get("event_ticker"); tk = str(m.get("ticker", ""))
+            if tk: k_by_ticker[tk] = m
             key = tk.split("-")[-1].lower() if join == "abbrev" else surname(m.get("yes_sub_title"))
             dm = re.search(r"-(\d{2}[A-Z]{3}\d{2})", tk); evd[ev] = ktok_iso(dm.group(1)) if dm else None
             if key: byev[ev][key] = tk
@@ -406,6 +484,7 @@ def build_colisted_map():
         byev, evd = collections.defaultdict(dict), {}
         for m in kd.get("markets", []):
             ev = m.get("event_ticker"); tk = str(m.get("ticker", ""))
+            if tk: k_by_ticker[tk] = m
             key = tk.split("-")[-1].lower()           # WC suffix is the country code or 'tie' (always abbrev)
             dm = re.search(r"-(\d{2}[A-Z]{3}\d{2})", tk); evd[ev] = ktok_iso(dm.group(1)) if dm else None
             if key: byev[ev][key] = tk
@@ -414,8 +493,17 @@ def build_colisted_map():
         soccer += soccer3_emit(pm_soc, kbydate, L, join)   # single source of truth (also offline-tested)
 
     # ---- ECON (macro): pmus '>=T' <-> the IDENTICAL Kalshi 'Above T-step' twin + Fed categorical (0013) ----
-    econ, econ_flags = econ_colisted(allm, errs=errs)
+    econ, econ_flags = econ_colisted(allm, errs=errs, k_sink=k_by_ticker)
     pm_macro_fams = {str(m.get("slug", "")).split("-")[0] for m in allm if m.get("category") == "macro"}
+
+    # ---- SETTLEMENT-IDENTITY VERDICT per pair (invariant #1, automatic): stamp settle_status +
+    #      tail_cost_cents onto every record via the scripts/settlement_identity.py gate, on the dicts
+    #      already pulled above (no per-pair re-fetch). A DIVERGENT pair is a both-legs-loss trap; the
+    #      monitor flags it. The verdict is METADATA — discovery still tracks every pair (research gathers
+    #      data on all, incl. NEEDS_MANUAL). ----
+    colisted = {"weather": weather, "sports": sports, "soccer3": soccer, "econ": econ}
+    pm_by_slug = {m.get("slug"): m for m in allm}
+    settle_verdict_summary = _attach_settle_verdicts(colisted, pm_by_slug, k_by_ticker)
 
     report = {
         "weather_cities_mapped": sorted(c for c in pm_cities if c in WX),
@@ -428,11 +516,12 @@ def build_colisted_map():
         "econ_families_mapped": sorted(f for f in pm_macro_fams if f in ECON),
         "econ_families_UNMAPPED": sorted(f for f in pm_macro_fams if f not in ECON),
         "econ_SKIPPED": econ_flags,                       # <=tails (opposite orient) + point-buckets + no listed twin
+        "settle_verdict_summary": settle_verdict_summary, # invariant #1: {cat: {IDENTICAL/TAIL/DIVERGENT/NEEDS_MANUAL: n}}
         "fetch_errors": errs,                             # non-empty = DEGRADED discovery pass (do NOT prune on it)
         "counts": {"weather_pairs": len(weather), "sports_pairs": len(sports),
                    "soccer3_pairs": len(soccer), "econ_pairs": len(econ)},
     }
-    return {"weather": weather, "sports": sports, "soccer3": soccer, "econ": econ}, report
+    return colisted, report
 
 def weather_monitor_map(colisted):
     """The 1:1 {slug: ticker} dict the current monitor consumes (weather subset; sports needs the
@@ -551,8 +640,44 @@ def _selftest():
     # incomplete game (only 2 of 3 sibling outcomes) -> emit nothing (need all 3)
     pm_partial = {("ger", "cuw", "2026-06-14"): {"ger": ger_mkt, "cuw": {"slug": "x"}}}   # no draw
     assert soccer3_emit(pm_partial, {"2026-06-14": [ev_gc]}, "fwc", "abbrev") == [], "incomplete game (no draw sibling) -> skip"
+    # --- SETTLEMENT-IDENTITY verdict attach (invariant #1 automatic): every discovered pair carries
+    #     settle_status + tail_cost_cents via the scripts/settlement_identity.py gate, on the dicts
+    #     build_colisted_map already pulled (no per-pair re-fetch). Offline: drive _attach directly with
+    #     synthetic pmus + Kalshi dicts + the slug/ticker lookups exactly as build_colisted_map builds them.
+    pm_wx = {"slug": "tc-temp-nychigh-2026-06-13-gte84lt85f",
+             "description": "highest temperature at Central Park (KNYC) ... National Weather Service's Climatological Report (Daily)."}
+    k_wx = {"ticker": "KXHIGHNY-26JUN13-B84", "floor_strike": 84, "cap_strike": 85, "yes_sub_title": "84 to 85",
+            "rules_primary": "If the high temperature at Central Park (KNYC) per the National Weather Service Climatological Report (CLI) is 84 to 85, then Yes."}
+    pm_u3 = {"slug": "urc-us-seasonadj-gte-june-2026-07-02-atl4pt4",
+             "description": "Will the U-3 unemployment rate reported by the Bureau of Labor Statistics be at least 4.4% ..."}
+    k_u3 = {"ticker": "KXU3-26JUN-T4.3", "floor_strike": 4.3, "cap_strike": None, "strike_type": "greater",
+            "yes_sub_title": "Above 4.3%",
+            "rules_primary": "If the seasonally adjusted unemployment rate (U-3) reported by the Bureau of Labor Statistics is above 4.3% in June 2026, then Yes."}
+    fake_col = {"weather": [{"cat": "weather", "city": "nyc", "slug": pm_wx["slug"], "kalshi": k_wx["ticker"]}],
+                "sports": [], "soccer3": [],
+                "econ": [{"cat": "econ", "family": "u3", "slug": pm_u3["slug"], "kalshi": k_u3["ticker"]}]}
+    pm_by_slug = {pm_wx["slug"]: pm_wx, pm_u3["slug"]: pm_u3}
+    k_by_ticker = {k_wx["ticker"]: k_wx, k_u3["ticker"]: k_u3}
+    summ = _attach_settle_verdicts(fake_col, pm_by_slug, k_by_ticker)
+    assert "_error" not in summ, ("gate must be importable + run offline", summ)
+    wx_rec, u3_rec = fake_col["weather"][0], fake_col["econ"][0]
+    assert wx_rec["settle_status"] in ("IDENTICAL", "NEEDS_MANUAL"), ("weather pair must carry a verdict", wx_rec)
+    assert wx_rec["settle_status"] == "IDENTICAL", ("synthetic weather (same station+CLI+boundary) -> IDENTICAL", wx_rec["settle_status"])
+    assert u3_rec["settle_status"] == "IDENTICAL", ("synthetic econ '>=4.4' <-> 'Above 4.3' grid-twin -> IDENTICAL", u3_rec["settle_status"])
+    assert "tail_cost_cents" in wx_rec and "tail_cost_cents" in u3_rec, "every pair carries tail_cost_cents"
+    assert summ["weather"].get("IDENTICAL") == 1 and summ["econ"].get("IDENTICAL") == 1, ("per-category counts present", summ)
+    # the one-line summary aggregates across categories; the DIVERGENT scan finds a structurally-mismatched pair
+    assert "2 IDENTICAL" in settle_verdict_line(summ), ("verdict line aggregates per-cat counts", settle_verdict_line(summ))
+    assert settle_divergent_pairs(fake_col) == [], "no DIVERGENT in the clean fake universe"
+    k_u3_offby1 = dict(k_u3, floor_strike=4.4, ticker="KXU3-26JUN-T4.4", yes_sub_title="Above 4.4%")   # the 0013 phantom partner
+    fake_div = {"weather": [], "sports": [], "soccer3": [],
+                "econ": [{"cat": "econ", "family": "u3", "slug": pm_u3["slug"], "kalshi": k_u3_offby1["ticker"]}]}
+    _attach_settle_verdicts(fake_div, {pm_u3["slug"]: pm_u3}, {k_u3_offby1["ticker"]: k_u3_offby1})
+    div = settle_divergent_pairs(fake_div)
+    assert div and div[0][0] == "econ", ("off-by-one econ partner -> DIVERGENT, surfaced for the monitor to flag", div)
     print("OK - helpers, smatch L1-collision rejection, C4 bounds-dict join, C2 exact-date + doubleheader binding, "
-          "econ twin/year parse, soccer3 per-outcome/L23-YES/alias-join/no-false-join")
+          "econ twin/year parse, soccer3 per-outcome/L23-YES/alias-join/no-false-join, "
+          "settle-verdict attach (IDENTICAL weather+econ, off-by-one DIVERGENT surfaced)")
 
 
 if __name__ == "__main__":
@@ -586,4 +711,14 @@ if __name__ == "__main__":
         print(f"\n!!! BUCKET MISALIGNMENT - {len(rep['weather_bucket_MISALIGNED'])} weather buckets NOT paired "
               f"(non-identical degF ranges / count mismatch -> settlement-identity guard):")
         for b in rep["weather_bucket_MISALIGNED"][:8]: print(f"    {b}")
+    # SETTLEMENT-IDENTITY verdict (invariant #1) — per-category counts + DIVERGENT trap callout
+    print(f"\n{settle_verdict_line(rep.get('settle_verdict_summary'))}")
+    for cat in ("weather", "sports", "soccer3", "econ"):
+        sv = (rep.get("settle_verdict_summary") or {}).get(cat)
+        if sv: print(f"    {cat:8} {sv}")
+    div = settle_divergent_pairs(colisted)
+    if div:
+        print(f"\n!!! DIVERGENT - {len(div)} co-listed pairs settle STRUCTURALLY DIFFERENTLY (a 'locked' pair can "
+              f"lose BOTH legs — do NOT trade as an arb; still TRACKED as research data):")
+        for cat, slug, tag in div[:8]: print(f"    [{cat}] {tag:6} {slug}")
     print(f"\nmonitor-ready weather map (1:1 slug->ticker): {len(weather_monitor_map(colisted))} markets")

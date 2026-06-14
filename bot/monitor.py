@@ -485,16 +485,30 @@ def _selftest():
     lg.write("tc-temp-laxhigh-2026-06-09-gte73", "OPEN", {"dir": "K", "net": 0.02}, 2)
     lg.write("aec-mlb-sea-bal-2026-06-10", "CLOSE", {"dir": "PK", "net": -0.01}, 9)  # SAME file as its OPEN
     lg.write("freeform-no-date", "OPEN", {"dir": "P", "net": 0.01}, 3)
-    lg.session_start({"weather": 1, "sports": 1})
-    lg.health({"weather": 1, "sports": 1})
-    assert json.load(open(os.path.join(td, "health.json")))["t"] > 0   # liveness beacon written atomically
+    # INVARIANT #1: the discovery/session log carries the settlement-verdict summary (session_start +
+    # health both merge arbitrary info -> the verdict rides there, NEVER in the transitions-* schema, so
+    # every transition loader is untouched). Mirror the {cat: {STATUS: n}} shape run_live folds in.
+    _sv = {"weather": {"IDENTICAL": 3}, "econ": {"IDENTICAL": 1, "DIVERGENT": 1}}
+    lg.session_start({"weather": 1, "sports": 1, "settle_verdict": _sv})
+    lg.health({"weather": 1, "sports": 1, "settle_verdict": _sv})
+    hj = json.load(open(os.path.join(td, "health.json")))
+    assert hj["t"] > 0   # liveness beacon written atomically
+    assert hj["settle_verdict"] == _sv, ("health beacon carries the settle-verdict summary", hj.get("settle_verdict"))
+    sess = [json.loads(l) for l in open(os.path.join(td, "sessions.jsonl")) if l.strip()]
+    boot = next(r for r in sess if r.get("event") == "session_start")
+    assert boot["settle_verdict"] == _sv, ("session_start marker carries the settle-verdict summary", boot.get("settle_verdict"))
+    # the verdict went into sessions/health ONLY — the transitions files keep their exact schema
+    tline = json.loads(open(os.path.join(td, "transitions-2026-06-10.jsonl")).read().strip().split("\n")[0])
+    assert set(tline) <= {"t", "market", "transition", "dir", "net_edge", "depth", "age", "px"}, ("transitions schema UNCHANGED", sorted(tline))
+    assert "settle_verdict" not in tline and "settle_status" not in tline, "verdict must NOT leak into the transitions record"
     names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(td, "*.jsonl")))
     assert names == ["sessions.jsonl", "transitions-2026-06-09.jsonl",
                      "transitions-2026-06-10.jsonl", "transitions-misc.jsonl"], names
     body = open(os.path.join(td, "transitions-2026-06-10.jsonl")).read().strip().split("\n")
     assert len(body) == 2, body          # OPEN + CLOSE of one market land together (no midnight split)
     shutil.rmtree(td, ignore_errors=True)
-    print("OK - TransitionLogger: event-date partition keeps a lifecycle whole; misc fallback; sessions.jsonl")
+    print("OK - TransitionLogger: event-date partition keeps a lifecycle whole; misc fallback; sessions.jsonl; "
+          "settle-verdict rides session_start+health (transitions schema unchanged)")
 
     # --- DEPTH: two-pointer fillable-pairs walk + both trackers' binding-direction logic ---
     a = [(0.40, 10), (0.42, 20)]; b = [(0.50, 5), (0.55, 30)]
@@ -883,7 +897,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     1:1 MarketTracker, SPORTS via the 2-outcome GameTracker (pm game market + two Kalshi team tickers). Re-
     audits coverage + churn on the heartbeat. Read-only (no orders); droplet DEPLOY is gated (decision 0006)."""
     import asyncio, websockets
-    from colisted_map import build_colisted_map
+    from colisted_map import build_colisted_map, settle_verdict_line, settle_divergent_pairs
     shard_size = 100
     pm_targets, k_targets, conns = {}, {}, {}     # slug->fn(bids,offers) ; ticker->fn(book) ; "pm"/"k"->ws
     books = {}                                    # Kalshi ticker -> KalshiBook (shared so prune can free it)
@@ -944,6 +958,23 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             new_pm.append(e["slug"]); new_k += [e["kalshi_a"], e["kalshi_b"]]
         return new_pm, new_k
 
+    def log_settle_verdict(col, r):
+        # INVARIANT #1 made automatic: every discovered pair carries a settlement verdict (build_colisted_map
+        # gated it on the already-pulled dicts). LOG the per-category summary and FLAG any DIVERGENT pair
+        # loudly — a DIVERGENT co-listed pair settles STRUCTURALLY DIFFERENTLY, so a "locked" YES+NO can lose
+        # BOTH legs; it must never be silently tracked as a clean arb. Tracking is unchanged (the verdict is
+        # METADATA — research still gathers data on every pair, incl. NEEDS_MANUAL). Returns the summary so
+        # the caller can fold the counts into the session/health beacon (NOT the transitions schema).
+        summ = r.get("settle_verdict_summary")
+        print(f"[settle] {settle_verdict_line(summ)}")
+        div = settle_divergent_pairs(col)
+        if div:
+            print(f"[settle] !!! {len(div)} DIVERGENT co-listed pairs (both-legs-loss trap — NOT a clean arb; "
+                  f"still tracked as research data):")
+            for cat, slug, tag in div[:8]:
+                print(f"[settle]     DIVERGENT [{cat}] {tag} {slug}")
+        return summ
+
     colisted, rep = build_colisted_map()
     for kind in ("weather_cities_UNMAPPED", "sports_leagues_UNMAPPED"):
         if rep[kind]:
@@ -955,9 +986,11 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
     print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports + "
           f"{len(colisted.get('econ', []))} econ + {len(colisted.get('soccer3', []))} soccer3 "
           f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
+    _verdict = log_settle_verdict(colisted, rep)
     _counts = {"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
                "econ": len(colisted.get("econ", [])), "soccer3": len(colisted.get("soccer3", [])),
                "pmus": len(pm_targets), "kalshi": len(k_targets),
+               "settle_verdict": _verdict,                         # invariant #1 counts in the boot marker + beacon
                "build": _build_id(), "argv": " ".join(sys.argv[1:])}   # deploy-vs-crash forensics: 23
     logger.session_start(_counts)   # restart marker                   # indistinguishable restarts in 21h
     logger.health(_counts)          # liveness beacon (startup)
@@ -1059,6 +1092,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                     if r2[kind]: print(f"[coverage] unmapped {kind}: {r2[kind]}")
                 if r2.get("weather_bucket_MISALIGNED"):     # C4: surface newly-listed misaligned buckets each heartbeat
                     print(f"[coverage] {len(r2['weather_bucket_MISALIGNED'])} weather bucket misalignments (NOT paired)")
+                hb_verdict = log_settle_verdict(fresh, r2)  # invariant #1: re-log the verdict summary + flag DIVERGENT
                 new_pm, new_k = register(fresh)             # trackers for new weather days / games
                 if new_pm and conns.get("pm"):
                     for i in range(0, len(new_pm), shard_size):   # additional pmus subscriptions on one conn =
@@ -1118,6 +1152,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                 logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
                                "econ": len(fresh.get("econ", [])), "soccer3": len(fresh.get("soccer3", [])),
                                "pmus": len(pm_targets), "kalshi": len(k_targets),
+                               "settle_verdict": hb_verdict,        # invariant #1 counts in the liveness beacon
                                "fee_changes": fee_state.get("n"),   # tripwire count (None until first poll)
                                "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
                                           "k": round(now - last_rx["k"], 1) if last_rx["k"] else None}})  # off-box check can
