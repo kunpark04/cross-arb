@@ -456,3 +456,24 @@ EVERY resource and code path that implicitly relied on it — shared slots/sets/
 key especially — and prove each still holds or fails CLOSED. On a money path, an INDEPENDENT review (not the
 author's self-review) before arming is cheap insurance ([L14]); the author who removed the guard is the least
 likely to see what it was silently protecting.
+
+## L32 — Pin a venue ORDER-ACK parser to a CAPTURED REAL response; a synthetic fixture is false-green on the fill path
+
+**Pattern:** `bot-rs`'s `kalshi_order_filled` read the field `fill_count` and hard-required a `status` field. The
+live Kalshi create-response actually uses **`fill_count_fp`** (a fixed-point string) — the venue had RENAMED the
+count field. So the bot read EVERY real Kalshi fill as **not-filled** (`{"status":"executed","fill_count_fp":
+"1.00","remaining_count_fp":"0.00"}` → `parsed_filled=false`); on a real arb it would treat a filled leg as
+unfilled and release/recover into a **SILENT NAKED POSITION** (the catastrophic both-legs axis). The unit test
+was GREEN the whole time because its fixture was a hand-written `{"status":"executed","fill_count":"1"}` — **a
+shape the API never sends.** Found only by a LIVE `--probe-order` placing real 1¢ orders with raw-response
+logging (`PROBE_LOG_RAW`): the order filled, the bot said not-filled, the cancel 404'd. (pmus's parser was fine
+— it had been pinned to the real OpenAPI order schema.)
+
+**Rule:** a parser of any venue ORDER-ACK (fill / cancel / state — the money path) must be pinned to a **captured
+REAL response**, never a hand-authored fixture — fetch one live (`GET /portfolio/orders/{id}`) and assert against
+its exact field names. A synthetic fixture only proves the code is self-consistent, not that it matches the venue;
+on the fill path that false-green is catastrophic ([L26] "verify the resulting STATE, not a response field" is the
+live-side guard — this is its unit-test-side twin). Keep an env-gated raw-response dump in the order path so the
+next venue drift (renamed field, async-vs-sync fill — [L23]) is one probe away from visible, not one naked
+position away. And re-confirm: "it rested / I cancelled it" is a hypothesis to verify against positions, never a
+fact ([L26]) — here the bot's own fill flag was the thing that was wrong.

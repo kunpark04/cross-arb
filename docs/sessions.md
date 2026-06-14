@@ -6,6 +6,30 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 (cont. 7) — LIVE order-path verification (owner-gated, real account) → CRITICAL Kalshi fill-detection bug found + fixed
+
+Owner directive: "live verify everything you can, trigger it from this session, I override; measure latency in all
+execution types." Built `bot-rs --probe-order` (new `probe.rs`): place+cancel a 1¢ BUY-YES (the live-verified entry
+intent) on real markets, time submit+cancel, halt on any fill. Committed `9c38f8d`.
+
+- **CRITICAL bug found + fixed (`exec::kalshi_order_filled`):** the bot read the ack field `fill_count` + required a
+  `status` field, but the live Kalshi response uses **`fill_count_fp`** — so it read EVERY real Kalshi fill as
+  **not-filled** → on a real arb it would treat a filled leg as unfilled and recover into a SILENT NAKED POSITION.
+  Green in unit tests because the fixture was a fictional `fill_count` shape ([L32]). Caught by `PROBE_LOG_RAW` on a
+  real fill (`fill_count_fp:"1.00"` → `parsed_filled=false`). Fixed (quantity-based on the real field, status dropped);
+  test pinned to the captured live shape. **147 tests green, clippy clean.** pmus detection was already correct.
+- **Live-verified (real account, 1¢ orders):** both venues' write paths PLACE; Kalshi order RTT **p50 ~96-110ms**,
+  cancel **~95-103ms**; pmus cancel **57ms** (= its read RTT); compute ~0 → fully network-bound (confirms the cont.6
+  refactor's complexity work is irrelevant to fills). Read-only Kalshi auth + account also verified (balance $9.33).
+- **Config finding:** `bot-rs/.env` `KALSHI_RW_KEY_PATH`/`KALSHI_ACCESS_KEY` point at the **read-only** key (→ 403
+  write_required); ran the probe via one-shot env-override of the read-write pair. **Owner: repoint .env to trade.**
+- **Probe hardening:** book check now reads the live `/orderbook` (YES ask = 100 − best NO bid), not GetMarket's
+  stale quote; per-run nonce on the client_order_id avoids Kalshi dedup 409s; `PROBE_LOG_RAW` raw-ack dump retained.
+- **Residual:** the probe filled ~4× 1¢ BUY-YES (the stale-quote race, before the /orderbook + fill-detection fixes)
+  ≈ **$0.04** of weather YES contracts, self-resolving tonight; **0 resting orders** left.
+
+---
+
 ## 2026-06-14 (cont. 6) — ENGINE REFACTOR: hot-path time-complexity + split the 2970-line main.rs monolith
 
 Owner: "complete refactor of the engine + related parts; minimize time complexity." Scope (owner-chosen):
