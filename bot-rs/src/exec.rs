@@ -205,6 +205,20 @@ fn kalshi_order_filled(v: &serde_json::Value, qty: u32) -> bool {
     fill_count >= qty as f64
 }
 
+/// Extract the exchange order id from a CreateOrder ack: Kalshi nests it at `order.order_id` (live-verified
+/// 2026-06-11/-14), pmus puts it TOP-LEVEL at `id` (camel `orderId` tolerated). Empty when absent (an error
+/// body or a renamed field) — surfaced only later when a cancel/recovery has no id to target, so it is pinned
+/// to a captured real body in tests (closing the F1 audit gap; the same false-green class as [L32]).
+fn parse_venue_order_id(v: &serde_json::Value) -> String {
+    v.get("order")
+        .and_then(|o| o.get("order_id"))
+        .or_else(|| v.get("orderId"))
+        .or_else(|| v.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Did the PMUS order FILL the full requested `qty`? With `synchronousExecution` (set in
 /// `build_pmus_payload`) the create blocks until the order resolves. A bare 2xx WITHOUT fill evidence is
 /// acceptance only ("accepted" != "filled"). FILLED iff ANY of these prove the full requested qty filled:
@@ -467,14 +481,7 @@ impl LiveBackend {
         // LOG *before* the status-gate returns, so a reject/429 is recorded too, with its raw body.
         // venue_order_id: VERIFIED live (Kalshi `{"order":{"order_id":..}}`; pmus top-level `{"id":..}`).
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-        let venue_order_id = v
-            .get("order")
-            .and_then(|o| o.get("order_id"))
-            .or_else(|| v.get("orderId"))
-            .or_else(|| v.get("id"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
+        let venue_order_id = parse_venue_order_id(&v);
         // FILLED vs merely ACCEPTED: a 2xx create is acceptance, not a fill (the core real-money bug). Read the
         // venue body for the FULL requested qty actually filling — Kalshi synchronously (`fill_count_fp`); pmus
         // with `synchronousExecution`. A non-fill (resting/0-exec) is NOT a hedge leg -> `filled:false`.
@@ -945,6 +952,22 @@ mod tests {
         assert!(kalshi_order_filled(&legacy, 1), "legacy fill_count field still works (back-compat)");
         let flat: serde_json::Value = serde_json::from_str(r#"{"fill_count":2}"#).unwrap();
         assert!(kalshi_order_filled(&flat, 2), "flat body + numeric legacy fill_count");
+    }
+
+    /// F1 (audit gap, [L32] class): `venue_order_id` extraction pinned to the CAPTURED real shapes — Kalshi
+    /// nests at `order.order_id`, pmus is top-level `id`. Live-verified by the probe's cancel working; now
+    /// unit-pinned so a rename can't silently empty the id (-> a skipped cancel / un-targetable naked-leg recovery).
+    #[test]
+    fn venue_order_id_from_real_shapes() {
+        // REAL Kalshi CreateOrder body (captured live 2026-06-14).
+        let k: serde_json::Value = serde_json::from_str(r#"{"order":{"order_id":"40feecd5-3c83-4259-a623-8aa053e1a40b","status":"resting","fill_count_fp":"0.00"}}"#).unwrap();
+        assert_eq!(parse_venue_order_id(&k), "40feecd5-3c83-4259-a623-8aa053e1a40b");
+        // REAL pmus synchronous CreateOrderResponse: top-level {"id":..,"executions":[..]}.
+        let p: serde_json::Value = serde_json::from_str(r#"{"id":"pm-ord-9","executions":[{"lastShares":"1","lastPx":"0.01"}]}"#).unwrap();
+        assert_eq!(parse_venue_order_id(&p), "pm-ord-9");
+        // camelCase `orderId` tolerated; an error/absent body -> empty (never crashes; surfaces at cancel-time).
+        assert_eq!(parse_venue_order_id(&serde_json::json!({"orderId": "x"})), "x");
+        assert_eq!(parse_venue_order_id(&serde_json::json!({"error": {"code": "bad"}})), "");
     }
 
     /// FIX B: pmus fill-detection pinned to the OpenAPI schema field names (orders-schema.json, 2026-06-11).
