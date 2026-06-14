@@ -13,28 +13,29 @@ Baseline before any edit: **147 passed, 0 failed** (the green gate to hold). Cav
 execution is network-bound (~86–261 ms RTT) so this buys CPU/allocation efficiency + clean scaling +
 maintainability, **not faster fills**. The discovery join is already pre-indexed O(P+K) — not a target.
 
-### Phase 1 — surgical hot-path complexity wins (run tests after each)
-- [ ] `book.rs` `PmusBook` **sorted storage**: sort the two ladders once in `apply_snapshot` (bids desc,
-      asks asc); `best()` O(n)→**O(1)** via `.first()`; `yes_bid/ask_ladder()` drop the per-call clone+sort
-      (O(n log n)→O(n)). API + return types UNCHANGED → all `book` tests pass verbatim.
-- [ ] `signal.rs` `signal` + `game_signal`: replace the per-call `opts: Vec<(Dir,f64)>` heap alloc with
-      fixed `Option<(Dir,f64)>` locals; PK-wins-ties + `no_arb`/`crossed` + empty-default semantics IDENTICAL.
-- [ ] `main.rs` hot loop: non-allocating freshness check (drop the per-frame `kalshi_tickers()` Vec); store
-      `by_slug: HashMap<String, Arc<LivePair>>` so the per-frame pair `.cloned()` is an Arc-bump, not a
-      multi-String deep clone. Behavior identical.
-- [ ] `cargo test` green (147) + `cargo clippy --all-targets` clean after Phase 1; commit.
+### Phase 1 — surgical hot-path complexity wins — ✅ (commit `51c4e9a`)
+- [x] `book.rs` `PmusBook` **sorted storage**: ladders sorted once in `apply_snapshot` (bids desc / asks asc);
+      `best()` O(n)→**O(1)** via `.first()`; `yes_bid/ask_ladder()` drop the per-read clone+sort (O(n log n)→O(n)).
+      API + return types UNCHANGED → all `book` tests pass verbatim.
+- [x] `signal.rs` `signal` + `game_signal`: per-call `opts: Vec<(Dir,f64)>` heap alloc → fixed `Option` locals;
+      PK-wins-ties + `no_arb`/`crossed` + empty-default semantics IDENTICAL.
+- [x] `main.rs` hot loop: non-allocating freshness check (no per-frame `kalshi_tickers()` Vec); `by_slug`
+      stored as `Arc<LivePair>` so the per-frame `.cloned()` is a refcount bump (deep clone only on the rare fire path).
+- [x] `cargo test` 147 green + `cargo clippy --all-targets` clean; `--smoke` reference captured.
 
-### Phase 2 — split `main.rs` (mechanical module moves, zero behavior change; compile+test after EACH)
-- [ ] `pricing.rs` — leg planning/building/pricing + `affordable`/`realized_edge_clears_floor`/
-      `position_from_intents`/exit-pricing (+ their tests). Compile+test.
-- [ ] `bookkeeping.rs` — exposure/position/recovery/unwind submission fns + `apply_outcome`/`qualifying_add`
-      (+ tests). Compile+test.
-- [ ] `refresh.rs` — `refresh_loop`/`report_coverage`/`prune_step`/`diff_targets` (+ tests). Compile+test.
-- [ ] `smoke.rs` — offline `smoke`/`report`. Compile+test.
-- [ ] `live.rs` — `run_live` + loop types (`LivePair`/`PairState`/`SubmitKind`/`FlatKind`/`SubmitOutcome`) +
-      `lock`/`poll_opt`/`supervise_fatal`/`led_by_from_prior`. `main.rs` → `main`+`banner`+mod decls only.
-- [ ] Final: `cargo test` 147 green + `cargo clippy --all-targets` clean + `cargo run -- --smoke` unchanged
-      output; adversarial self-review (money path untouched); commit. Update sessions.md + a decision entry.
+### Phase 2 — split `main.rs` (2970→142 lines; mechanical, zero behavior change) — ✅
+Delegated to the coding-agent against hard gates (147 tests / clippy / byte-identical smoke), then
+independently re-verified. 7 new modules, all moved items `pub(crate)` (incl. struct fields):
+- [x] `pair.rs` (172) — `LivePair`/`PairState`/`SubmitKind`/`FlatKind`/`SubmitOutcome` + `lock`/`pair_tickers`.
+- [x] `pricing.rs` (545) — leg planning/building/pricing + `affordable`/`realized_edge_clears_floor`/exit-pricing.
+- [x] `bookkeeping.rs` (1274) — exposure/position/recovery/unwind + `apply_outcome`/`qualifying_add` (W-1 verbatim).
+- [x] `refresh.rs` (225) — `refresh_loop`/`report_coverage`/`prune_step`/`diff_targets`.
+- [x] `smoke.rs` (185) — offline `smoke`/`report`/`fire_legs`.
+- [x] `live.rs` (438) — `run_live`/`poll_opt`/`supervise_fatal`/`led_by_from_prior`.
+- [x] `test_support.rs` (cfg-test) — the 3 cross-module fixtures (`q_pk`/`wx_pair`/`wc_pair`); tests distributed
+      per owning module (pair 2 / pricing 11 / bookkeeping 24 / refresh 2).
+- [x] **Re-verified independently:** `cargo test` 147/0, `cargo clippy --all-targets` clean, `--smoke` program
+      output byte-identical, `git status` = only `M main.rs` + the 7 new files. Update sessions.md.
 
 ## bot-rs — WORLD CUP tradeable (LIVE path) — IN PROGRESS
 
