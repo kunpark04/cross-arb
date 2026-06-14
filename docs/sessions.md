@@ -6,6 +6,28 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 (cont.) — World Cup 3-leg Dutch-book arb (the fuller WC opportunity, dry-run)
+
+Owner: "go all the way." Added the cross-venue 3-leg **Dutch book** alongside the per-outcome binary arbs
+(`916c89c`): buy YES on all 3 outcomes, each on its cheapest venue; lock iff the 3 cheapest sum < $1 (one
+pays $1 → profit = $1 − basket_cost, any result). On one venue the 3 YES sum > 1 (overround); only the
+cross-venue-cheapest set can dip below 1.
+
+- **Architecture:** a PARALLEL 3-leg path (`SoccerTriple`/`dutch_book`/`submit_triple`/`TripleAck`/
+  `evaluate_triple`/`TriplePosition`/`triple_unwind`) — the proven **2-leg core is BYTE-UNCHANGED** (135
+  baseline tests pass untouched; git-diff = 9 deletions, all surgical insertion points).
+- **Naked-pair recovery (the critical part):** a partial fill (1 or 2 of 3) flattens EVERY filled leg +
+  **FAILS-CLOSED** (halt) on any unrecoverable leg — 3 dedicated tests prove a silently-un-flattened 2-of-3
+  (= directional exposure) cannot occur. Reuses the 2-leg recovery primitive per leg.
+- **Verified:** 161 tests (+26), clippy clean; smoke fires `basket_cost=0.92, net=4.1¢` (3 YES legs, one per
+  outcome on its cheapest venue). Self-review 0 CRITICAL; the per-game cluster cap bounds the combined
+  basket+binary exposure (correlated).
+- **Before arming (owner gated, 0006):** release held-basket exposure on settlement (the 2 WARNs — a
+  safe-failure: the bot stops OPENING baskets, never over-trades); void-tail calibration; an INDEPENDENT
+  review of the recovery fail-close + exposure lifecycle. Dry-run by default.
+
+---
+
 ## 2026-06-14 — World Cup tradeable (live, dry-run): per-outcome BINARY arbs, not a 3-leg basket
 
 Owner directive: make the FIFA World Cup (the coverage audit's one real untracked block, ~60 games, +34%)
