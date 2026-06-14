@@ -440,3 +440,19 @@ settlement payoff. The honest caveats for flipping are specific and real — it 
 same-direction widening), it's 4 fills of execution/naked risk vs 0 for holding, it converts lock-and-forget into
 basis-TIMING, and the flip IS the fat-fast ~66%-toxic regime — so state THOSE rather than dismissing the idea.
 It's directly backtestable on the monitor's logged FLIP transitions (OPEN/CLOSE/FLIP/WIDEN/NARROW).
+
+## L31 — Removing a structural guard means auditing EVERY shared resource it implicitly protected
+
+Relaxing bot-rs's one-position-per-slug guard (to add scale-in/re-entry, [0019]) exposed a latent
+silent-naked-leg bug (W-1): the per-slug `flattening` slot was a boolean `HashSet` that ASSUMED one position per
+slug, so a half-filled add racing an unwind read the unwind's flatten as "this leg is covered" and fired neither
+a recovery nor a halt — a live unhedged position. The guard had silently protected that assumption; removing it
+broke it. The author's self-review only flagged it as a *risk*; an INDEPENDENT review caught + reproduced it. The
+fix made `flattening` record its KIND (`Recovery`/`Unwind`) so a recovery fails-CLOSED when an unwind (a
+different leg) holds the slot.
+
+**Rule:** when you remove a structural invariant (a guard, a uniqueness constraint, a 1:1 assumption), enumerate
+EVERY resource and code path that implicitly relied on it — shared slots/sets/maps keyed on the now-non-unique
+key especially — and prove each still holds or fails CLOSED. On a money path, an INDEPENDENT review (not the
+author's self-review) before arming is cheap insurance ([L14]); the author who removed the guard is the least
+likely to see what it was silently protecting.

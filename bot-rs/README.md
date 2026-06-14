@@ -31,6 +31,7 @@ of least resistance, because the readiness audit + backtest concluded the edge i
 | Event-proximity gate | `MAX_DAYS_TO_EVENT` | 2.0 | capital velocity — skip **any** arb more than this many days before its settlement event (game for sports, release for econ); weather (event ~now) is naturally exempt. Category-agnostic; dormant until stage-2 supplies `days_to_event`. `<=0` disables |
 | Postponement unwind | `KALSHI_VOID_WINDOW_DAYS` | 2.0 | flatten a held **sports** pair (SELL both legs) when a postponement's makeup is past Kalshi's void window (or unknown) — before Kalshi voids. Logic in `unwind.rs`; stage-2 wires live statsapi detection |
 | Settle-clean | `REQUIRE_SETTLE_CLEAN` | true | only trade settlement-verified pairs (weather; econ/sports per recon) |
+| Add-to-held (scale-in / re-entry) | `ENABLE_SCALE_IN` / `ENABLE_REENTRY` / `MAX_POSITIONS_PER_SLUG` | **off / off / 1** | **OPTION-VALUE, OFF by default** ([0019](../decisions/0019-scale-in-reentry-multi-position.md)): allow a SECOND locked pair on a held bucket — scale-in (base edge still live) or re-entry (edge closed, position still held) — when a bigger same-direction arb (`net ≥ base + ADD_TAU_GAIN`) appears. Multi-position-per-slug with **exact per-position exposure release**; concentration bounded by the per-pair notional + per-slug count caps. Marginal value on current data (capital, not opportunity, binds); built for readiness. Arming = the riskiest money-path change since the Dutch book — needs a final independent review of the W-1 fix first |
 | Key path | `KALSHI_RW_KEY_PATH` | unset | external path to the read-write key — loaded at runtime, never copied into the repo |
 
 The bot **refuses to start** in `live`+`prod` without `CROSSARB_I_UNDERSTAND_PROD=yes`. The recommended
@@ -95,7 +96,7 @@ deploy target is **Linux**, where none of this applies (no `windows-sys`, no min
 ```bash
 cd bot-rs
 cp .env.example .env   # fill in key paths + safety vars (gitignored; keys stay external)
-cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind + naked-leg recovery (123 tests)
+cargo test             # full suite: risk gates + fee/signal parity (1:1 + game) + book + venue parsers + discovery + postpone-detector + auth + unwind + naked-leg recovery + multi-position scale-in/re-entry (147 tests)
 cargo run              # dry-run smoke (no orders; safety banner + gate/unwind decisions)
 cargo run -- --smoke   # force the offline smoke even with creds present
 ```

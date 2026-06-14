@@ -6,6 +6,67 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 (cont. 5) — SCALE-IN + RE-ENTRY built into the live bot (multi-position-per-slug, owner-directed)
+
+Owner: "build both … to the live" — scale-in (pile onto a still-live edge) + re-entry (a new arb on a held
+bucket) — despite the cont. 4 verdict that both are marginal. Built as a SAFE, OFF-by-default option-value
+capability. Design-of-record [tasks/scale-in-reentry-design.md](../tasks/scale-in-reentry-design.md) + [0019] →
+built `8164710` → independent review caught a CRITICAL → fixed `95cf753`.
+
+- **Change:** position tracking one-per-slug → **multiple-per-slug** (`HashMap<slug, SlugPositions{Vec<HeldLeg>}>`).
+  Load-bearing (R1): `decrement_exposure`'s whole-bucket `per_pair.remove` is GONE → a unified `subtract_exposure`
+  releases each position's stored `cost_per×size` EXACTLY (the desync the old one-position guard prevented). The
+  entry guard's `contains_key` clause → a qualifying-add gate (same-dir + `net≥base+tau` + flag + per-slug cap);
+  the `halt||pending||flattening` de-dup stays exact.
+- **Safe-by-default:** `ENABLE_SCALE_IN`/`ENABLE_REENTRY` **both OFF**, `MAX_POSITIONS_PER_SLUG` **1** →
+  BYTE-IDENTICAL to today; loud `ADD-TO-HELD ARMED` banner when non-default.
+- **W-1 (CRITICAL, gated) — caught by the INDEPENDENT review** (the self-review only flagged it as a risk): an
+  unwind racing a half-filled add on one slug left a SILENT naked leg (`recover_naked_leg` read the unwind's
+  `flattening` as "covered"). Unreachable at defaults; reachable only armed with cap≥2. **Fixed:** `flattening`
+  now records its KIND (`Recovery`/`Unwind`) → a recovery fails-CLOSED (halt) when an unwind holds the slot.
+  Invariant + regression: a filled leg is NEVER left without a recovery OR a halt ([L31]).
+- **Verified:** **147 tests** (146 baseline + 1), clippy clean, smoke byte-identical. Before arming (owner): the
+  standing demo round-trip + pmus signing + a FINAL fresh review of the W-1 fix. Marginal value — armed by owner choice only.
+
+---
+
+## 2026-06-14 (cont. 4) — Flip / Add feasibility (read-only): both marginal; capital is the binding constraint
+
+The owner's flip / scale-in / re-entry ideas measured end-to-end on the 5-day persistence data (3 backtests + 2
+independent stats audits). **Neither clears the bar to build on current data.**
+
+- **FLIP** (close-on-basis-cross + reverse): weather **0/101** + econ **0/4** NEVER flip (a 1:1 bucket's basis
+  converges, never crosses — structural, audit-confirmed); only sports flips (**1.7%**), and its close mark is
+  **structurally unpriceable** (the Kalshi YES *bid* isn't logged). A sports-line-lag play that's rare AND
+  unmeasurable; measuring it needs a monitor change (log the Kalshi YES bid).
+- **ADD** (scale-in + re-entry): the unconstrained ~$98.69 (phantom-lensed) collapses to **~$0 bankroll-netted** —
+  the base strategy already saturates both $250 pools (3/4 adds skipped for capital). Re-entry's apparent value is
+  the **capital-velocity effect** (~$9/5d only at the realistic sports-settle hold, guard-blocked); true scale-in
+  is **near-absent** (~$0, invariant to hold + bankroll). Capital, not opportunity, binds — confirms the thesis.
+- **Method:** `flip_add_backtest.py` + `bankroll_add_backtest.py` reuse `capturable()`'s [L20]/[L28] phantom
+  filters; the stats audits forced disclosure of a hold-window sensitivity, a 27% flat-ladder-phantom share, and a
+  realized-vs-total window-boundary artifact ([L30]). PAPER/GROSS, effective-n≈5 — method demo, not validation.
+
+---
+
+## 2026-06-14 (cont. 3) — Settlement gate auto-wired into discovery + WC join robustness + droplet REDEPLOYED (WC monitoring LIVE)
+
+- **Settlement verdict auto-attached** (`c89c009`, todo #14): `build_colisted_map` stamps `settle_status` +
+  `tail_cost_cents` on EVERY discovered pair via `settlement_identity` ([0018]); the monitor logs `[settle] N
+  IDENTICAL / TAIL / DIVERGENT / NEEDS_MANUAL` + flags DIVERGENT (the gate now runs on every live-discovered market
+  — the owner directive). Live: **37 IDENTICAL / 260 TAIL / 0 DIVERGENT / 117 NEEDS_MANUAL** over 414 pairs. Guarded
+  import → a visible degrade-note where the gate's analysis deps aren't shipped.
+- **WC country-code join made robust** (`2c16f00`): the hardcoded 3-entry alias table → a normalized-full-name
+  fallback (exact, L1-safe) so ALL code mismatches bind (current + future knockout rounds), `[wc-unbound]` loud on a
+  double-miss. Caught: 9 games have identical codes but DIFFERENT names (USA vs United States) → exact-code stays
+  PRIMARY so a name-only matcher can't falsely fail them.
+- **Droplet REDEPLOYED** (owner-greenlit, [0006](../decisions/0006-deploy-on-digitalocean-consult-first.md)): the
+  read-only monitor now tracks **42 weather + 208 sports + 13 econ + 192 soccer3 (World Cup)** — WC edge history
+  starts accumulating (closes the "no WC backtest data" gap). The settle-verdict degrades to a laptop-side note on
+  the droplet by design (`analyze_persistence` dep stays off the collection box).
+
+---
+
 ## 2026-06-14 (cont. 2) — Dutch book REMOVED — narrowed to the single 2-leg strategy (pre-go-live de-risk)
 
 Heading toward a real-money go-live, the owner narrowed to ONE arb strategy and pulled the 3-leg Dutch book
