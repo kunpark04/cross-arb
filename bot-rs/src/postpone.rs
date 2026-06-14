@@ -216,7 +216,10 @@ pub async fn poll_mlb_postponements(
             let map = positions.lock().unwrap();
             let mut v = Vec::new();
             for hp in map.values() {
-                if hp.pos.cat == crate::types::Cat::Sports && hp.league != "mlb" && warned_non_mlb.insert(hp.league.clone()) {
+                // an EMPTY league = a position enrolled WITHOUT poll metadata (weather/econ never reach here
+                // with cat==Sports; a WORLD-CUP `Cat::Sports` pair does, on purpose — it has no statsapi
+                // source). Skip the "no source" warning for it: there is no league name to report.
+                if hp.pos.cat == crate::types::Cat::Sports && !hp.league.is_empty() && hp.league != "mlb" && warned_non_mlb.insert(hp.league.clone()) {
                     println!("[postpone] no auto-unwind source for league {} (statsapi is MLB-only)", hp.league);
                 }
                 if hp.league == "mlb" && !hp.team_a.is_empty() && !hp.team_b.is_empty() {

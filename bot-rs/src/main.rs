@@ -124,17 +124,21 @@ fn banner(cfg: &Config) {
     println!();
 }
 
-/// A co-listed pair the live loop tracks. Weather/econ are 1:1 (`kalshi_b = None`). SPORTS is 2-outcome:
-/// `kalshi` = team-A ticker (the team pmus lists as YES), `kalshi_b = Some(team-B ticker)` — BOTH Kalshi
-/// books are subscribed and the 2-outcome `game_signal` needs both. Filled by `discovery`.
+/// A co-listed pair the live loop tracks. Weather/econ are 1:1 (`kalshi_b = None`). MONEYLINE SPORTS is
+/// 2-outcome: `kalshi` = team-A ticker (the team pmus lists as YES), `kalshi_b = Some(team-B ticker)` — BOTH
+/// Kalshi books are subscribed and the 2-outcome `game_signal` needs both. A WORLD-CUP outcome is a BINARY
+/// pair (`kalshi_b = None`, `soccer = true`) routed through the 1:1 `signal` path. Filled by `discovery`.
 #[derive(Clone, Debug)]
 struct LivePair {
     slug: String,         // pmus market slug
-    kalshi: String,       // Kalshi ticker (team-A ticker for sports)
-    kalshi_b: Option<String>, // SPORTS: team-B (away) Kalshi ticker; None for weather/econ
+    kalshi: String,       // Kalshi ticker (team-A ticker for moneyline sports)
+    kalshi_b: Option<String>, // MONEYLINE SPORTS: team-B (away) Kalshi ticker; None for weather/econ/WC
     cat: Cat,
     cluster: String,
     settle_clean: bool,
+    /// WORLD-CUP per-outcome marker (see `discovery::Pair::soccer`): a binary `Cat::Sports` pair routed via
+    /// `signal`. Lets the loop skip enrolling a WC pair in the MLB-only postponement poll (no statsapi source).
+    soccer: bool,
     days_to_event: Option<f64>,
     /// pmus per-market order constraints (FIX C): price tick the pmus leg must be a multiple of, and the
     /// minimum order qty pmus accepts. `None` -> the leg builder leaves the price unquantized / skips the
@@ -157,7 +161,7 @@ impl LivePair {
 
 impl From<discovery::Pair> for LivePair {
     fn from(p: discovery::Pair) -> Self {
-        LivePair { slug: p.slug, kalshi: p.kalshi, kalshi_b: p.kalshi_b, cat: p.cat, cluster: p.cluster, settle_clean: p.settle_clean, days_to_event: p.days_to_event, pm_min_tick: p.pm_min_tick, pm_min_qty: p.pm_min_qty }
+        LivePair { slug: p.slug, kalshi: p.kalshi, kalshi_b: p.kalshi_b, cat: p.cat, cluster: p.cluster, settle_clean: p.settle_clean, soccer: p.soccer, days_to_event: p.days_to_event, pm_min_tick: p.pm_min_tick, pm_min_qty: p.pm_min_qty }
     }
 }
 
@@ -234,8 +238,8 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
     let initial = match discovery::discover(&http).await {
         Ok(d) => {
             println!(
-                "[discovery] {} weather + {} econ + {} sports pairs tracked ({} total subscribable)",
-                d.weather_pairs, d.econ_pairs, d.sports_pairs, d.pairs.len()
+                "[discovery] {} weather + {} econ + {} sports + {} world-cup pairs tracked ({} total subscribable)",
+                d.weather_pairs, d.econ_pairs, d.sports_pairs, d.soccer_pairs, d.pairs.len()
             );
             report_coverage(&d);
             d.pairs
@@ -639,7 +643,10 @@ fn track_position(
     pair: &LivePair,
     pos: Position,
 ) {
-    let (league, date, team_a, team_b) = if pair.cat == Cat::Sports {
+    // poll metadata is for the MLB postponement poll ONLY. A WORLD-CUP pair is `Cat::Sports` but has no
+    // statsapi source (`soccer`), so it enrolls with EMPTY metadata (like weather/econ) -> the poll skips it.
+    // Its tiny void/postpone tail is the noted follow-on, not handled by the MLB poll.
+    let (league, date, team_a, team_b) = if pair.cat == Cat::Sports && !pair.soccer {
         let last_seg = |t: &str| t.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
         (
             discovery::pm_league(&pair.slug).unwrap_or_default(),
@@ -970,6 +977,9 @@ fn report_coverage(d: &discovery::Discovery) {
     }
     if !d.sports_leagues_unmapped.is_empty() {
         println!("[coverage] UNMAPPED sports leagues: {:?}", d.sports_leagues_unmapped);
+    }
+    if !d.soccer_leagues_unmapped.is_empty() {
+        println!("[coverage] UNMAPPED soccer (drawable-outcome) leagues: {:?}", d.soccer_leagues_unmapped);
     }
     if d.weather_buckets_misaligned > 0 {
         println!("[coverage] {} weather buckets had no identical-bounds Kalshi twin (NOT paired)", d.weather_buckets_misaligned);
@@ -1450,7 +1460,7 @@ fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
     // a 1:1 LivePair (weather/econ) builder for the smoke (kalshi_b = None).
     let lp = |slug: &str, kalshi: &str, cat: Cat, cluster: &str| LivePair {
         slug: slug.into(), kalshi: kalshi.into(), kalshi_b: None, cat, cluster: cluster.into(),
-        settle_clean: false, days_to_event: None, pm_min_tick: None, pm_min_qty: None,
+        settle_clean: false, soccer: false, days_to_event: None, pm_min_tick: None, pm_min_qty: None,
     };
 
     // (1) the live U-3 >=4.2 gap (pmus YES 0.75 / Kalshi YES 0.86) — but ECON, settlement NOT yet
@@ -1505,6 +1515,7 @@ fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
         cat: Cat::Sports,
         cluster: "mlb-2026-06-16".into(),
         settle_clean: false,
+        soccer: false,
         days_to_event: Some(5.0),
         pm_min_tick: None,
         pm_min_qty: None,
@@ -1529,6 +1540,38 @@ fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
     sport_pair_soon.days_to_event = Some(1.0);
     println!("[smoke] sports arb (assumed-settled), 1 day pre-game -> within window:");
     report(&sc, &sport_pair_soon, &sport_soon, Edge { net: 0.03, dir: Dir::PK }, backend);
+
+    // (4b) WORLD CUP (per-outcome BINARY): one outcome ("Germany wins") is its OWN binary co-listed pair —
+    //      pmus YES (atc-fwc-ger-cuw-…-ger) + Kalshi NO (KXWCGAME-…-GER). kalshi_b=None + soccer=true, so it
+    //      flows through the BINARY signal path (buy YES cheap + NO dear), NOT game_signal. settle_clean=true
+    //      (regulation-clean), so the gate trades it on edge alone — 1 day pre-game (within the proximity
+    //      window). This is exactly the weather/econ 1:1 shape, proving WC reuses that path unchanged.
+    let wc_pair = LivePair {
+        slug: "atc-fwc-ger-cuw-2026-06-14-ger".into(),
+        kalshi: "KXWCGAME-26JUN14GERCUW-GER".into(),
+        kalshi_b: None, // per-outcome BINARY -> routed via `signal`, never `game_signal`
+        cat: Cat::Sports,
+        cluster: "fwc-ger-cuw-2026-06-14".into(),
+        settle_clean: true, // regulation-clean (the void tail is far below a tradeable edge)
+        soccer: true,
+        days_to_event: Some(1.0),
+        pm_min_tick: None,
+        pm_min_qty: None,
+    };
+    let wc = Quote {
+        market: wc_pair.slug.clone(),
+        cat: Cat::Sports,
+        pm: Book { yes_bid: Some(0.40), yes_ask: Some(0.42), age_s: 0.3 }, // pmus YES (back "Germany wins") cheap
+        k: Book { yes_bid: Some(0.45), yes_ask: Some(0.46), age_s: 0.0 },  // Kalshi YES dearer -> buy NO on Kalshi
+        k_b: None, // BINARY: no away-team book (the whole point — WC is NOT the 2-team game model)
+        depth: Depth { c2: 80, c1: 90, c0: 100 },
+        settle_clean: true,
+        cluster: wc_pair.cluster.clone(),
+        led_by: None,
+        days_to_event: Some(1.0),
+    };
+    println!("[smoke] world-cup outcome arb (BINARY: pmus YES + Kalshi NO on one outcome), 1 day pre-game:");
+    report(&sc, &wc_pair, &wc, Edge { net: 0.03, dir: Dir::PK }, backend);
 
     // (5) postponement unwind, LIVE PATH on a SYNTHETIC schedule (no network): a held MLB pair (dir PK:
     //     YES@pmus + YES@Kalshi-B) + a `snap`'d "Postponed, makeup 5d out" schedule game -> the DETECTOR
@@ -1610,6 +1653,7 @@ mod tests {
             cat: Cat::Weather,
             cluster: "nychigh-2026-06-11".into(),
             settle_clean: true,
+            soccer: false,
             days_to_event: None,
             pm_min_tick: None,
             pm_min_qty: None,
@@ -1638,6 +1682,83 @@ mod tests {
         assert_eq!(kp[1].market, "tc-temp-nychigh-2026-06-11-gte95f");
     }
 
+    /// A WORLD-CUP outcome LivePair (kalshi_b=None, soccer=true). It builds a clean 1:1 cluster and a
+    /// BINARY pair builder for the smoke/test.
+    fn wc_pair() -> LivePair {
+        LivePair {
+            slug: "atc-fwc-ger-cuw-2026-06-14-ger".into(),
+            kalshi: "KXWCGAME-26JUN14GERCUW-GER".into(),
+            kalshi_b: None, // per-outcome BINARY
+            cat: Cat::Sports,
+            cluster: "fwc-ger-cuw-2026-06-14".into(),
+            settle_clean: true,
+            soccer: true,
+            days_to_event: Some(1.0),
+            pm_min_tick: None,
+            pm_min_qty: None,
+        }
+    }
+
+    /// ROUTING (the money-path self-review item a): a WORLD-CUP outcome pair MUST take the BINARY `signal`
+    /// arm, NEVER `game_signal`. The live loop routes on `kalshi_b.is_some()` (Some -> game_signal; None ->
+    /// signal), so a WC pair (kalshi_b=None) is structurally guaranteed the binary arm — assert that, AND
+    /// prove it via the LEG SHAPE: `build_legs` on a WC pair produces the 1:1 binary shape (YES@pmus(slug) +
+    /// NO@Kalshi(ticker) for PK; YES@Kalshi + NO@pmus for KP), which ONLY the `(None, dir)` arms of plan_legs
+    /// emit. A `game_signal`/2-team pair would instead make a YES@Kalshi-B leg — the mis-hedge this prevents.
+    #[test]
+    fn world_cup_pair_routes_through_binary_signal_not_game_signal() {
+        let pair = wc_pair();
+        // the exact routing predicate the live loop uses (main::run_live): None -> binary `signal` arm.
+        assert!(pair.kalshi_b.is_none(), "a WC pair has no kalshi_b -> the loop takes the binary signal arm");
+        assert!(pair.soccer, "and it is flagged soccer (regulation-settlement basis)");
+        // dir PK: pmus YES ask 0.42 (back 'Germany wins' cheap on pmus) + Kalshi NO = 1 - Kalshi YES bid 0.45.
+        let q = Quote {
+            market: pair.slug.clone(),
+            cat: Cat::Sports,
+            pm: Book { yes_bid: Some(0.40), yes_ask: Some(0.42), age_s: 0.0 },
+            k: Book { yes_bid: Some(0.45), yes_ask: Some(0.46), age_s: 0.0 },
+            k_b: None, // BINARY: there is NO away-team book — the structural proof WC isn't the 2-team model
+            depth: Depth { c2: 50, c1: 50, c0: 50 },
+            settle_clean: true,
+            cluster: pair.cluster.clone(),
+            led_by: None,
+            days_to_event: Some(1.0),
+        };
+        // PK legs = YES@pmus(slug) @ 42c + NO@Kalshi(ticker) @ (1-0.45)=55c — the weather/econ 1:1 shape.
+        let pk = build_legs(&pair, &q, Dir::PK, 1).unwrap();
+        assert_eq!((pk[0].venue, pk[0].side, pk[0].price_cents), (Venue::Pmus, Side::Yes, 42));
+        assert_eq!(pk[0].market, "atc-fwc-ger-cuw-2026-06-14-ger", "the pmus leg uses the outcome SLUG");
+        assert_eq!((pk[1].venue, pk[1].side, pk[1].price_cents), (Venue::Kalshi, Side::No, 55));
+        assert_eq!(pk[1].market, "KXWCGAME-26JUN14GERCUW-GER", "the Kalshi leg uses the outcome TICKER (binary), not a team-B ticker");
+        // the per-outcome legs LOCK (self-review item b): YES on the cheap venue + NO on the dear venue, on
+        // the SAME outcome (same slug/ticker pair) — so it pays $1 whichever way THIS outcome resolves.
+        assert!(pk[0].side == Side::Yes && pk[1].side == Side::No, "YES@one venue + NO@other on the same outcome");
+        // KP flips: YES@Kalshi(ticker) 46c + NO@pmus(slug) = 1 - 0.40 = 60c. Still the 1:1 binary shape.
+        let kp = build_legs(&pair, &q, Dir::KP, 1).unwrap();
+        assert_eq!((kp[0].venue, kp[0].side, kp[0].market.as_str()), (Venue::Kalshi, Side::Yes, "KXWCGAME-26JUN14GERCUW-GER"));
+        assert_eq!((kp[1].venue, kp[1].side, kp[1].market.as_str()), (Venue::Pmus, Side::No, "atc-fwc-ger-cuw-2026-06-14-ger"));
+    }
+
+    /// `track_position` does NOT enroll a WORLD-CUP pair in the MLB postponement poll (no statsapi WC
+    /// source): a WC `Cat::Sports` pair gets EMPTY poll metadata (like weather/econ), while a moneyline MLB
+    /// pair still derives league/date/abbrevs. (The held position is still recorded for exposure/dedup.)
+    #[test]
+    fn track_position_skips_mlb_poll_for_world_cup() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pair = wc_pair();
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 1, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 55, qty: 1, client_order_id: "b".into() },
+        ];
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
+        track_position(&positions, &pair, pos);
+        let hp = positions.lock().unwrap().get(&pair.slug).cloned().expect("WC position still recorded (exposure/dedup)");
+        // EMPTY poll metadata -> the MLB poll's `league=="mlb"` filter skips it (no wrong unwind / no warning).
+        assert_eq!((hp.league.as_str(), hp.date.as_str(), hp.team_a.as_str(), hp.team_b.as_str()), ("", "", "", ""),
+            "a WC pair enrolls with EMPTY MLB-poll metadata (it has no statsapi source)");
+    }
+
     /// SPORTS leg construction: PK = "YES@pmus(slug) and YES@Kalshi-B(ticker_b)"; KP = "YES@Kalshi-A
     /// (ticker_a) and NO@pmus(slug)". Both Kalshi legs carry their own TICKER (the leg-market fix), and
     /// the sports PK second leg is a YES on the AWAY team's book (kb ask), not a NO leg.
@@ -1650,6 +1771,7 @@ mod tests {
             cat: Cat::Sports,
             cluster: "mlb-2026-06-16".into(),
             settle_clean: false,
+            soccer: false,
             days_to_event: Some(1.0),
             pm_min_tick: None,
             pm_min_qty: None,
@@ -1788,11 +1910,18 @@ mod tests {
     /// risk gate / book wiring is fed the right values per category.
     #[test]
     fn livepair_from_discovery_preserves_settle_clean_and_tickers() {
-        let wx = discovery::Pair { slug: "tc-temp-x-2026-06-11-gte95f".into(), kalshi: "K".into(), kalshi_b: None, cat: Cat::Weather, cluster: "x".into(), settle_clean: true, days_to_event: Some(0.0), pm_min_tick: None, pm_min_qty: None };
-        let ec = discovery::Pair { slug: "urc-x".into(), kalshi: "K2".into(), kalshi_b: None, cat: Cat::Econ, cluster: "u3-26JUN".into(), settle_clean: false, days_to_event: None, pm_min_tick: None, pm_min_qty: None };
-        let sp = discovery::Pair { slug: "aec-mlb-lad-pit-2026-06-16".into(), kalshi: "K-LAD".into(), kalshi_b: Some("K-PIT".into()), cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0), pm_min_tick: None, pm_min_qty: None };
+        let wx = discovery::Pair { slug: "tc-temp-x-2026-06-11-gte95f".into(), kalshi: "K".into(), kalshi_b: None, cat: Cat::Weather, cluster: "x".into(), settle_clean: true, soccer: false, days_to_event: Some(0.0), pm_min_tick: None, pm_min_qty: None };
+        let ec = discovery::Pair { slug: "urc-x".into(), kalshi: "K2".into(), kalshi_b: None, cat: Cat::Econ, cluster: "u3-26JUN".into(), settle_clean: false, soccer: false, days_to_event: None, pm_min_tick: None, pm_min_qty: None };
+        let sp = discovery::Pair { slug: "aec-mlb-lad-pit-2026-06-16".into(), kalshi: "K-LAD".into(), kalshi_b: Some("K-PIT".into()), cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, soccer: false, days_to_event: Some(1.0), pm_min_tick: None, pm_min_qty: None };
+        // a WORLD-CUP discovery Pair is binary (kalshi_b=None) + soccer=true + settle_clean=true; it carries
+        // those through to LivePair unchanged so the loop routes it binary and trades it (regulation-clean).
+        let wc = discovery::Pair { slug: "atc-fwc-ger-cuw-2026-06-14-ger".into(), kalshi: "KXWCGAME-26JUN14GERCUW-GER".into(), kalshi_b: None, cat: Cat::Sports, cluster: "fwc-ger-cuw-2026-06-14".into(), settle_clean: true, soccer: true, days_to_event: Some(1.0), pm_min_tick: None, pm_min_qty: None };
         assert!(LivePair::from(wx).settle_clean);
         assert!(!LivePair::from(ec).settle_clean);
+        // the WC pair routes BINARY (kalshi_b=None) yet is flagged soccer + settle_clean.
+        let wc_lp = LivePair::from(wc);
+        assert!(wc_lp.kalshi_b.is_none() && wc_lp.soccer && wc_lp.settle_clean);
+        assert_eq!(wc_lp.kalshi_tickers(), vec!["KXWCGAME-26JUN14GERCUW-GER".to_string()], "WC subscribes ONE Kalshi ticker per outcome");
         // a sports LivePair subscribes BOTH team tickers (kalshi_tickers / pair_tickers parity).
         let sp_lp = LivePair::from(sp.clone());
         assert_eq!(sp_lp.kalshi_tickers(), vec!["K-LAD".to_string(), "K-PIT".to_string()]);
@@ -1861,7 +1990,7 @@ mod tests {
             slug: "aec-mlb-lad-pit-2026-06-16".into(),
             kalshi: "KXMLBGAME-26JUN16-LAD".into(),
             kalshi_b: Some("KXMLBGAME-26JUN16-PIT".into()),
-            cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0),
+            cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, soccer: false, days_to_event: Some(1.0),
             pm_min_tick: None, pm_min_qty: None,
         };
         let legs = [
@@ -1896,7 +2025,7 @@ mod tests {
             slug: "aec-mlb-lad-pit-2026-06-16".into(),
             kalshi: "KXMLBGAME-26JUN16-LAD".into(),
             kalshi_b: Some("KXMLBGAME-26JUN16-PIT".into()),
-            cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0),
+            cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, soccer: false, days_to_event: Some(1.0),
             pm_min_tick: None, pm_min_qty: None,
         };
         let legs = [
@@ -1947,7 +2076,7 @@ mod tests {
     #[test]
     fn pairstate_indexes_and_frees_both_sports_tickers() {
         let mut ps = PairState::default();
-        ps.insert(LivePair { slug: "aec-mlb-lad-pit-2026-06-16".into(), kalshi: "K-LAD".into(), kalshi_b: Some("K-PIT".into()), cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, days_to_event: Some(1.0), pm_min_tick: None, pm_min_qty: None });
+        ps.insert(LivePair { slug: "aec-mlb-lad-pit-2026-06-16".into(), kalshi: "K-LAD".into(), kalshi_b: Some("K-PIT".into()), cat: Cat::Sports, cluster: "mlb-2026-06-16".into(), settle_clean: false, soccer: false, days_to_event: Some(1.0), pm_min_tick: None, pm_min_qty: None });
         assert_eq!(ps.by_ticker.get("K-LAD").map(String::as_str), Some("aec-mlb-lad-pit-2026-06-16"));
         assert_eq!(ps.by_ticker.get("K-PIT").map(String::as_str), Some("aec-mlb-lad-pit-2026-06-16"));
         ps.remove("aec-mlb-lad-pit-2026-06-16");
@@ -1967,7 +2096,7 @@ mod tests {
         let pair = LivePair {
             slug: "tc-temp-nychigh-2026-06-11-gte95f".into(),
             kalshi: "KXHIGHNY-26JUN11-T95".into(),
-            kalshi_b: None, cat: Cat::Weather, cluster: "nychigh-2026-06-11".into(), settle_clean: true, days_to_event: None,
+            kalshi_b: None, cat: Cat::Weather, cluster: "nychigh-2026-06-11".into(), settle_clean: true, soccer: false, days_to_event: None,
             pm_min_tick: None, pm_min_qty: None,
         };
         let legs = [
@@ -2235,7 +2364,7 @@ mod tests {
         let pair = LivePair {
             slug: "tc-temp-nychigh-2026-06-11-gte95f".into(),
             kalshi: "KXHIGHNY-26JUN11-T95".into(),
-            kalshi_b: None, cat: Cat::Weather, cluster: "nychigh-2026-06-11".into(), settle_clean: true, days_to_event: None,
+            kalshi_b: None, cat: Cat::Weather, cluster: "nychigh-2026-06-11".into(), settle_clean: true, soccer: false, days_to_event: None,
             pm_min_tick: Some(0.05), pm_min_qty: None,
         };
         let legs = [

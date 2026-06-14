@@ -4,6 +4,39 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
+## bot-rs — WORLD CUP tradeable (LIVE path) — IN PROGRESS
+
+Plan: `~/.claude/plans/deep-waddling-barto.md` (§1, §2). Python side landed (17ab0ea, `bot/colisted_map.py`).
+WC = 3 INDEPENDENT per-outcome BINARY arbs/game (NOT a 3-leg basket). Reuse the weather/econ 1:1 path
+entirely; the ONLY changes are DISCOVERY + a routing-MARKER. DO NOT touch exec/Position/unwind/game_signal.
+
+**Design decision (load-bearing):** REUSE `Cat::Sports` (no new `Cat` variant). Traced against every
+`Cat`-keyed branch: routing is `kalshi_b==None` (already binary); settlement passes via `settle_clean=true`;
+`lock_days(Sports)` is the correct near-dated model (a `Cat::Soccer` variant would mis-route to the 21d econ
+fallback); the MLB postpone poll only acts on `league=="mlb"` so WC is never wrongly unwound. Add a minimal
+`soccer: bool` to `discovery::Pair`+`LivePair` (the plan's "minimal marker"): carries the regulation-settlement
+semantics + lets `track_position` skip enrolling WC in the MLB poll. NOT a routing field.
+
+- [x] `discovery.rs`: SOCCER3 (fwc→KXWCGAME) + SOCCER_CC_ALIAS (irn→iri, alg→dza, hai→hti), SEPARATE from
+      LEAGUES_ABBREV. `soc_parts`, `pm_yes_price` (L23 marketSides Yes-side; pmus `price`/`outcomes` STRING-safe).
+      `soccer3` assemble branch: group 3 siblings/(a,b,date), bind GAME via `pick_wc_game`(exact-date+used+TIE)
+      +alias, require all 3 + TIE, emit 3 PER-OUTCOME BINARY Pairs (kalshi_b=None, soccer=true, settle_clean=true).
+      `soccer` on `Pair`; `soccer_pairs`/`soccer_leagues_unmapped` on `Discovery`.
+- [x] `main.rs`: `soccer` on `LivePair`/`From`/smoke/tests; `track_position` skips MLB-poll enrollment for a
+      soccer pair (empty poll metadata); WC smoke case (binary `signal` arm). `postpone.rs`: skip the non-mlb
+      warning for an empty-league position.
+- [x] tests (+8): 3 binary Pairs/game; alias join (irn↔iri); draw↔TIE; NO false joins / no partial bind /
+      no-TIE skip; unmapped-league report; WC routes binary (leg shape = YES@pmus + NO@Kalshi, not team-B);
+      track_position skips MLB poll; moneyline + weather/econ untouched.
+- [x] `cargo test` 136 green (was 128); `cargo clippy --all-targets` clean; `--smoke` shows WC binary dry-run
+      (Pmus Yes @42c + Kalshi NO @55c on the SAME outcome — the 1:1 shape, contrast the sports `Kalshi Yes -PIT`).
+- [x] Self-review (money path) — PROCEED, 0 CRITICAL / 0 WARN / 2 INFO. (a) WC never→game_signal (binary arm,
+      proven by leg shape + smoke); (b) per-outcome legs lock (YES@pmus+NO@Kalshi on the SAME outcome);
+      (c) no false joins (explicit alias, exact-date, used+TIE-distinct guard — differential-verified byte-
+      identical to Python `soccer3_emit`); (d) build_legs/exec/unwind/Position UNCHANGED; (e) moneyline+wx/econ
+      untouched. Removed a dead `pm_yes_price` port (live YES book is the per-slug WS frame, not the catalog).
+      Artifacts → `tasks/_agent_bus/20260614-wcrust/{coding-agent,code-logic-reviewer}.md`.
+
 ## bot-rs — CONCURRENCY-CORE + GATE FIXES (2026-06-11) — engine-fix-B
 
 Adversarial-engine-review fixes on the LIVE order path. Core refactor: route ALL submissions through a

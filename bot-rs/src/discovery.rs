@@ -39,16 +39,23 @@ const MON: [&str; 12] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG",
 type KBucket = (String, Option<i64>, Option<i64>);
 
 /// A co-listed pair the live loop can subscribe + price. Weather/econ are 1:1 (one pmus slug <-> one
-/// Kalshi ticker, `kalshi_b = None`). SPORTS is 2-outcome: `kalshi` = team-A ticker (the team pmus lists
-/// as YES), `kalshi_b = Some(team-B ticker)` — both are subscribed and the game signal needs both.
+/// Kalshi ticker, `kalshi_b = None`). SPORTS moneyline is 2-outcome: `kalshi` = team-A ticker (the team
+/// pmus lists as YES), `kalshi_b = Some(team-B ticker)` — both are subscribed and the game signal needs
+/// both. A WORLD-CUP outcome is its OWN binary co-listed pair (kalshi_b = None, soccer = true), routed
+/// through the weather/econ 1:1 path — a WC game's 3 outcomes are 3 such binaries, never a 3-leg basket.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pair {
     pub slug: String,        // pmus market slug (the WS subscribe key + book key)
-    pub kalshi: String,      // the settlement-identical Kalshi ticker (team-A ticker for sports)
-    pub kalshi_b: Option<String>, // SPORTS only: the team-B (away) Kalshi ticker; None for weather/econ
+    pub kalshi: String,      // the settlement-identical Kalshi ticker (team-A ticker for moneyline sports)
+    pub kalshi_b: Option<String>, // moneyline SPORTS only: the team-B (away) Kalshi ticker; None for weather/econ/WC
     pub cat: Cat,
     pub cluster: String,     // correlated-exposure key (city-date / family-period / game)
-    pub settle_clean: bool,  // weather=true (empirically verified); econ/sports=false (recon open)
+    pub settle_clean: bool,  // weather=true (empirically verified); econ/moneyline-sports=false (recon open); WC=true (regulation-clean)
+    /// WORLD-CUP per-outcome pair marker. Reuses `Cat::Sports` (so `lock_days`/divergence behave correctly
+    /// for a near-dated game) but is a BINARY pair (kalshi_b=None, routed through `signal`, not `game_signal`).
+    /// The flag carries the regulation-settlement basis and lets the live loop skip enrolling a WC pair in the
+    /// MLB-only postponement poll (statsapi has no WC source). `false` for weather/econ/moneyline sports.
+    pub soccer: bool,
     pub days_to_event: Option<f64>,
     /// pmus `orderPriceMinTickSize` (a number, e.g. 0.001) — the price tick a pmus ORDER must be a multiple
     /// of. `None` when the catalog omits it (the leg builder then keeps the whole-cent price unquantized).
@@ -65,9 +72,11 @@ pub struct Discovery {
     pub pairs: Vec<Pair>,
     pub weather_pairs: usize,
     pub econ_pairs: usize,
-    pub sports_pairs: usize,                 // matched + emitted as 2-ticker subscribable Pairs (team A + B)
+    pub sports_pairs: usize,                 // moneyline: matched + emitted as 2-ticker subscribable Pairs (team A + B)
+    pub soccer_pairs: usize,                 // WORLD CUP: per-outcome BINARY pairs (3 per bound game)
     pub weather_cities_unmapped: Vec<String>, // pmus lists these climate cities, WX map doesn't -> MISSED
     pub sports_leagues_unmapped: Vec<String>,
+    pub soccer_leagues_unmapped: Vec<String>, // pmus lists these drawable-outcome leagues, SOCCER3 doesn't -> MISSED
     pub weather_buckets_misaligned: usize,    // pmus weather buckets with no identical-bounds Kalshi twin
     pub econ_skipped: usize,                  // <= tails / == point buckets / >=T with no listed twin
     pub truncated: bool,                      // pmus catalog hit the page cap (coverage incomplete)
@@ -111,6 +120,24 @@ const LEAGUES_ABBREV: [(&str, &str); 8] = [
     ("cod", "KXCODGAME"),
 ];
 
+/// SOCCER 3-way (World Cup), kept SEPARATE from `LEAGUES_ABBREV` so the moneyline path is untouched. A WC
+/// game is NOT a 2-team complementary market: pmus lists each outcome as its OWN binary
+/// (`atc-fwc-<a>-<b>-<date>-<a|b|draw>`, `marketType="drawable_outcome"`) and so does Kalshi
+/// (`KXWCGAME-…-<A>|-TIE|-<B>`). Each outcome is a clean binary co-listed pair, emitted PER-OUTCOME and
+/// routed through the weather/econ 1:1 path. Only `fwc` (live match-winners) this build (port of `SOCCER3`).
+const SOCCER3: [(&str, &str); 1] = [("fwc", "KXWCGAME")];
+
+/// pmus country-code -> Kalshi country-code, ONLY where they differ (port of `SOCCER_CC_ALIAS`). The exact
+/// abbrev join binds most WC games; these remaps bind the residue. NO fuzzy 3-letter matching — an explicit
+/// table keeps the no-false-positive invariant (L1). The partner countries in those games are EXACT on
+/// Kalshi (self-mapping), so they need no entry.
+const SOCCER_CC_ALIAS: [(&str, &str); 3] = [("irn", "iri"), ("alg", "dza"), ("hai", "hti")];
+
+/// Apply the pmus->Kalshi country-code alias (identity when the code matches on both venues).
+fn soccer_cc_alias(code: &str) -> &str {
+    SOCCER_CC_ALIAS.iter().find(|(pm, _)| *pm == code).map(|(_, k)| *k).unwrap_or(code)
+}
+
 // ============================================================================================
 // PURE SLUG / FIELD PARSERS  (port of colisted_map.py's regex helpers; tested offline)
 // ============================================================================================
@@ -129,6 +156,23 @@ pub fn weather_city(slug: &str) -> Option<String> {
 /// pmus league token from a sports slug: the 2nd dash-segment (`aec-mlb-lad-pit-...` -> `mlb`). Port of `pmlg`.
 pub(crate) fn pm_league(slug: &str) -> Option<String> {
     slug.split('-').nth(1).map(|s| s.to_ascii_lowercase())
+}
+
+/// A parsed World-Cup outcome slug `atc-fwc-<a>-<b>-<YYYY>-<MM>-<DD>-<outcome>`: `(a, b, date, outcome)`,
+/// where `outcome` is the LAST segment ∈ {`a`, `b`, `draw`}. Port of `soc_parts`. `None` for any non-WC
+/// slug (wrong prefix / too few segments) so a moneyline or weather slug never enters the soccer branch.
+///
+/// NOTE on the pmus YES side: discovery only MAPS slug<->ticker (it never reads catalog prices — like the
+/// weather/econ branches). The L23 YES-orientation is honored where the price is actually read: the LIVE
+/// pmus WS book is per-SLUG YES-oriented (`venue::parse_pmus_market_data`: `bids`=YES bids, `offers`=YES
+/// asks for the subscribed outcome slug), so a WC outcome's YES book needs no `marketSides` Yes-side read.
+fn soc_parts(slug: &str) -> Option<(String, String, String, String)> {
+    let p: Vec<&str> = slug.split('-').collect();
+    if p.len() < 8 || p[0] != "atc" || p[1] != "fwc" {
+        return None;
+    }
+    let date = format!("{}-{}-{}", p[4], p[5], p[6]);
+    Some((p[2].to_string(), p[3].to_string(), date, p[p.len() - 1].to_string()))
 }
 
 /// Extract a `YYYY-MM-DD` date from a slug, if present.
@@ -461,6 +505,36 @@ fn resolve_two(ev: &std::collections::HashMap<String, String>, ka: &str, kb: &st
     }
 }
 
+/// Bind a WORLD-CUP game (Kalshi abbrevs A, B already aliased) to ONE `KXWCGAME` event's `{suffix: ticker}`
+/// set on its EXACT date, returning the THREE tickers `(team_a, team_b, tie)`. Soccer-3way analogue of
+/// `pick_game`: the pmus slug always carries the ET date (`soc_parts` requires it), so the bind is exact-date
+/// only — no ±1 fallback needed. Requires all three of A, B and a `"tie"` suffix to resolve to DISTINCT
+/// tickers (a partial WC event -> skip, never a partial bind; L1). `used` marks each bound event so two pmus
+/// games on the same date can't both grab the first event (the doubleheader guard; WC has none, but the guard
+/// is free correctness and mirrors the moneyline path). FAITHFUL to `soccer3_emit`'s `pick_game` + `pl["tie"]`.
+fn pick_wc_game(
+    kbydate: &std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>>,
+    ka: &str,
+    kb: &str,
+    date: &str,
+    used: &mut std::collections::HashSet<(String, usize)>,
+) -> Option<(String, String, String)> {
+    let events = kbydate.get(date)?;
+    for (i, ev) in events.iter().enumerate() {
+        if used.contains(&(date.to_string(), i)) {
+            continue;
+        }
+        // need team-A, team-B AND a TIE suffix, all DISTINCT (no false/partial bind).
+        if let (Some((ta, tb)), Some(tie)) = (resolve_two(ev, ka, kb), ev.get("tie")) {
+            if ta != *tie && tb != *tie {
+                used.insert((date.to_string(), i));
+                return Some((ta, tb, tie.clone()));
+            }
+        }
+    }
+    None
+}
+
 /// `|a - b| <= 1 day` on `YYYY-MM-DD` dates (port of `dnear`); a parse failure falls back to `a == b`.
 fn dnear(a: &str, b: &str) -> bool {
     match (ymd_to_epoch_days(a), ymd_to_epoch_days(b)) {
@@ -519,6 +593,7 @@ where
                         cat: Cat::Weather,
                         cluster: m.cluster,
                         settle_clean: m.settle_clean,
+                        soccer: false,
                         days_to_event: m.days_to_event,
                         pm_min_tick,
                         pm_min_qty,
@@ -577,6 +652,7 @@ where
                         cat: Cat::Econ,
                         cluster: m.cluster,
                         settle_clean: m.settle_clean,
+                        soccer: false,
                         days_to_event: m.days_to_event,
                         pm_min_tick,
                         pm_min_qty,
@@ -649,6 +725,7 @@ where
                 cat: Cat::Sports,
                 cluster: format!("{league}-{date}"),
                 settle_clean: false, // only a game that COMPLETES on schedule settles identically (void tail)
+                soccer: false, // moneyline sports, not World Cup
                 days_to_event,
                 pm_min_tick,
                 pm_min_qty,
@@ -657,6 +734,103 @@ where
         }
     }
     d.sports_leagues_unmapped = pm_leagues.iter().filter(|l| !LEAGUES_ABBREV.iter().any(|(x, _)| *x == l.as_str())).cloned().collect();
+
+    // ---- SOCCER 3-way (World Cup): each of the 3 outcomes is its OWN binary on BOTH venues -> emit each as
+    //      a PER-OUTCOME BINARY Pair (kalshi_b=None, soccer=true), routed through the weather/econ 1:1 signal
+    //      path (NOT the 2-team game_signal). pmus is 3 sibling slugs grouped per (a,b,date); Kalshi is the
+    //      KXWCGAME event's 3 tickers (team A/B + TIE). Reuses the exact-date + used-set bind (pick_wc_game)
+    //      + a country-code alias for the code-convention mismatches. Port of the colisted_map soccer3 branch.
+    //      group pmus drawable-outcome WC markets: (a,b,date) -> {outcome_token: market}.
+    let mut pm_soc: std::collections::HashMap<(String, String, String), std::collections::HashMap<String, &Value>> =
+        std::collections::HashMap::new();
+    let mut soc_leagues: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for m in pm_markets {
+        if field_str(m, "category").as_deref() != Some("sports") || field_str(m, "marketType").as_deref() != Some("drawable_outcome") {
+            continue;
+        }
+        let Some(slug) = field_str(m, "slug") else { continue };
+        // league token = the slug's 2nd segment (`atc-fwc-...` -> `fwc`); record it for the coverage audit.
+        if let Some(l) = pm_league(&slug) {
+            soc_leagues.insert(l);
+        }
+        if let Some((a, b, date, outcome)) = soc_parts(&slug) {
+            pm_soc.entry((a, b, date)).or_default().insert(outcome, m);
+        }
+    }
+    for (league, kser) in SOCCER3 {
+        // `pm_soc` only ever holds `atc-fwc-` games (soc_parts requires the fwc prefix), so a non-empty map
+        // means the one configured league (`fwc`) is live. Mirrors the Python `if not pm_soc: continue`.
+        if pm_soc.is_empty() {
+            continue;
+        }
+        let kmarkets = kalshi_series(kser);
+        // group Kalshi KXWCGAME markets by EVENT -> {suffix: ticker} (suffix = country code or `tie`),
+        // recording each event's date; then bucket events by date for the exact-date bind (kbydate).
+        let mut by_event: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+        let mut event_date: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for m in &kmarkets {
+            let Some(tk) = field_str(m, "ticker") else { continue };
+            let Some(ev) = field_str(m, "event_ticker") else { continue };
+            event_date.entry(ev.clone()).or_insert_with(|| ktok_date(&tk).unwrap_or_default());
+            let suffix = tk.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
+            if !suffix.is_empty() {
+                by_event.entry(ev).or_default().insert(suffix, tk);
+            }
+        }
+        // DETERMINISM (mirrors the moneyline path): events come out of a HashMap (random order), so push
+        // sorted by event_ticker -> a stable per-date event INDEX for the used-set across re-discovery passes.
+        let mut kbydate: std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>> = std::collections::HashMap::new();
+        let mut events: Vec<(String, std::collections::HashMap<String, String>)> = by_event.into_iter().collect();
+        events.sort_by(|a, b| a.0.cmp(&b.0));
+        for (ev, dict) in events {
+            let date = event_date.get(&ev).cloned().unwrap_or_default();
+            kbydate.entry(date).or_default().push(dict);
+        }
+        // one used-set per league pass: a bound Kalshi event can't bind a second pm game (doubleheader guard).
+        let mut used: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+        // bind games in a STABLE (sorted-key) order — `pm_soc` is a HashMap (random iteration), so without a
+        // deterministic order the used-set could bind two same-date games to swapped events across passes.
+        let mut game_keys: Vec<&(String, String, String)> = pm_soc.keys().collect();
+        game_keys.sort();
+        for key in game_keys {
+            let (a, b, date) = key;
+            let outs = &pm_soc[key];
+            // need all 3 sibling outcomes (team A / team B / draw) before binding — no partial game (L1).
+            let (Some(pa), Some(pb), Some(pdraw)) = (outs.get(a.as_str()), outs.get(b.as_str()), outs.get("draw")) else {
+                continue;
+            };
+            let (ka, kb) = (soccer_cc_alias(a), soccer_cc_alias(b));
+            let Some((ta, tb, tie)) = pick_wc_game(&kbydate, ka, kb, date, &mut used) else { continue };
+            // days_to_event = game date - today (in days); None when either date is unknown -> gate dormant.
+            let days_to_event = match (today_epoch_days, ymd_to_epoch_days(date)) {
+                (Some(today), Some(game)) => Some((game - today) as f64),
+                _ => None,
+            };
+            let cluster = format!("{league}-{a}-{b}-{date}"); // per-GAME correlated-exposure cluster (3 outcomes)
+            // emit each outcome as its OWN binary Pair: -a<->team-A ticker, -b<->team-B ticker, -draw<->TIE.
+            for (pm_mkt, ticker) in [(pa, ta), (pb, tb), (pdraw, tie)] {
+                let Some(slug) = field_str(pm_mkt, "slug") else { continue };
+                let (pm_min_tick, pm_min_qty) = pm_order_constraints(pm_mkt);
+                d.pairs.push(Pair {
+                    slug,
+                    kalshi: ticker,
+                    kalshi_b: None, // WC is per-outcome BINARY (1:1), like weather/econ
+                    cat: Cat::Sports, // reuse Sports: correct lock_days/divergence; binary via kalshi_b=None
+                    cluster: cluster.clone(),
+                    // regulation-clean on both venues (the small priceable void tail is far below a tradeable
+                    // edge) -> the bot trades it via the existing edge floor + settle_clean, mirroring the
+                    // Python TAIL verdict. settle_clean=true passes the risk gate's invariant-#1 clause.
+                    settle_clean: true,
+                    soccer: true,
+                    days_to_event,
+                    pm_min_tick,
+                    pm_min_qty,
+                });
+                d.soccer_pairs += 1;
+            }
+        }
+    }
+    d.soccer_leagues_unmapped = soc_leagues.iter().filter(|l| !SOCCER3.iter().any(|(x, _)| *x == l.as_str())).cloned().collect();
 
     d
 }
@@ -995,8 +1169,10 @@ mod tests {
 
         // SPORTS: the MLB game is now emitted as a 2-ticker Pair (team A = LAD, team B = PIT). pmus lists
         // LAD as the long-named side -> kalshi = LAD ticker, kalshi_b = PIT ticker; days_to_event = 5.
+        // (filter `!soccer`: a moneyline sports pair is `Cat::Sports` too, but this catalog has no WC.)
         assert_eq!(d.sports_pairs, 1);
-        let sp: Vec<&Pair> = d.pairs.iter().filter(|p| p.cat == Cat::Sports).collect();
+        assert_eq!(d.soccer_pairs, 0, "no World Cup markets in this catalog");
+        let sp: Vec<&Pair> = d.pairs.iter().filter(|p| p.cat == Cat::Sports && !p.soccer).collect();
         assert_eq!(sp.len(), 1, "sports is emitted as a subscribable 2-ticker Pair");
         assert_eq!(sp[0].kalshi, "KXMLBGAME-26JUN16-LAD");
         assert_eq!(sp[0].kalshi_b.as_deref(), Some("KXMLBGAME-26JUN16-PIT"));
@@ -1224,5 +1400,141 @@ mod tests {
         let d = assemble(&cat, false, None, stub);
         assert_eq!(d.econ_pairs, 0);
         assert_eq!(d.econ_skipped, 1);
+    }
+
+    // ---- SOCCER 3-way (World Cup): per-outcome BINARY emission, alias join, L23 YES-read, no false join ----
+
+    /// `soc_parts` parses an `atc-fwc-<a>-<b>-<date>-<outcome>` slug into (a, b, date, outcome) and rejects
+    /// any non-WC slug (so a moneyline / weather slug never enters the soccer branch).
+    #[test]
+    fn soc_parts_parses_wc_and_rejects_others() {
+        assert_eq!(
+            soc_parts("atc-fwc-ger-cuw-2026-06-14-ger"),
+            Some(("ger".into(), "cuw".into(), "2026-06-14".into(), "ger".into()))
+        );
+        assert_eq!(soc_parts("atc-fwc-ger-cuw-2026-06-14-draw").map(|t| t.3), Some("draw".into()));
+        assert_eq!(soc_parts("atc-fwc-irn-nzl-2026-06-15-irn").map(|t| (t.0, t.3)), Some(("irn".into(), "irn".into())));
+        // non-WC slugs -> None.
+        assert!(soc_parts("aec-mlb-min-tex-2026-06-16").is_none());
+        assert!(soc_parts("tc-temp-sfohigh-2026-06-09-gte64lt65f").is_none());
+        assert!(soc_parts("atc-fwc-ger").is_none()); // too few segments
+    }
+
+    /// The WC Kalshi stub: one KXWCGAME event per game with three tickers (team A / team B / TIE).
+    fn wc_kalshi_stub(series: &str) -> Vec<Value> {
+        let raw = match series {
+            "KXWCGAME" => vec![
+                // GER vs CUW on 26JUN14 (exact-abbrev join).
+                r#"{"ticker":"KXWCGAME-26JUN14GERCUW-GER","event_ticker":"KXWCGAME-26JUN14GERCUW","yes_sub_title":"Germany"}"#,
+                r#"{"ticker":"KXWCGAME-26JUN14GERCUW-CUW","event_ticker":"KXWCGAME-26JUN14GERCUW","yes_sub_title":"Curacao"}"#,
+                r#"{"ticker":"KXWCGAME-26JUN14GERCUW-TIE","event_ticker":"KXWCGAME-26JUN14GERCUW","yes_sub_title":"Draw"}"#,
+                // IRI vs NZL on 26JUN15 — Kalshi uses `iri`; pmus uses `irn` (the alias case).
+                r#"{"ticker":"KXWCGAME-26JUN15IRINZL-IRI","event_ticker":"KXWCGAME-26JUN15IRINZL","yes_sub_title":"IR Iran"}"#,
+                r#"{"ticker":"KXWCGAME-26JUN15IRINZL-NZL","event_ticker":"KXWCGAME-26JUN15IRINZL","yes_sub_title":"New Zealand"}"#,
+                r#"{"ticker":"KXWCGAME-26JUN15IRINZL-TIE","event_ticker":"KXWCGAME-26JUN15IRINZL","yes_sub_title":"Draw"}"#,
+            ],
+            _ => vec![],
+        };
+        raw.into_iter().map(|s| serde_json::from_str(s).unwrap()).collect()
+    }
+
+    /// A complete WC game (3 pmus sibling slugs) -> exactly 3 PER-OUTCOME BINARY Pairs, each with ONE Kalshi
+    /// ticker (kalshi_b=None) + soccer=true + settle_clean=true + Cat::Sports. draw maps to the event TIE
+    /// ticker. This is the core of the WC discovery branch: per-outcome binary, NOT a 2-team game pair.
+    #[test]
+    fn soccer3_emits_three_per_outcome_binary_pairs() {
+        let pm_cat = vec![
+            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-ger-cuw-2026-06-14-cuw", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-ger-cuw-2026-06-14-draw", "sports", r#""marketType":"drawable_outcome""#),
+        ];
+        // today 2026-06-13; game 2026-06-14 -> days_to_event = 1.
+        let today = ymd_to_epoch_days("2026-06-13");
+        let d = assemble(&pm_cat, false, today, wc_kalshi_stub);
+        assert_eq!(d.soccer_pairs, 3, "3 siblings -> 3 per-outcome binary pairs");
+        let wc: Vec<&Pair> = d.pairs.iter().filter(|p| p.soccer).collect();
+        assert_eq!(wc.len(), 3);
+        // EVERY WC pair is BINARY (kalshi_b=None), soccer, settle_clean, Cat::Sports, with the per-game cluster.
+        for p in &wc {
+            assert!(p.kalshi_b.is_none(), "each WC outcome is a BINARY pair (no kalshi_b)");
+            assert!(p.soccer && p.settle_clean && p.cat == Cat::Sports);
+            assert_eq!(p.cluster, "fwc-ger-cuw-2026-06-14");
+            assert_eq!(p.days_to_event, Some(1.0));
+        }
+        // the three outcomes map to the three event tickers: -ger<->GER, -cuw<->CUW, -draw<->TIE.
+        let by_slug = |suf: &str| wc.iter().find(|p| p.slug.ends_with(suf)).unwrap().kalshi.as_str();
+        assert_eq!(by_slug("-ger"), "KXWCGAME-26JUN14GERCUW-GER");
+        assert_eq!(by_slug("-cuw"), "KXWCGAME-26JUN14GERCUW-CUW");
+        assert_eq!(by_slug("-draw"), "KXWCGAME-26JUN14GERCUW-TIE", "draw <-> TIE");
+        // moneyline sports is untouched: no moneyline markets here -> no 2-ticker sports pairs.
+        assert_eq!(d.sports_pairs, 0, "the soccer branch must not emit moneyline 2-ticker pairs");
+        assert!(d.pairs.iter().all(|p| p.kalshi_b.is_none()), "WC pairs never carry a kalshi_b");
+    }
+
+    /// ALIAS join: pmus `irn` must bind the Kalshi `...IRINZL` event (irn->iri), via the explicit alias table
+    /// — NOT fail, and NOT fuzzy-match. The three outcomes still emit, with -irn<->IRI.
+    #[test]
+    fn soccer3_alias_join_binds_irn_to_iri() {
+        let pm_cat = vec![
+            pm("atc-fwc-irn-nzl-2026-06-15-irn", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-irn-nzl-2026-06-15-nzl", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-irn-nzl-2026-06-15-draw", "sports", r#""marketType":"drawable_outcome""#),
+        ];
+        let d = assemble(&pm_cat, false, ymd_to_epoch_days("2026-06-13"), wc_kalshi_stub);
+        assert_eq!(d.soccer_pairs, 3, "alias irn->iri must bind all 3 outcomes");
+        let irn = d.pairs.iter().find(|p| p.slug.ends_with("-irn")).unwrap();
+        assert_eq!(irn.kalshi, "KXWCGAME-26JUN15IRINZL-IRI", "irn binds the IRI ticker via the alias");
+        let draw = d.pairs.iter().find(|p| p.slug.ends_with("2026-06-15-draw")).unwrap();
+        assert_eq!(draw.kalshi, "KXWCGAME-26JUN15IRINZL-TIE");
+    }
+
+    /// NO FALSE JOIN + NO PARTIAL BIND (L1): an unknown country code that is neither exact nor aliased to a
+    /// Kalshi suffix emits NOTHING (pick_wc_game refuses; no fuzzy fallback); and a game missing a sibling
+    /// outcome (only 2 of 3) or missing the Kalshi TIE ticker emits NOTHING (all-3-or-skip).
+    #[test]
+    fn soccer3_no_false_join_and_no_partial_bind() {
+        // (1) unknown code `xxx` (not exact, not aliased) -> no pair, even though the date/partner exist.
+        let bad = vec![
+            pm("atc-fwc-xxx-nzl-2026-06-15-xxx", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-xxx-nzl-2026-06-15-nzl", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-xxx-nzl-2026-06-15-draw", "sports", r#""marketType":"drawable_outcome""#),
+        ];
+        assert_eq!(assemble(&bad, false, None, wc_kalshi_stub).soccer_pairs, 0, "no false join on an unknown code");
+        // (2) incomplete game: only 2 of 3 sibling outcomes (no draw) -> emit nothing.
+        let partial = vec![
+            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-ger-cuw-2026-06-14-cuw", "sports", r#""marketType":"drawable_outcome""#),
+        ];
+        assert_eq!(assemble(&partial, false, None, wc_kalshi_stub).soccer_pairs, 0, "incomplete game (no draw) -> skip");
+        // (3) Kalshi event has no TIE ticker -> no bind (need team A + B + TIE).
+        fn no_tie_stub(series: &str) -> Vec<Value> {
+            if series == "KXWCGAME" {
+                vec![
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN14GERCUW-GER","event_ticker":"KXWCGAME-26JUN14GERCUW"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN14GERCUW-CUW","event_ticker":"KXWCGAME-26JUN14GERCUW"}"#).unwrap(),
+                ]
+            } else {
+                vec![]
+            }
+        }
+        let full = vec![
+            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-ger-cuw-2026-06-14-cuw", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-ger-cuw-2026-06-14-draw", "sports", r#""marketType":"drawable_outcome""#),
+        ];
+        assert_eq!(assemble(&full, false, None, no_tie_stub).soccer_pairs, 0, "no Kalshi TIE -> no bind");
+    }
+
+    /// COVERAGE: a pmus drawable-outcome slug for an UNMAPPED soccer league (not `fwc`) is reported in
+    /// `soccer_leagues_unmapped` (L7) — never silently missed. `fwc` is mapped, so it is NOT reported.
+    #[test]
+    fn soccer3_unmapped_league_is_reported() {
+        // `fifa` is a drawable-outcome soccer league NOT in SOCCER3 (futures/offseason, deferred).
+        let pm_cat = vec![
+            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fifa-x-y-2026-07-01-x", "sports", r#""marketType":"drawable_outcome""#),
+        ];
+        let d = assemble(&pm_cat, false, None, wc_kalshi_stub);
+        assert_eq!(d.soccer_leagues_unmapped, vec!["fifa".to_string()], "an unmapped drawable-outcome league is reported");
     }
 }
