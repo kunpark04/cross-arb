@@ -355,9 +355,9 @@ impl LiveBackend {
         };
         // Kalshi's CreateOrder takes `yes_price` OR `no_price` (cents) — the field MATCHING the order side.
         // `build_legs` hands a NO leg the NO price, so a `side:no` order must use `no_price` (sending
-        // `yes_price` on a no-order is the same class of bug the pmus NO leg had — caught live). ⚠️ Only the
-        // YES path is live-verified (a 2026-06-11 placed/cancelled YES order); the `no_price` mapping is the
-        // documented parallel but NOT YET live-verified — confirm with a far-from-market NO order before relying.
+        // `yes_price` on a no-order is the same class of bug the pmus NO leg had — caught live). BOTH sides are
+        // now LIVE-VERIFIED: YES (2026-06-11 placed/cancelled) and NO (2026-06-14 — a 1¢ BUY-NO on an empty book
+        // was recorded by Kalshi as `outcome_side:"no"` + `no_price_dollars:"0.0100"`, rested + cancelled). Holds.
         let price_key = match intent.side {
             Side::Yes => "yes_price",
             Side::No => "no_price",

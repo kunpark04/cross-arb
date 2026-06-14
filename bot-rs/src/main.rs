@@ -74,6 +74,12 @@ async fn main() {
     };
     println!("execution backend : {}\n", backend.label());
 
+    // `--probe-no`: LIVE verification of the Kalshi NO-leg `no_price` write-mapping (audit's top pre-arming
+    // risk) — a 1¢ BUY-NO on a fully-empty book. Same consent gates; real order only when EXECUTION_MODE=live.
+    if std::env::args().any(|a| a == "--probe-no") {
+        probe::verify_kalshi_no_mapping(&cfg, backend).await;
+        return;
+    }
     // `--probe-order [N]`: LIVE order-path verification + latency probe (1¢ BUY-YES place+cancel). Gated by
     // the SAME prod/settle consent checks above; uses the configured backend (real orders only when
     // EXECUTION_MODE=live). Runs instead of the loop/smoke and exits.

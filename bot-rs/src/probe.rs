@@ -47,17 +47,20 @@ fn report_lat(label: &str, mut v: Vec<f64>) {
 /// Place a 1¢ BUY-YES on `(venue, market)`, time the submit; if accepted with a real venue order id, cancel
 /// it and time the cancel. Returns `(submit_ms, Option<cancel_ms>, filled)` or `None` on a placement reject
 /// (a closed/invalid market — skipped, not fatal). A FILL (must not happen for a 1¢ YES buy) is surfaced.
-fn place_cancel(backend: &Arc<dyn ExecutionBackend>, venue: Venue, market: &str, nonce: u128, i: usize) -> Option<(f64, Option<f64>, bool)> {
+fn place_cancel(backend: &Arc<dyn ExecutionBackend>, venue: Venue, market: &str, side: Side, nonce: u128, i: usize) -> Option<(f64, Option<f64>, bool)> {
     let intent = OrderIntent {
         venue,
         market: market.to_string(),
         action: Action::Buy,
-        side: Side::Yes, // ONLY Yes — never the marketable buy-NO trap (exec.rs:373)
-        price_cents: 1,  // lowest tick: non-marketable, cannot fill against a live ask
+        // YES = the safe non-marketable rest (the latency probe). NO = the Kalshi `no_price` write-mapping
+        // verification — KALSHI-ONLY and gated to a FULLY-EMPTY book so it can't fill regardless of how the
+        // price field is interpreted (the pmus buy-NO->sell-YES trap exec.rs:373 doesn't apply; pmus is skipped).
+        side,
+        price_cents: 1, // lowest tick
         qty: 1,
-        // `nonce` (a per-run timestamp) makes the Kalshi client_order_id UNIQUE across runs — Kalshi dedups on
-        // it, so a re-run with a reused id 409s ("order already exists"). Fresh nonce -> fresh, placeable id.
-        client_order_id: format!("probe-{venue:?}-{nonce}-{i}"),
+        // `nonce` (a per-run timestamp) + `side` make the Kalshi client_order_id UNIQUE — Kalshi dedups on it,
+        // so a reused id 409s ("order already exists"). Fresh nonce -> fresh, placeable id.
+        client_order_id: format!("probe-{venue:?}-{side:?}-{nonce}-{i}"),
     };
     let t0 = Instant::now();
     let ack = backend.submit(&intent);
@@ -115,6 +118,23 @@ async fn kalshi_quote_ask(http: &reqwest::Client, ticker: &str) -> Option<Option
     }
 }
 
+/// Is the Kalshi book safe to rest a 1¢ BUY on — under EITHER price interpretation? A 1¢ limit BUY can only
+/// fill against a 1¢ ask, and a side's ask is 1¢ only when the OPPOSITE side has a 99¢/100¢ bid. So a 1¢ BUY-NO
+/// can't fill if best YES bid <= 98, and (if the venue mis-read it as a 1¢ BUY-YES) it can't fill if best NO bid
+/// <= 98. Requiring BOTH best bids <= 98 (or absent) makes the `no_price`-mapping test fill-safe regardless of
+/// interpretation, without needing a fully-empty book. `None` = the GET failed (skip, conservative).
+async fn kalshi_book_safe_for_1c_buy(http: &reqwest::Client, ticker: &str) -> Option<bool> {
+    let url = format!("https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook");
+    let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
+    let ob = v.get("orderbook")?;
+    let best_bid = |k: &str| {
+        ob.get(k)
+            .and_then(|x| x.as_array())
+            .and_then(|arr| arr.iter().filter_map(|lvl| lvl.as_array()?.first()?.as_u64()).max())
+    };
+    Some(best_bid("yes").is_none_or(|b| b <= 98) && best_bid("no").is_none_or(|b| b <= 98))
+}
+
 /// Run the order-path probe: discover real markets, then place+cancel a 1¢ BUY-YES on a DIFFERENT market
 /// each iteration (so a single closed market can't bias it, and we never hammer one book). Reports per-venue
 /// submit + cancel latency. Kalshi places only where YES ask >= 2¢ (guaranteed REST, no fill); pmus is
@@ -167,7 +187,7 @@ pub async fn run(cfg: &Config, backend: Arc<dyn ExecutionBackend>, iters: usize)
             Some(Some(a)) if a >= 2 => {} // YES ask >= 2¢ -> 1¢ buy strictly below the offer -> rests -> SAFE
             _ => continue,                // a YES offer at 1¢ (would fill) OR a failed quote (unknown) -> skip
         }
-        if let Some((s, c, filled)) = place_cancel(&backend, Venue::Kalshi, &pair.kalshi, nonce, i) {
+        if let Some((s, c, filled)) = place_cancel(&backend, Venue::Kalshi, &pair.kalshi, Side::Yes, nonce, i) {
             k_sub.push(s);
             if let Some(c) = c {
                 k_can.push(c);
@@ -186,7 +206,7 @@ pub async fn run(cfg: &Config, backend: Arc<dyn ExecutionBackend>, iters: usize)
     let p_iters = if with_pmus { iters.min(3) } else { 0 };
     let (mut p_sub, mut p_can, mut p_fills) = (Vec::new(), Vec::new(), 0u32);
     for (i, pair) in disc.pairs.iter().take(p_iters).enumerate() {
-        if let Some((s, c, filled)) = place_cancel(&backend, Venue::Pmus, &pair.slug, nonce, 1000 + i) {
+        if let Some((s, c, filled)) = place_cancel(&backend, Venue::Pmus, &pair.slug, Side::Yes, nonce, 1000 + i) {
             p_sub.push(s);
             if let Some(c) = c {
                 p_can.push(c);
@@ -211,4 +231,87 @@ pub async fn run(cfg: &Config, backend: Arc<dyn ExecutionBackend>, iters: usize)
     } else {
         println!("[probe] clean: every 1¢ order rested + cancelled; no fills, no residual exposure.");
     }
+}
+
+/// VERIFY the Kalshi NO-leg price mapping (the audit's top pre-arming risk): the bot prices a `BUY NO` into
+/// the `no_price` field (`exec::build_kalshi_payload`, flagged "not live-verified" at exec.rs:341). If Kalshi
+/// actually wants `yes_price = 100 - no_price`, EVERY `NO@Kalshi` leg (fired on every weather/econ PK entry)
+/// misprices -> naked leg. This places a 1¢ BUY-NO on a FULLY-EMPTY Kalshi book (cannot fill regardless of
+/// interpretation) and cancels it; `exec_log` + `PROBE_LOG_RAW` capture the create response. VERDICT (read
+/// the raw `[raw]` line / executions.jsonl): a CORRECT mapping records `outcome_side:"no"` +
+/// `no_price_dollars:"0.0100"` (the NO leg sits at 1¢); a WRONG mapping shows the 1¢ on `yes_price_dollars` /
+/// `outcome_side:"yes"`, OR the create REJECTS the `no_price` body.
+pub async fn verify_kalshi_no_mapping(cfg: &Config, backend: Arc<dyn ExecutionBackend>) {
+    println!("============================================================");
+    println!(" VERIFY Kalshi NO-leg price mapping — 1¢ BUY-NO on a FULLY-EMPTY book");
+    println!("============================================================");
+    println!("execution mode : {:?}", cfg.mode);
+    println!("venue env      : {:?}{}\n", cfg.venue_env, if cfg.is_prod() { "  *** REAL MONEY (1¢) ***" } else { "  (sandbox)" });
+
+    let http = reqwest::Client::builder().use_rustls_tls().build().unwrap_or_else(|_| reqwest::Client::new());
+    let disc = match crate::discovery::discover(&http).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[verify] discovery failed ({e}) — cannot pick a market.");
+            return;
+        }
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    // candidate Kalshi tickers: a specific `PROBE_TICKER` (operator-pinned, e.g. a known empty-book market) or
+    // the discovered universe.
+    // PROBE_TICKER pins ONE ticker (operator vouches it's a safe/empty book, confirmed out-of-band) and
+    // BYPASSES the book gate — used when the gate's `/orderbook` GET is unavailable. Else scan the discovered
+    // universe with the gate.
+    let pinned = matches!(std::env::var("PROBE_TICKER"), Ok(ref t) if !t.is_empty());
+    let candidates: Vec<String> = match std::env::var("PROBE_TICKER") {
+        Ok(t) if !t.is_empty() => vec![t],
+        _ => disc.pairs.iter().map(|p| p.kalshi.clone()).collect(),
+    };
+    let mut placed = 0u32;
+    let (mut n_safe, mut n_99, mut n_fail) = (0u32, 0u32, 0u32);
+    for (i, ticker) in candidates.iter().enumerate() {
+        if placed >= 2 {
+            break;
+        }
+        // space the book GETs so a rapid scan isn't rate-limited into skipping everything.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        // only a book with no 99¢ bid on either side (see `kalshi_book_safe_for_1c_buy`) — unless PINNED.
+        if !pinned {
+            match kalshi_book_safe_for_1c_buy(&http, ticker).await {
+                Some(true) => n_safe += 1,
+                Some(false) => {
+                    n_99 += 1;
+                    continue;
+                }
+                None => {
+                    n_fail += 1;
+                    continue;
+                }
+            }
+        }
+        println!("[verify] placing 1¢ BUY-NO on {ticker}{} ...", if pinned { " (operator-pinned, gate bypassed)" } else { " (fill-safe book)" });
+        if let Some((_, _, filled)) = place_cancel(&backend, Venue::Kalshi, ticker, Side::No, nonce, i) {
+            placed += 1;
+            if filled {
+                eprintln!("[verify] UNEXPECTED FILL on a fill-safe book — halting; check positions.");
+                break;
+            }
+        }
+    }
+    if placed == 0 {
+        println!(
+            "[verify] no order placed — scanned {} (safe={n_safe} had-99bid={n_99} fetch-failed={n_fail}); \
+             set PROBE_TICKER=<empty-book ticker> to pin one.",
+            candidates.len()
+        );
+    }
+    println!(
+        "\n[verify] VERDICT — inspect the create response above ([raw] / executions.jsonl `raw`):\n  \
+         CORRECT  -> outcome_side=\"no\"  AND  no_price_dollars=\"0.0100\"  (the NO leg rests at 1¢)\n  \
+         WRONG    -> the 1¢ landed on yes_price_dollars / outcome_side=\"yes\", OR the create was REJECTED."
+    );
 }
