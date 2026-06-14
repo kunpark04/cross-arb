@@ -21,6 +21,7 @@ mod matcher;
 mod pair;
 mod postpone;
 mod pricing;
+mod probe;
 mod refresh;
 mod risk;
 mod signal;
@@ -71,6 +72,14 @@ async fn main() {
         ExecutionMode::Live => std::sync::Arc::new(LiveBackend::new(&cfg)),
     };
     println!("execution backend : {}\n", backend.label());
+
+    // `--probe-order [N]`: LIVE order-path verification + latency probe (1¢ BUY-YES place+cancel). Gated by
+    // the SAME prod/settle consent checks above; uses the configured backend (real orders only when
+    // EXECUTION_MODE=live). Runs instead of the loop/smoke and exits.
+    if let Some(n) = probe_order_iters() {
+        probe::run(&cfg, backend, n).await;
+        return;
+    }
 
     // STAGE-1 smoke vs STAGE-2 live loop. The smoke runs the real risk+exec spine on synthetic
     // snapshots (no network) and is the path of least resistance: it runs when `--smoke` is passed OR
@@ -139,4 +148,12 @@ fn banner(cfg: &Config) {
         println!("KILL SWITCH       : ENGAGED (CROSSARB_KILL) - no trading");
     }
     println!();
+}
+
+/// Parse `--probe-order [N]` from argv. `Some(N)` (default 8) when the flag is present, else `None`.
+/// N is the max place+cancel iterations for the order-path latency probe (`probe::run`).
+fn probe_order_iters() -> Option<usize> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--probe-order")?;
+    Some(args.get(i + 1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(8))
 }

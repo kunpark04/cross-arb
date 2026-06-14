@@ -180,25 +180,27 @@ fn num_or_str(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-/// Did the KALSHI order FILL the full requested `qty`? Kalshi reports fills SYNCHRONOUSLY in the create
-/// response (live-verified shape: `{"order":{"status":"resting","fill_count":"0.00",...}}`). FILLED iff the
-/// order `status` is an executed/filled terminal state (NOT `resting`/`canceled`/`pending`) AND the fill
-/// count >= `qty`. A `resting` (marketable-miss) order is acceptance only -> `false` (the live `[201] resting,
-/// fill_count 0` case the bot must NOT treat as a hedge leg). Conservative on an unrecognized body: not filled.
+/// Did the KALSHI order FILL the full requested `qty`? Judged on the FILLED QUANTITY (the ground truth).
+/// CURRENT Kalshi API field: **`fill_count_fp`** — a fixed-point STRING, e.g. `"1.00"` (older shape used
+/// `fill_count`/`filled_count`, kept as fallbacks). FILLED iff the filled count `>= qty`. FAIL-SAFE: an
+/// absent/0 count -> `false`, so a `resting` (marketable-miss) order or an unrecognized body is NEVER read as
+/// a hedge leg (the silent-naked-leg axis — a fabricated "filled" leaves a real naked position).
+///
+/// ⚠️ HISTORY (2026-06-14): this previously read only `fill_count` AND hard-required a `status` field. A LIVE
+/// probe caught the bot returning `parsed_filled=false` on a REAL `{"fill_count_fp":"1.00","status":"executed",
+/// "remaining_count_fp":"0.00"}` fill — the venue had RENAMED the count field, so EVERY Kalshi fill was being
+/// missed (→ the bot would treat a filled leg as unfilled → release/recover → silent naked position). The
+/// create-response unit test used a fictional `fill_count` fixture, so it never caught the rename. Now
+/// quantity-based on the real field, and the test is pinned to the captured live shape.
 fn kalshi_order_filled(v: &serde_json::Value, qty: u32) -> bool {
     let order = v.get("order").unwrap_or(v); // tolerate both {order:{..}} and a flat {..}
-    let status = order
-        .get("status")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let status_executed = matches!(status.as_str(), "executed" | "filled");
     let fill_count = order
-        .get("fill_count")
+        .get("fill_count_fp")            // CURRENT API: filled qty, fixed-point STRING ("1.00")
+        .or_else(|| order.get("fill_count")) // legacy field names (back-compat)
         .or_else(|| order.get("filled_count"))
         .and_then(num_or_str)
         .unwrap_or(0.0);
-    status_executed && fill_count >= qty as f64
+    fill_count >= qty as f64
 }
 
 /// Did the PMUS order FILL the full requested `qty`? With `synchronousExecution` (set in
@@ -480,6 +482,17 @@ impl LiveBackend {
             Venue::Kalshi => kalshi_order_filled(&v, intent.qty),
             Venue::Pmus => pmus_order_filled(&v, intent.qty),
         };
+        // DIAGNOSTIC (env-gated, default OFF): dump the raw create-response body + the parsed `filled` so a
+        // live probe can confirm the SYNCHRONOUS fill-detection (`PROBE_LOG_RAW=1`). Logs only the order ack
+        // body (never key material), truncated. This is how we tell "rested then hit later" from "filled
+        // synchronously but mis-parsed".
+        if std::env::var("PROBE_LOG_RAW").as_deref() == Ok("1") {
+            eprintln!(
+                "[raw] {:?} http={} parsed_filled={} body={}",
+                intent.venue, status.as_u16(), filled,
+                text.chars().take(400).collect::<String>()
+            );
+        }
         Ok(Ack {
             client_order_id: intent.client_order_id.clone(),
             venue_order_id,
@@ -897,18 +910,23 @@ mod tests {
     /// (`"0.00"`), so the parser must read number-or-string. A 0-fill executed body is still not-filled.
     #[test]
     fn kalshi_resting_is_not_filled_executed_is() {
-        // the live-verified resting shape: {"order":{"status":"resting","fill_count":"0.00"}} -> not filled.
-        let resting: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"resting","fill_count":"0.00"}}"#).unwrap();
-        assert!(!kalshi_order_filled(&resting, 1), "a resting order is acceptance, not a fill");
-        // executed with a full fill_count (string) -> filled.
-        let executed: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"executed","fill_count":"1"}}"#).unwrap();
-        assert!(kalshi_order_filled(&executed, 1), "executed + full fill_count is a fill");
-        // executed but fill_count < requested count (partial) -> NOT a full fill.
-        let partial: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"executed","fill_count":"1"}}"#).unwrap();
-        assert!(!kalshi_order_filled(&partial, 3), "a partial fill is not the full requested qty");
-        // a numeric fill_count is also accepted (not only string); flat (no {order:..}) body tolerated.
-        let flat: serde_json::Value = serde_json::from_str(r#"{"status":"executed","fill_count":2}"#).unwrap();
-        assert!(kalshi_order_filled(&flat, 2));
+        // REAL current shape (captured LIVE 2026-06-14) — a RESTING order: fill_count_fp "0.00" -> not filled.
+        let resting: serde_json::Value = serde_json::from_str(
+            r#"{"order":{"status":"resting","fill_count_fp":"0.00","initial_count_fp":"1.00","remaining_count_fp":"1.00"}}"#).unwrap();
+        assert!(!kalshi_order_filled(&resting, 1), "a resting order (fill_count_fp 0) is acceptance, not a fill");
+        // REAL current shape — an EXECUTED full fill: fill_count_fp "1.00". This is the EXACT body the OLD code
+        // (which read only `fill_count`) misread as not-filled live -> the silent-naked-leg bug. Now -> filled.
+        let executed: serde_json::Value = serde_json::from_str(
+            r#"{"order":{"status":"executed","fill_count_fp":"1.00","initial_count_fp":"1.00","remaining_count_fp":"0.00"}}"#).unwrap();
+        assert!(kalshi_order_filled(&executed, 1), "executed + fill_count_fp >= qty is a fill (the RENAMED field)");
+        // partial: fill_count_fp 1 but 3 requested -> NOT a full fill.
+        let partial: serde_json::Value = serde_json::from_str(r#"{"order":{"fill_count_fp":"1.00"}}"#).unwrap();
+        assert!(!kalshi_order_filled(&partial, 3), "fill_count_fp below the requested qty is a partial, not full");
+        // LEGACY back-compat: the older `fill_count` field still parses (string or numeric; flat body tolerated).
+        let legacy: serde_json::Value = serde_json::from_str(r#"{"order":{"status":"executed","fill_count":"1"}}"#).unwrap();
+        assert!(kalshi_order_filled(&legacy, 1), "legacy fill_count field still works (back-compat)");
+        let flat: serde_json::Value = serde_json::from_str(r#"{"fill_count":2}"#).unwrap();
+        assert!(kalshi_order_filled(&flat, 2), "flat body + numeric legacy fill_count");
     }
 
     /// FIX B: pmus fill-detection pinned to the OpenAPI schema field names (orders-schema.json, 2026-06-11).
