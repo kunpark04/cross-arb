@@ -6,6 +6,23 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 (cont. 2) — Dutch book REMOVED — narrowed to the single 2-leg strategy (pre-go-live de-risk)
+
+Heading toward a real-money go-live, the owner narrowed to ONE arb strategy and pulled the 3-leg Dutch book
+(`e39043c` reverts `916c89c`). Rationale: it's the riskiest, never-run-live code (3-leg execution +
+naked-pair recovery; the recommended independent review not yet done) — removing it shrinks the live surface
+to the proven 2-leg **per-outcome binary arb** (buy YES cheap + NO dear on one outcome:
+weather/econ/sports/WC-per-outcome). bot-rs back to **135 tests**, clippy clean; restorable from `916c89c`.
+
+**Go-live blindspots flagged (still open):** the **edge is unvalidated** (0014 needs weeks of data; backtests
+are effective-n≈1, paper/gross, phantom-corrected); **no clean live order has ever been placed** (demo
+round-trip + pmus POST-signing/`SELL_*` unverified); **settlement empirically confirmed for WEATHER only**
+(sports/econ recon ~Jun 23–25 / Jul 3; WC never settled on both venues); the 2-leg **naked-leg recovery
+still fires first on real money**. The defensible first real-money step = **weather-only, 1-contract, after a
+clean demo round-trip** — not full-universe by EOD.
+
+---
+
 ## 2026-06-14 (cont.) — World Cup 3-leg Dutch-book arb (the fuller WC opportunity, dry-run)
 
 Owner: "go all the way." Added the cross-venue 3-leg **Dutch book** alongside the per-outcome binary arbs
