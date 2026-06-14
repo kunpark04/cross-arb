@@ -77,6 +77,7 @@ pub struct Discovery {
     pub weather_cities_unmapped: Vec<String>, // pmus lists these climate cities, WX map doesn't -> MISSED
     pub sports_leagues_unmapped: Vec<String>,
     pub soccer_leagues_unmapped: Vec<String>, // pmus lists these drawable-outcome leagues, SOCCER3 doesn't -> MISSED
+    pub soccer_unbound: Vec<(String, String)>, // WC games binding by NEITHER exact code NOR name: (slug, why) -> LOUD miss
     pub weather_buckets_misaligned: usize,    // pmus weather buckets with no identical-bounds Kalshi twin
     pub econ_skipped: usize,                  // <= tails / == point buckets / >=T with no listed twin
     pub truncated: bool,                      // pmus catalog hit the page cap (coverage incomplete)
@@ -127,15 +128,37 @@ const LEAGUES_ABBREV: [(&str, &str); 8] = [
 /// routed through the weather/econ 1:1 path. Only `fwc` (live match-winners) this build (port of `SOCCER3`).
 const SOCCER3: [(&str, &str); 1] = [("fwc", "KXWCGAME")];
 
-/// pmus country-code -> Kalshi country-code, ONLY where they differ (port of `SOCCER_CC_ALIAS`). The exact
-/// abbrev join binds most WC games; these remaps bind the residue. NO fuzzy 3-letter matching — an explicit
-/// table keeps the no-false-positive invariant (L1). The partner countries in those games are EXACT on
-/// Kalshi (self-mapping), so they need no entry.
-const SOCCER_CC_ALIAS: [(&str, &str); 3] = [("irn", "iri"), ("alg", "dza"), ("hai", "hti")];
+/// Canonical country key for the WC name-fallback join — port of `colisted_map.py::_norm_country`: fold the
+/// Latin-1 accented letters to ASCII, lowercase, strip to `[a-z0-9]`. `"IR Iran"`->`"iriran"`,
+/// `"Türkiye"`->`"turkiye"`, `"Côte d'Ivoire"`->`"cotedivoire"`. EXACT equality on this key is the join (no
+/// substring/fuzzy — two DISTINCT countries must never share a key; verified for the full 48-country WC
+/// field). Empty for an empty/missing name (a missing name must produce a non-matchable key). The accent
+/// fold (vs Python's NFKD) keeps the Türkiye/Côte-d'Ivoire class name-equal across venues WITHOUT a unicode
+/// crate — though those bind by exact CODE today, so the fold is belt-and-suspenders for a future mismatch.
+fn norm_country(name: &str) -> String {
+    name.chars()
+        .map(fold_accent)
+        .flat_map(|c| c.to_lowercase())
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
 
-/// Apply the pmus->Kalshi country-code alias (identity when the code matches on both venues).
-fn soccer_cc_alias(code: &str) -> &str {
-    SOCCER_CC_ALIAS.iter().find(|(pm, _)| *pm == code).map(|(_, k)| *k).unwrap_or(code)
+/// Fold a single Latin-1 accented letter to its base ASCII letter (the accents that appear in country
+/// names: acute/grave/circumflex/diaeresis/tilde/ring/cedilla/slash). Non-accented chars pass through; a
+/// non-ASCII char with no fold here is dropped by `norm_country`'s ascii-alphanumeric filter (matching
+/// Python's `encode("ascii","ignore")`).
+fn fold_accent(c: char) -> char {
+    match c {
+        'À'..='Å' | 'à'..='å' => 'a',
+        'Ç' | 'ç' => 'c',
+        'È'..='Ë' | 'è'..='ë' => 'e',
+        'Ì'..='Ï' | 'ì'..='ï' => 'i',
+        'Ñ' | 'ñ' => 'n',
+        'Ò'..='Ö' | 'Ø' | 'ò'..='ö' | 'ø' => 'o',
+        'Ù'..='Ü' | 'ù'..='ü' => 'u',
+        'Ý' | 'ý' | 'ÿ' => 'y',
+        other => other,
+    }
 }
 
 // ============================================================================================
@@ -535,6 +558,53 @@ fn pick_wc_game(
     None
 }
 
+/// The full country name of a pmus WC outcome market: `marketSides[].team.name` (BOTH the Yes and No side
+/// of a `-<code>` market carry the SAME team, so the first non-empty wins). Empty for a `-draw` market
+/// (team is null) or any market without a named team. Port of `colisted_map.py::pm_team_name`.
+fn pm_wc_team_name(m: &Value) -> String {
+    m.get("marketSides")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|s| s.get("team").and_then(|t| t.get("name")).and_then(Value::as_str).filter(|n| !n.is_empty()))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Resolve the pmus codes `(a, b)` to the Kalshi event suffixes to bind. PRIMARY: the exact 3-letter code
+/// (FIFA codes are unique -> safe). FALLBACK (the residue where venues use different codes, e.g. pmus `irn`
+/// / Kalshi `iri`): the NORMALIZED full team NAME — pmus `marketSides[].team.name` vs Kalshi `yes_sub_title`,
+/// EXACT-equal after `norm_country` (no substring/fuzzy, L1). Each returned code is the exact code if it
+/// appears on SOME Kalshi event for `date`, else the name-matched suffix, else the original code (so
+/// `pick_wc_game` then fails -> the game is reported unbound, never falsely bound). Port of `_wc_resolve_codes`.
+fn wc_resolve_codes(
+    a: &str,
+    b: &str,
+    pa: &Value,
+    pb: &Value,
+    knames_for_date: &[std::collections::HashMap<String, String>],
+) -> (String, String) {
+    let mut sufs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut name2suf: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for ev in knames_for_date {
+        for (suf, nm) in ev {
+            sufs.insert(suf.as_str());
+            let nz = norm_country(nm);
+            if !nz.is_empty() {
+                name2suf.entry(nz).or_insert(suf.as_str()); // first wins (mirrors Python setdefault)
+            }
+        }
+    }
+    let resolve = |code: &str, pm_mkt: &Value| -> String {
+        if sufs.contains(code) {
+            return code.to_string(); // exact code present -> primary path
+        }
+        // else exact-normalized-name fallback; neither -> keep the code (pick_wc_game then fails -> unbound).
+        name2suf.get(&norm_country(&pm_wc_team_name(pm_mkt))).map(|s| s.to_string()).unwrap_or_else(|| code.to_string())
+    };
+    (resolve(a, pa), resolve(b, pb))
+}
+
 /// `|a - b| <= 1 day` on `YYYY-MM-DD` dates (port of `dnear`); a parse failure falls back to `a == b`.
 fn dnear(a: &str, b: &str) -> bool {
     match (ymd_to_epoch_days(a), ymd_to_epoch_days(b)) {
@@ -738,8 +808,10 @@ where
     // ---- SOCCER 3-way (World Cup): each of the 3 outcomes is its OWN binary on BOTH venues -> emit each as
     //      a PER-OUTCOME BINARY Pair (kalshi_b=None, soccer=true), routed through the weather/econ 1:1 signal
     //      path (NOT the 2-team game_signal). pmus is 3 sibling slugs grouped per (a,b,date); Kalshi is the
-    //      KXWCGAME event's 3 tickers (team A/B + TIE). Reuses the exact-date + used-set bind (pick_wc_game)
-    //      + a country-code alias for the code-convention mismatches. Port of the colisted_map soccer3 branch.
+    //      KXWCGAME event's 3 tickers (team A/B + TIE). Reuses the exact-date + used-set bind (pick_wc_game);
+    //      the country code is matched EXACT-first, then by normalized full team NAME (team.name vs
+    //      yes_sub_title) for the venue-code-mismatch residue — a game that binds by NEITHER is reported in
+    //      `soccer_unbound` (LOUD), never silently missed. Port of the colisted_map soccer3 branch.
     //      group pmus drawable-outcome WC markets: (a,b,date) -> {outcome_token: market}.
     let mut pm_soc: std::collections::HashMap<(String, String, String), std::collections::HashMap<String, &Value>> =
         std::collections::HashMap::new();
@@ -764,9 +836,10 @@ where
             continue;
         }
         let kmarkets = kalshi_series(kser);
-        // group Kalshi KXWCGAME markets by EVENT -> {suffix: ticker} (suffix = country code or `tie`),
-        // recording each event's date; then bucket events by date for the exact-date bind (kbydate).
+        // group Kalshi KXWCGAME markets by EVENT -> {suffix: ticker} (suffix = country code or `tie`) AND a
+        // PARALLEL {suffix: yes_sub_title} name map (the name-fallback bridge), recording each event's date.
         let mut by_event: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+        let mut by_name: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
         let mut event_date: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for m in &kmarkets {
             let Some(tk) = field_str(m, "ticker") else { continue };
@@ -774,17 +847,22 @@ where
             event_date.entry(ev.clone()).or_insert_with(|| ktok_date(&tk).unwrap_or_default());
             let suffix = tk.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
             if !suffix.is_empty() {
-                by_event.entry(ev).or_default().insert(suffix, tk);
+                let name = field_str(m, "yes_sub_title").unwrap_or_default();
+                by_event.entry(ev.clone()).or_default().insert(suffix.clone(), tk);
+                by_name.entry(ev).or_default().insert(suffix, name);
             }
         }
         // DETERMINISM (mirrors the moneyline path): events come out of a HashMap (random order), so push
         // sorted by event_ticker -> a stable per-date event INDEX for the used-set across re-discovery passes.
+        // kbydate (suffix->ticker) and kbydate_names (suffix->name) are pushed in the SAME order -> aligned.
         let mut kbydate: std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>> = std::collections::HashMap::new();
-        let mut events: Vec<(String, std::collections::HashMap<String, String>)> = by_event.into_iter().collect();
-        events.sort_by(|a, b| a.0.cmp(&b.0));
-        for (ev, dict) in events {
+        let mut kbydate_names: std::collections::HashMap<String, Vec<std::collections::HashMap<String, String>>> = std::collections::HashMap::new();
+        let mut event_tickers: Vec<String> = by_event.keys().cloned().collect();
+        event_tickers.sort();
+        for ev in event_tickers {
             let date = event_date.get(&ev).cloned().unwrap_or_default();
-            kbydate.entry(date).or_default().push(dict);
+            kbydate.entry(date.clone()).or_default().push(by_event.remove(&ev).unwrap_or_default());
+            kbydate_names.entry(date).or_default().push(by_name.remove(&ev).unwrap_or_default());
         }
         // one used-set per league pass: a bound Kalshi event can't bind a second pm game (doubleheader guard).
         let mut used: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
@@ -792,6 +870,7 @@ where
         // deterministic order the used-set could bind two same-date games to swapped events across passes.
         let mut game_keys: Vec<&(String, String, String)> = pm_soc.keys().collect();
         game_keys.sort();
+        let no_names: Vec<std::collections::HashMap<String, String>> = Vec::new();
         for key in game_keys {
             let (a, b, date) = key;
             let outs = &pm_soc[key];
@@ -799,8 +878,18 @@ where
             let (Some(pa), Some(pb), Some(pdraw)) = (outs.get(a.as_str()), outs.get(b.as_str()), outs.get("draw")) else {
                 continue;
             };
-            let (ka, kb) = (soccer_cc_alias(a), soccer_cc_alias(b));
-            let Some((ta, tb, tie)) = pick_wc_game(&kbydate, ka, kb, date, &mut used) else { continue };
+            // resolve codes EXACT-first then by NAME (supersedes the old alias table); a code+name double-miss
+            // keeps the original code so pick_wc_game fails -> reported unbound below.
+            let knames_for_date = kbydate_names.get(date).unwrap_or(&no_names);
+            let (ka, kb) = wc_resolve_codes(a, b, pa, pb, knames_for_date);
+            let Some((ta, tb, tie)) = pick_wc_game(&kbydate, &ka, &kb, date, &mut used) else {
+                // LOUD miss: bound by neither exact code nor name -> record the pmus slug + the unmatched names.
+                d.soccer_unbound.push((
+                    field_str(pa, "slug").unwrap_or_default(),
+                    format!("{a}={:?}/{b}={:?} date={date}", pm_wc_team_name(pa), pm_wc_team_name(pb)),
+                ));
+                continue;
+            };
             // days_to_event = game date - today (in days); None when either date is unknown -> gate dormant.
             let days_to_event = match (today_epoch_days, ymd_to_epoch_days(date)) {
                 (Some(today), Some(game)) => Some((game - today) as f64),
@@ -1471,56 +1560,108 @@ mod tests {
         assert!(d.pairs.iter().all(|p| p.kalshi_b.is_none()), "WC pairs never carry a kalshi_b");
     }
 
-    /// ALIAS join: pmus `irn` must bind the Kalshi `...IRINZL` event (irn->iri), via the explicit alias table
-    /// — NOT fail, and NOT fuzzy-match. The three outcomes still emit, with -irn<->IRI.
+    /// A pmus WC outcome market carrying team.name (the name-fallback bridge); `-draw` carries no team.
+    fn wc_pm(slug: &str, team_name: Option<&str>) -> Value {
+        let sides = match team_name {
+            Some(n) => format!(r#"[{{"description":"Yes","team":{{"name":"{n}"}}}},{{"description":"No","team":{{"name":"{n}"}}}}]"#),
+            None => r#"[{"description":"Yes","team":null},{"description":"No","team":null}]"#.to_string(),
+        };
+        pm(slug, "sports", &format!(r#""marketType":"drawable_outcome","marketSides":{sides}"#))
+    }
+
+    /// NAME-FALLBACK join (supersedes the removed alias table): pmus code `irn` is ABSENT from the Kalshi
+    /// event (which uses `iri`), so the exact-code path fails; the name fallback ("IR Iran"=="IR Iran")
+    /// binds it. NOT fuzzy — exact normalized-name equality. The three outcomes emit, with -irn<->IRI.
     #[test]
-    fn soccer3_alias_join_binds_irn_to_iri() {
+    fn soccer3_name_fallback_binds_irn_to_iri() {
         let pm_cat = vec![
-            pm("atc-fwc-irn-nzl-2026-06-15-irn", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-irn-nzl-2026-06-15-nzl", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-irn-nzl-2026-06-15-draw", "sports", r#""marketType":"drawable_outcome""#),
+            wc_pm("atc-fwc-irn-nzl-2026-06-15-irn", Some("IR Iran")),
+            wc_pm("atc-fwc-irn-nzl-2026-06-15-nzl", Some("New Zealand")),
+            wc_pm("atc-fwc-irn-nzl-2026-06-15-draw", None),
         ];
         let d = assemble(&pm_cat, false, ymd_to_epoch_days("2026-06-13"), wc_kalshi_stub);
-        assert_eq!(d.soccer_pairs, 3, "alias irn->iri must bind all 3 outcomes");
+        assert_eq!(d.soccer_pairs, 3, "name fallback irn->iri must bind all 3 outcomes");
+        assert!(d.soccer_unbound.is_empty(), "a name-matched game is not unbound");
         let irn = d.pairs.iter().find(|p| p.slug.ends_with("-irn")).unwrap();
-        assert_eq!(irn.kalshi, "KXWCGAME-26JUN15IRINZL-IRI", "irn binds the IRI ticker via the alias");
+        assert_eq!(irn.kalshi, "KXWCGAME-26JUN15IRINZL-IRI", "irn binds the IRI ticker by NAME, not a hardcoded alias");
         let draw = d.pairs.iter().find(|p| p.slug.ends_with("2026-06-15-draw")).unwrap();
         assert_eq!(draw.kalshi, "KXWCGAME-26JUN15IRINZL-TIE");
     }
 
-    /// NO FALSE JOIN + NO PARTIAL BIND (L1): an unknown country code that is neither exact nor aliased to a
-    /// Kalshi suffix emits NOTHING (pick_wc_game refuses; no fuzzy fallback); and a game missing a sibling
-    /// outcome (only 2 of 3) or missing the Kalshi TIE ticker emits NOTHING (all-3-or-skip).
+    /// `norm_country`: NFKD-equivalent accent fold + lowercase + strip non-alphanumeric. The live code-
+    /// mismatch countries are name-IDENTICAL across venues; two DISTINCT countries (incl. the South/North
+    /// Korea trap the task flagged) must NOT collide -> the L1 no-false-join invariant holds without fuzzy.
     #[test]
-    fn soccer3_no_false_join_and_no_partial_bind() {
-        // (1) unknown code `xxx` (not exact, not aliased) -> no pair, even though the date/partner exist.
+    fn norm_country_folds_accents_and_never_overcollapses() {
+        assert_eq!(norm_country("IR Iran"), "iriran");
+        assert_eq!(norm_country("Türkiye"), "turkiye", "ü folds to u (matches Kalshi 'Turkiye')");
+        assert_eq!(norm_country("Côte d'Ivoire"), "cotedivoire");
+        assert_eq!(norm_country("New Zealand"), "newzealand");
+        assert_eq!(norm_country(""), "");
+        // L1: distinct countries must never share a normalized key.
+        assert_ne!(norm_country("South Korea"), norm_country("North Korea"));
+        assert_ne!(norm_country("Korea Republic"), norm_country("Korea DPR"));
+        assert_ne!(norm_country("Congo DR"), norm_country("Congo"));
+    }
+
+    /// NO FALSE JOIN + LOUD MISS + NO PARTIAL BIND (L1): a code whose name ALSO matches no Kalshi country
+    /// emits NOTHING and is REPORTED in `soccer_unbound` (no fuzzy fallback); the South/North Korea trap
+    /// must NOT bind; and a game missing a sibling outcome / the Kalshi TIE emits NOTHING (all-3-or-skip).
+    #[test]
+    fn soccer3_no_false_join_loud_miss_and_no_partial_bind() {
+        // (1) unknown code `xxx` with a name ("Atlantis") in no Kalshi event -> code+name both fail -> UNBOUND.
         let bad = vec![
-            pm("atc-fwc-xxx-nzl-2026-06-15-xxx", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-xxx-nzl-2026-06-15-nzl", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-xxx-nzl-2026-06-15-draw", "sports", r#""marketType":"drawable_outcome""#),
+            wc_pm("atc-fwc-xxx-nzl-2026-06-15-xxx", Some("Atlantis")),
+            wc_pm("atc-fwc-xxx-nzl-2026-06-15-nzl", Some("New Zealand")),
+            wc_pm("atc-fwc-xxx-nzl-2026-06-15-draw", None),
         ];
-        assert_eq!(assemble(&bad, false, None, wc_kalshi_stub).soccer_pairs, 0, "no false join on an unknown code");
-        // (2) incomplete game: only 2 of 3 sibling outcomes (no draw) -> emit nothing.
+        let d_bad = assemble(&bad, false, None, wc_kalshi_stub);
+        assert_eq!(d_bad.soccer_pairs, 0, "no false join on an unknown code+name");
+        assert_eq!(d_bad.soccer_unbound.len(), 1, "the code+name miss is REPORTED unbound, not silent");
+        assert_eq!(d_bad.soccer_unbound[0].0, "atc-fwc-xxx-nzl-2026-06-15-xxx");
+        // (2) L1 OVER-COLLAPSE: pmus North Korea must NOT bind a Kalshi event listing only South Korea (kor).
+        fn kor_stub(series: &str) -> Vec<Value> {
+            if series == "KXWCGAME" {
+                vec![
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN16KORNZL-KOR","event_ticker":"KXWCGAME-26JUN16KORNZL","yes_sub_title":"South Korea"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN16KORNZL-NZL","event_ticker":"KXWCGAME-26JUN16KORNZL","yes_sub_title":"New Zealand"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN16KORNZL-TIE","event_ticker":"KXWCGAME-26JUN16KORNZL","yes_sub_title":"Tie"}"#).unwrap(),
+                ]
+            } else {
+                vec![]
+            }
+        }
+        let nk = vec![
+            wc_pm("atc-fwc-prk-nzl-2026-06-16-prk", Some("North Korea")),
+            wc_pm("atc-fwc-prk-nzl-2026-06-16-nzl", Some("New Zealand")),
+            wc_pm("atc-fwc-prk-nzl-2026-06-16-draw", None),
+        ];
+        let d_nk = assemble(&nk, false, None, kor_stub);
+        assert_eq!(d_nk.soccer_pairs, 0, "L1: North Korea must NOT bind a South-Korea-only event");
+        assert_eq!(d_nk.soccer_unbound.len(), 1, "the over-collapse miss is reported unbound");
+        // (3) incomplete game: only 2 of 3 sibling outcomes (no draw) -> emit nothing AND not reported unbound.
         let partial = vec![
-            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-ger-cuw-2026-06-14-cuw", "sports", r#""marketType":"drawable_outcome""#),
+            wc_pm("atc-fwc-ger-cuw-2026-06-14-ger", Some("Germany")),
+            wc_pm("atc-fwc-ger-cuw-2026-06-14-cuw", Some("Curacao")),
         ];
-        assert_eq!(assemble(&partial, false, None, wc_kalshi_stub).soccer_pairs, 0, "incomplete game (no draw) -> skip");
-        // (3) Kalshi event has no TIE ticker -> no bind (need team A + B + TIE).
+        let d_partial = assemble(&partial, false, None, wc_kalshi_stub);
+        assert_eq!(d_partial.soccer_pairs, 0, "incomplete game (no draw) -> skip");
+        assert!(d_partial.soccer_unbound.is_empty(), "an incomplete game is not reported unbound (need all 3 first)");
+        // (4) Kalshi event has no TIE ticker -> no bind (need team A + B + TIE) -> reported unbound.
         fn no_tie_stub(series: &str) -> Vec<Value> {
             if series == "KXWCGAME" {
                 vec![
-                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN14GERCUW-GER","event_ticker":"KXWCGAME-26JUN14GERCUW"}"#).unwrap(),
-                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN14GERCUW-CUW","event_ticker":"KXWCGAME-26JUN14GERCUW"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN14GERCUW-GER","event_ticker":"KXWCGAME-26JUN14GERCUW","yes_sub_title":"Germany"}"#).unwrap(),
+                    serde_json::from_str(r#"{"ticker":"KXWCGAME-26JUN14GERCUW-CUW","event_ticker":"KXWCGAME-26JUN14GERCUW","yes_sub_title":"Curacao"}"#).unwrap(),
                 ]
             } else {
                 vec![]
             }
         }
         let full = vec![
-            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-ger-cuw-2026-06-14-cuw", "sports", r#""marketType":"drawable_outcome""#),
-            pm("atc-fwc-ger-cuw-2026-06-14-draw", "sports", r#""marketType":"drawable_outcome""#),
+            wc_pm("atc-fwc-ger-cuw-2026-06-14-ger", Some("Germany")),
+            wc_pm("atc-fwc-ger-cuw-2026-06-14-cuw", Some("Curacao")),
+            wc_pm("atc-fwc-ger-cuw-2026-06-14-draw", None),
         ];
         assert_eq!(assemble(&full, false, None, no_tie_stub).soccer_pairs, 0, "no Kalshi TIE -> no bind");
     }

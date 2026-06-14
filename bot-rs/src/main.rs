@@ -981,6 +981,10 @@ fn report_coverage(d: &discovery::Discovery) {
     if !d.soccer_leagues_unmapped.is_empty() {
         println!("[coverage] UNMAPPED soccer (drawable-outcome) leagues: {:?}", d.soccer_leagues_unmapped);
     }
+    for (slug, why) in &d.soccer_unbound {
+        // LOUD, never silent: a WC game whose codes mismatch AND whose names don't agree -> would be missed.
+        println!("[wc-unbound] no Kalshi bind (code+name both failed): {slug}  ({why})");
+    }
     if d.weather_buckets_misaligned > 0 {
         println!("[coverage] {} weather buckets had no identical-bounds Kalshi twin (NOT paired)", d.weather_buckets_misaligned);
     }
