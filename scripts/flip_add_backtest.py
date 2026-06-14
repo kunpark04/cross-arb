@@ -234,7 +234,8 @@ def add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, 
             open_dir.setdefault(r["market"], r.get("dir"))     # first OPEN's dir = the entry direction
         elif r["transition"] == "WIDEN":
             widens.setdefault(r["market"], []).append(
-                (r["t"], r.get("net_edge"), (r.get("depth") or {}).get("c2", 0), r.get("dir"), r.get("depth")))
+                (r["t"], r.get("net_edge"), (r.get("depth") or {}).get("c2", 0), r.get("dir"), r.get("depth"),
+                 r.get("px")))                                  # px (last slot) lets a downstream bankroll walk leg-split the add
     out, dropped_flat = [], 0
     for m, ep in filled.items():
         d0 = open_dir.get(m, ep["dir"])
@@ -249,7 +250,7 @@ def add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, 
             continue
         # the FIRST qualifying widen (causal — what you'd actually act on), NOT the max over the day
         # (picking the peak is an oracle, [L19]).
-        bt, bnet, bc2, _, bdepth = cand[0]
+        bt, bnet, bc2, _, bdepth, bpx = cand[0]
         flat = _widen_is_flat(bdepth)
         size0 = min(ep["open_c2"], max_clip)
         size_add = min(bc2, max_clip, int(round(add_cap_frac * size0)))             # per-pair add cap
@@ -268,7 +269,8 @@ def add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, 
         out.append({"market": m, "cat": ep["cat"], "dir": d0, "net0": ep["open_net"],
                     "c2_0": ep["open_c2"], "net_add": bnet, "c2_add": bc2,
                     "size0": size0, "size_add": size_add, "inc_pnl": inc, "void": vh,
-                    "flat_widen": flat, "is_true_add": is_true_add})
+                    "flat_widen": flat, "is_true_add": is_true_add,
+                    "widen_t": bt, "widen_px": bpx})       # the add's OPEN time + touches, for a causal bankroll walk
     return out, dropped_flat
 
 
