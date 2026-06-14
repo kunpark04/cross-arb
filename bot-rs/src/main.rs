@@ -178,7 +178,10 @@ impl From<discovery::Pair> for LivePair {
 /// teams for a sports pair) back to the pmus slug, so a frame on either Kalshi book finds its pair.
 #[derive(Default)]
 struct PairState {
-    by_slug: std::collections::HashMap<String, LivePair>,
+    // `Arc<LivePair>` so the event loop's per-frame `by_slug.get(&slug).cloned()` is a refcount bump, not a
+    // deep clone of the record (several Strings) on every book frame. Pairs are immutable once inserted
+    // (the refresh task inserts/removes whole records, never mutates a field), so sharing is sound.
+    by_slug: std::collections::HashMap<String, std::sync::Arc<LivePair>>,
     by_ticker: std::collections::HashMap<String, String>, // Kalshi ticker -> pmus slug
 }
 
@@ -187,7 +190,7 @@ impl PairState {
         for tk in p.kalshi_tickers() {
             self.by_ticker.insert(tk, p.slug.clone());
         }
-        self.by_slug.insert(p.slug.clone(), p);
+        self.by_slug.insert(p.slug.clone(), std::sync::Arc::new(p));
     }
     fn remove(&mut self, slug: &str) {
         if let Some(p) = self.by_slug.remove(slug) {
@@ -478,7 +481,11 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
         // C3 FRESHNESS GATE: require a post-reconnect frame for EVERY Kalshi ticker this pair uses before
         // building a Quote. This blocks trading a just-cleared Kalshi book (against a never-cleared pmus
         // book) until its snapshot rebuilds, while a 1:1 pair whose ticker just arrived trades correctly.
-        if !pair.kalshi_tickers().iter().all(|t| k_fresh.contains(t)) {
+        // Checked field-by-field (team-A always; team-B iff present) so the per-frame path allocates no
+        // `kalshi_tickers()` Vec — equivalent to "all tickers fresh".
+        let all_fresh = k_fresh.contains(&pair.kalshi)
+            && pair.kalshi_b.as_ref().is_none_or(|b| k_fresh.contains(b));
+        if !all_fresh {
             continue;
         }
 
@@ -602,7 +609,9 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
             let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
             reserve_exposure(&mut exposure, &pos, a.cost_per);
             pending_entries.insert(slug.clone());
-            spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some(pair.clone()), a.cost_per, edge.net, edge.dir);
+            // deref-clone the shared `Arc<LivePair>` into the owned `LivePair` the outcome carries (only on
+            // the rare approved-fire path, never per frame); the poll reads its league/date/abbrevs later.
+            spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir);
         }
     }
     if halt.load(Ordering::Relaxed) {

@@ -130,12 +130,14 @@ impl KalshiBook {
 }
 
 /// pmus book for ONE market: YES bid + YES ask ladders straight from its snapshot (pmus serves the
-/// YES book directly — no merge). Ladders are stored sorted on access. `last_update` carries the
-/// staleness clock, same as `KalshiBook`.
+/// YES book directly — no merge). Ladders are kept **pre-sorted at apply time** (bids high→low, asks
+/// low→high) so `best()` is O(1) off the front and the per-frame depth-walk reads no longer re-sort
+/// (the old store-unsorted/sort-on-every-read path was O(n log n) per ladder read). `last_update`
+/// carries the staleness clock, same as `KalshiBook`.
 #[derive(Debug, Clone)]
 pub struct PmusBook {
-    yes_bids: Vec<(f64, f64)>, // (price, qty)
-    yes_asks: Vec<(f64, f64)>,
+    yes_bids: Vec<(f64, f64)>, // (price, qty) — sorted DESCENDING by price (best/highest first)
+    yes_asks: Vec<(f64, f64)>, // (price, qty) — sorted ASCENDING by price (best/lowest first)
     last_update: Instant,
 }
 
@@ -150,26 +152,23 @@ impl PmusBook {
         PmusBook::default()
     }
 
-    /// Replace both YES ladders from a snapshot. Inputs need not be pre-sorted. Levels are taken
-    /// verbatim (the depth walk already stops on a `<= QTY_EPS` step), matching `KalshiBook`.
+    /// Replace both YES ladders from a snapshot. Inputs need not be pre-sorted — we sort each ONCE here
+    /// (bids high→low, asks low→high) so every later read (`best`, the ladder accessors, the depth walk)
+    /// is sort-free. Levels are taken verbatim otherwise (the depth walk already stops on a `<= QTY_EPS`
+    /// step), matching `KalshiBook`.
     pub fn apply_snapshot(&mut self, yes_bids: &[(f64, f64)], yes_asks: &[(f64, f64)]) {
         self.yes_bids = yes_bids.to_vec();
+        self.yes_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high → low
         self.yes_asks = yes_asks.to_vec();
+        self.yes_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)); // low → high
         self.last_update = Instant::now();
     }
 
-    /// (best YES bid = highest bid, best YES ask = lowest ask).
+    /// (best YES bid = highest bid, best YES ask = lowest ask). O(1): the ladders are kept sorted, so the
+    /// best of each side is the FRONT element (was an O(n) max/min fold over the whole ladder every touch).
     pub fn best(&self) -> (Option<f64>, Option<f64>) {
-        let yb = self
-            .yes_bids
-            .iter()
-            .map(|&(p, _)| p)
-            .fold(None, |acc, p| Some(acc.map_or(p, |a: f64| a.max(p))));
-        let ya = self
-            .yes_asks
-            .iter()
-            .map(|&(p, _)| p)
-            .fold(None, |acc, p| Some(acc.map_or(p, |a: f64| a.min(p))));
+        let yb = self.yes_bids.first().map(|&(p, _)| p);
+        let ya = self.yes_asks.first().map(|&(p, _)| p);
         (yb, ya)
     }
 
@@ -195,18 +194,14 @@ impl PmusBook {
         self.last_update = Instant::now() - std::time::Duration::from_secs(secs);
     }
 
-    /// YES BID ladder DESCENDING (best first).
+    /// YES BID ladder DESCENDING (best first). Stored pre-sorted, so this is a plain clone (no re-sort).
     pub fn yes_bid_ladder(&self) -> Vec<(f64, f64)> {
-        let mut v = self.yes_bids.clone();
-        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        v
+        self.yes_bids.clone()
     }
 
-    /// YES ASK ladder ASCENDING (best/lowest ask first).
+    /// YES ASK ladder ASCENDING (best/lowest ask first). Stored pre-sorted, so this is a plain clone.
     pub fn yes_ask_ladder(&self) -> Vec<(f64, f64)> {
-        let mut v = self.yes_asks.clone();
-        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        v
+        self.yes_asks.clone()
     }
 }
 

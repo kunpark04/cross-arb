@@ -4,6 +4,38 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
+## bot-rs — ENGINE REFACTOR: time-complexity + monolith split (2026-06-14) — IN PROGRESS
+
+Owner directive: "complete refactor of the engine code + related parts; minimize time complexity."
+Scope chosen (owner): **surgical hot-path complexity wins + split the 2809-line `main.rs` monolith**,
+**ZERO behavior change** — bit-identical numerics, all 147 tests + every safety invariant preserved.
+Baseline before any edit: **147 passed, 0 failed** (the green gate to hold). Caveat surfaced to owner:
+execution is network-bound (~86–261 ms RTT) so this buys CPU/allocation efficiency + clean scaling +
+maintainability, **not faster fills**. The discovery join is already pre-indexed O(P+K) — not a target.
+
+### Phase 1 — surgical hot-path complexity wins (run tests after each)
+- [ ] `book.rs` `PmusBook` **sorted storage**: sort the two ladders once in `apply_snapshot` (bids desc,
+      asks asc); `best()` O(n)→**O(1)** via `.first()`; `yes_bid/ask_ladder()` drop the per-call clone+sort
+      (O(n log n)→O(n)). API + return types UNCHANGED → all `book` tests pass verbatim.
+- [ ] `signal.rs` `signal` + `game_signal`: replace the per-call `opts: Vec<(Dir,f64)>` heap alloc with
+      fixed `Option<(Dir,f64)>` locals; PK-wins-ties + `no_arb`/`crossed` + empty-default semantics IDENTICAL.
+- [ ] `main.rs` hot loop: non-allocating freshness check (drop the per-frame `kalshi_tickers()` Vec); store
+      `by_slug: HashMap<String, Arc<LivePair>>` so the per-frame pair `.cloned()` is an Arc-bump, not a
+      multi-String deep clone. Behavior identical.
+- [ ] `cargo test` green (147) + `cargo clippy --all-targets` clean after Phase 1; commit.
+
+### Phase 2 — split `main.rs` (mechanical module moves, zero behavior change; compile+test after EACH)
+- [ ] `pricing.rs` — leg planning/building/pricing + `affordable`/`realized_edge_clears_floor`/
+      `position_from_intents`/exit-pricing (+ their tests). Compile+test.
+- [ ] `bookkeeping.rs` — exposure/position/recovery/unwind submission fns + `apply_outcome`/`qualifying_add`
+      (+ tests). Compile+test.
+- [ ] `refresh.rs` — `refresh_loop`/`report_coverage`/`prune_step`/`diff_targets` (+ tests). Compile+test.
+- [ ] `smoke.rs` — offline `smoke`/`report`. Compile+test.
+- [ ] `live.rs` — `run_live` + loop types (`LivePair`/`PairState`/`SubmitKind`/`FlatKind`/`SubmitOutcome`) +
+      `lock`/`poll_opt`/`supervise_fatal`/`led_by_from_prior`. `main.rs` → `main`+`banner`+mod decls only.
+- [ ] Final: `cargo test` 147 green + `cargo clippy --all-targets` clean + `cargo run -- --smoke` unchanged
+      output; adversarial self-review (money path untouched); commit. Update sessions.md + a decision entry.
+
 ## bot-rs — WORLD CUP tradeable (LIVE path) — IN PROGRESS
 
 Plan: `~/.claude/plans/deep-waddling-barto.md` (§1, §2). Python side landed (17ab0ea, `bot/colisted_map.py`).

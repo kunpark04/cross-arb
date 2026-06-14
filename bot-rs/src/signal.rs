@@ -61,32 +61,32 @@ pub fn signal(pm: &Book, k: &Book) -> Signal {
     let k_x = matches!((k_yb, k_ya), (Some(b), Some(a)) if b > a);
     let crossed = p_x || k_x;
 
-    // (dir, net_edge) candidates. dir PK = YES@pmus + NO@Kalshi (Python "P"); KP = YES@Kalshi + NO@pmus.
-    let mut opts: Vec<(Dir, f64)> = Vec::new();
-    if let (Some(p_ya), Some(k_yb)) = (p_ya, k_yb) {
-        if !crossed {
+    // The two (dir, net_edge) candidates, each priced only if its two needed quotes exist AND nothing is
+    // crossed. dir PK = YES@pmus + NO@Kalshi (Python "P"); KP = YES@Kalshi + NO@pmus. Fixed `Option` locals
+    // — no heap alloc (was an `opts` Vec pushed/folded every call).
+    let pk = match (crossed, p_ya, k_yb) {
+        (false, Some(p_ya), Some(k_yb)) => {
             let (ay, an) = (p_ya, 1.0 - k_yb); // YES@pmus, NO@Kalshi
-            let net = round4((1.0 - (ay + an)) - pmus_marginal_fee(ay) - kalshi_marginal_fee(an));
-            opts.push((Dir::PK, net));
+            Some((Dir::PK, round4((1.0 - (ay + an)) - pmus_marginal_fee(ay) - kalshi_marginal_fee(an))))
         }
-    }
-    if let (Some(k_ya), Some(p_yb)) = (k_ya, p_yb) {
-        if !crossed {
+        _ => None,
+    };
+    let kp = match (crossed, k_ya, p_yb) {
+        (false, Some(k_ya), Some(p_yb)) => {
             let (ay, an) = (k_ya, 1.0 - p_yb); // YES@Kalshi, NO@pmus
-            let net = round4((1.0 - (ay + an)) - kalshi_marginal_fee(ay) - pmus_marginal_fee(an));
-            opts.push((Dir::KP, net));
+            Some((Dir::KP, round4((1.0 - (ay + an)) - kalshi_marginal_fee(ay) - pmus_marginal_fee(an))))
         }
-    }
+        _ => None,
+    };
 
-    if opts.is_empty() {
-        // nothing priceable (one-sided both ways, or crossed). ledger.py defaults dir "P" == PK.
-        return Signal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed };
-    }
-    // max by net edge; ties resolve to the first-pushed (PK), matching Python's `max(opts)` stability.
-    let best = opts
-        .iter()
-        .copied()
-        .fold(opts[0], |acc, o| if o.1 > acc.1 { o } else { acc });
+    // best by net edge; a TIE resolves to PK (the first candidate), matching Python's stable `max(opts)`
+    // over [PK, KP]. Nothing priceable (one-sided both ways, or crossed) -> no_arb, default dir PK (ledger.py).
+    let best = match (pk, kp) {
+        (Some(p), Some(k)) => if k.1 > p.1 { k } else { p },
+        (Some(p), None) => p,
+        (None, Some(k)) => k,
+        (None, None) => return Signal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed },
+    };
     Signal {
         edge: Edge { net: best.1, dir: best.0 },
         no_arb: best.1 <= 0.0,
@@ -129,23 +129,29 @@ pub fn game_signal(pm_bid: Option<f64>, pm_ask: Option<f64>, ka_ask: Option<f64>
             return GameSignal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed: true };
         }
     }
-    // opts: detection uses the at-scale MARGINAL fee (no ceil) on both venues — capture any arb +EV at size.
-    let mut opts: Vec<(Dir, f64)> = Vec::new();
-    if let (Some(pa), Some(kb)) = (pm_ask, kb_ask) {
+    // Candidates: detection uses the at-scale MARGINAL fee (no ceil) on both venues — capture any arb +EV
+    // at size. Fixed `Option` locals (no `opts` Vec alloc).
+    let pk = match (pm_ask, kb_ask) {
         // PK: back A@pmus (pay pm_ask) + B@Kalshi (pay kb_ask).
-        opts.push((Dir::PK, round4((1.0 - (pa + kb)) - pmus_marginal_fee(pa) - kalshi_marginal_fee(kb))));
-    }
-    if let (Some(ka), Some(pb)) = (ka_ask, pm_bid) {
+        (Some(pa), Some(kb)) => Some((Dir::PK, round4((1.0 - (pa + kb)) - pmus_marginal_fee(pa) - kalshi_marginal_fee(kb)))),
+        _ => None,
+    };
+    let kp = match (ka_ask, pm_bid) {
         // KP: back A@Kalshi (pay ka_ask) + B@pmus (pay NO = 1 - pm_bid).
-        let pm_backb = round4(1.0 - pb);
-        opts.push((Dir::KP, round4((1.0 - (ka + pm_backb)) - kalshi_marginal_fee(ka) - pmus_marginal_fee(pm_backb))));
-    }
-    if opts.is_empty() {
-        // nothing priceable. monitor.py returns None; the loop skips (no dir to act on). Default dir PK.
-        return GameSignal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed: false };
-    }
-    // max by net; ties resolve to the first-pushed (PK before KP), matching Python's `max(opts)` stability.
-    let best = opts.iter().copied().fold(opts[0], |acc, o| if o.1 > acc.1 { o } else { acc });
+        (Some(ka), Some(pb)) => {
+            let pm_backb = round4(1.0 - pb);
+            Some((Dir::KP, round4((1.0 - (ka + pm_backb)) - kalshi_marginal_fee(ka) - pmus_marginal_fee(pm_backb))))
+        }
+        _ => None,
+    };
+    // best by net; a TIE resolves to PK (the first candidate), matching Python's stable `max(opts)`. Nothing
+    // priceable -> no_arb, default dir PK (monitor.py returns None; the loop skips).
+    let best = match (pk, kp) {
+        (Some(p), Some(k)) => if k.1 > p.1 { k } else { p },
+        (Some(p), None) => p,
+        (None, Some(k)) => k,
+        (None, None) => return GameSignal { edge: Edge { net: 0.0, dir: Dir::PK }, no_arb: true, crossed: false },
+    };
     GameSignal { edge: Edge { net: best.1, dir: best.0 }, no_arb: best.1 <= 0.0, crossed: false }
 }
 
