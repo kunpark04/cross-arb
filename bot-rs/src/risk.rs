@@ -269,6 +269,134 @@ pub fn evaluate(
     })
 }
 
+// ====================================================================================================
+// 3-LEG DUTCH-BOOK (World Cup) pre-trade gate — a PARALLEL of `evaluate`. The 2-leg `evaluate` is
+// UNCHANGED. Same gate philosophy (cheap/structural rejects first, sizing last), adapted to a basket:
+// the per-BASKET cost is `basket_cost` (sum of the 3 cheapest YES asks), and the fillable size is the
+// MIN depth across the three outcomes' cheapest-venue ladders — all three legs must have depth to lock.
+// ====================================================================================================
+
+/// An approved 3-leg basket: the size to fire on each leg + the per-basket cash cost (`basket_cost`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovedTriple {
+    pub size: u32,
+    pub cost_per: f64, // $ per locked basket = the dutch-book `basket_cost`
+    pub net: f64,      // locked profit per $1 payout (the dutch-book net edge)
+    pub edge_rate: f64, // booked edge ÷ lock-days (¢ per $-day) — same velocity metric as the 2-leg path
+}
+
+/// Run the full pre-trade gate for a 3-leg DUTCH-BOOK basket. `sig` is the `dutch_book` result (net edge +
+/// basket cost); `affordable` = baskets the bankroll can fund at this basket cost. Mirrors `evaluate`'s
+/// ordering + every shared gate (kill-switch, stream-pause, settlement identity, event-proximity, edge
+/// sign + floor + rate, caps, depth/affordability/concurrency sizing) — WC is `Cat::Sports`, settlement
+/// TAIL-clean (the per-basket void tail is already netted into `sig.net`). A basket fires ONLY when
+/// `sig.net > 0` AND all three outcomes have depth (`q.depth` is the cross-outcome MIN — 0 if any leg is
+/// empty). Crossed/stale books are rejected upstream in `dutch_book` (sets `no_arb`/`crossed`), so by the
+/// time a positive `sig.net` reaches here the chosen books were non-crossed; this gate adds the
+/// per-outcome STALENESS check the signal does not (a wedged-but-uncrossed book must not trade).
+pub fn evaluate_triple(
+    cfg: &Config,
+    q: &SoccerTriple,
+    sig: &crate::signal::DutchSignal,
+    exp: &Exposure,
+    affordable: u32,
+) -> Result<ApprovedTriple, Reject> {
+    // 0. global halts
+    if cfg.kill_switch {
+        return Err(Reject::KillSwitch);
+    }
+    if exp.stream_paused {
+        return Err(Reject::StreamPaused);
+    }
+
+    // 1. settlement identity (invariant #1). WC is regulation-clean (settle_clean=true, the TAIL verdict);
+    //    require_settle_clean still refuses a basket the discovery layer did NOT mark clean.
+    let settle_ok = q.settle_clean || (cfg.assume_sports_settled);
+    if cfg.require_settle_clean && !settle_ok {
+        return Err(Reject::SettlementUnverified);
+    }
+
+    // 1b. event-proximity (capital velocity) — don't lock capital long before the game. NaN fails CLOSED
+    //     (same W5 rule as `evaluate`). `None` stays dormant. (max_days_to_event <= 0 disables.)
+    if cfg.max_days_to_event > 0.0 {
+        if let Some(dte) = q.days_to_event {
+            if !dte.is_finite() || dte > cfg.max_days_to_event {
+                return Err(Reject::TooEarly);
+            }
+        }
+    }
+
+    // 2. per-outcome book sanity. Crossed books are already rejected in `dutch_book` (a crossed chosen
+    //    book makes the signal no_arb), but STALENESS is a risk-layer gate: a wedged-but-uncrossed book on
+    //    ANY of the three outcomes (either venue) ages out -> reject the whole basket (L13). The signal
+    //    chose the cheaper venue per outcome, but a stale leg on the OTHER venue could still be the one we
+    //    fire (the basket may mix venues), so check BOTH books of every outcome — the worst leg governs.
+    for oc in &q.outcomes {
+        for (b, venue) in [(&oc.q.pm, Venue::Pmus), (&oc.q.k, Venue::Kalshi)] {
+            if b.crossed() {
+                return Err(Reject::CrossedBook(venue));
+            }
+            if b.age_s > cfg.max_book_age_s {
+                return Err(Reject::StaleBook(venue));
+            }
+        }
+    }
+
+    // 4. edge sign + opt-in floor (L11 / L15). `sig.net` already nets the per-basket void tail + fees.
+    if sig.net <= 0.0 {
+        return Err(Reject::NonPositiveEdge);
+    }
+    if sig.net * 100.0 < cfg.edge_floor_cents {
+        return Err(Reject::BelowEdgeFloor);
+    }
+
+    // 4a. edge-RATE reservation floor (0014-H2) — reserve scarce capital for high-velocity arbs. WC is a
+    //     near-dated game; `lock_days(Cat::Sports, days_to_event)` is the dynamic days-to-grade model.
+    let edge_rate = sig.net * 100.0 / lock_days(Cat::Sports, q.days_to_event);
+    if cfg.min_edge_rate_cpd > 0.0 && edge_rate < cfg.min_edge_rate_cpd {
+        return Err(Reject::BelowEdgeRateFloor(edge_rate));
+    }
+
+    // 5. concurrency
+    if exp.open_positions >= cfg.max_concurrent_positions {
+        return Err(Reject::ConcurrencyCap);
+    }
+
+    // 6. sizing: min(displayed basket depth c2, per-pair contract cap, affordable, notional caps). The
+    //    per-BASKET cost is `basket_cost` (NOT 1-edge — a basket pays $1 once but COSTS basket_cost, which
+    //    differs from a 2-leg pair's `1 - net` only by the void-tail term; use the real basket cost).
+    let cost_per = sig.basket_cost.max(0.01);
+    let mut size = q.depth.c2.min(cfg.max_contracts_per_pair).min(affordable);
+
+    let pair_room = cfg.max_notional_per_pair - exp.per_pair.get(&q.game).copied().unwrap_or(0.0);
+    let clus_room = cfg.max_notional_per_cluster - exp.per_cluster.get(&q.cluster).copied().unwrap_or(0.0);
+    let tot_room = cfg.max_total_notional - exp.total;
+    let pair_cap = (pair_room.max(0.0) / cost_per).floor() as u32;
+    let clus_cap = (clus_room.max(0.0) / cost_per).floor() as u32;
+    let tot_cap = (tot_room.max(0.0) / cost_per).floor() as u32;
+    if pair_cap == 0 {
+        return Err(Reject::PairCap);
+    }
+    if clus_cap == 0 {
+        return Err(Reject::ClusterCap);
+    }
+    if tot_cap == 0 {
+        return Err(Reject::TotalCap);
+    }
+    size = size.min(pair_cap).min(clus_cap).min(tot_cap);
+
+    // FAT-EDGE TOXICITY haircut — same blunt size-down above the knee as the 2-leg path (a fat basket edge
+    // is as likely to be adversely-selected; never to 0 — L15).
+    if sig.net * 100.0 >= cfg.fat_edge_knee_cents && cfg.fat_edge_size_factor < 1.0 {
+        size = ((size as f64) * cfg.fat_edge_size_factor).floor().max(1.0) as u32;
+    }
+
+    if size < 1 {
+        return Err(Reject::NoFillableSize);
+    }
+    Ok(ApprovedTriple { size, cost_per, net: sig.net, edge_rate })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,5 +740,115 @@ mod tests {
         // opt-in skip (0 disables it). (The SHIPPED from_env default is 1.0 — enabled live 2026-06-13 —
         // but test configs keep it 0.0 to isolate the OTHER gates; see settlement/proximity tests.)
         assert!(evaluate(&cfg(), &econ, &econ_edge, &Exposure::new(), 1000).is_ok());
+    }
+
+    // ---- 3-LEG DUTCH-BOOK gate (evaluate_triple) -------------------------------------------------------
+
+    use crate::signal::dutch_book;
+
+    /// A WC triple quote with the three outcomes' books + a per-outcome depth, all settle-clean + fresh.
+    /// `depths` are the per-outcome basket-leg depths (c2 buckets); the SoccerTriple carries the MIN.
+    fn triple_quote(depths: [u32; 3]) -> SoccerTriple {
+        let ocq = |tag: OutcomeTag, pma: f64, ka: f64| OutcomeQuote {
+            tag,
+            pm: Book { yes_bid: Some(pma - 0.02), yes_ask: Some(pma), age_s: 0.1 },
+            k: Book { yes_bid: Some(ka - 0.02), yes_ask: Some(ka), age_s: 0.0 },
+        };
+        let min_d = depths.iter().copied().min().unwrap();
+        SoccerTriple {
+            game: "ger-cuw-2026-06-14".into(),
+            outcomes: [
+                TripleOutcome { tag: OutcomeTag::A, q: ocq(OutcomeTag::A, 0.42, 0.46) }, // A cheap pmus 0.42
+                TripleOutcome { tag: OutcomeTag::D, q: ocq(OutcomeTag::D, 0.26, 0.20) }, // draw cheap Kalshi 0.20
+                TripleOutcome { tag: OutcomeTag::B, q: ocq(OutcomeTag::B, 0.30, 0.35) }, // B cheap pmus 0.30
+            ],
+            cluster: "fwc-ger-cuw-2026-06-14".into(),
+            settle_clean: true,
+            depth: Depth { c2: min_d, c1: min_d, c0: min_d },
+            days_to_event: Some(1.0),
+        }
+    }
+    fn sig_of(q: &SoccerTriple) -> crate::signal::DutchSignal {
+        dutch_book(&[q.outcomes[0].q, q.outcomes[1].q, q.outcomes[2].q], 0.005)
+    }
+
+    /// A clean WC basket (0.92 cost, net ~4c > the 2c floor) is APPROVED, sized at the MIN-of-3 depth.
+    #[test]
+    fn evaluate_triple_approves_and_sizes_to_min_depth() {
+        let q = triple_quote([60, 30, 80]); // the THIN outcome (30) caps the basket
+        let sig = sig_of(&q);
+        assert!(!sig.no_arb, "the 0.92 basket locks");
+        let a = evaluate_triple(&cfg(), &q, &sig, &Exposure::new(), 1000).unwrap();
+        assert_eq!(a.size, 30, "basket size = min of the 3 outcomes' depth (the thin draw leg)");
+        assert!((a.cost_per - sig.basket_cost).abs() < 1e-9, "cost_per is the basket cost");
+        assert!(a.net > 0.02, "net clears the 2c floor");
+    }
+
+    /// If ANY outcome has ZERO depth, the basket cannot lock (the min-of-3 is 0) -> NoFillableSize. All
+    /// three legs must have depth — a 2-of-3-deep basket is not a Dutch book.
+    #[test]
+    fn evaluate_triple_requires_all_three_to_have_depth() {
+        let q = triple_quote([50, 0, 50]); // the draw leg has no depth
+        let sig = sig_of(&q);
+        assert_eq!(evaluate_triple(&cfg(), &q, &sig, &Exposure::new(), 1000), Err(Reject::NoFillableSize));
+    }
+
+    /// A non-positive / below-floor basket is rejected on edge sign + the floor (L11/L15), same as the
+    /// 2-leg path. A basket summing to >= $1 nets <= 0 -> NonPositiveEdge.
+    #[test]
+    fn evaluate_triple_rejects_non_positive_and_below_floor() {
+        // make every outcome expensive so the cheapest basket sums > $1 -> net <= 0. Set BOTH bid+ask
+        // consistently (bid < ask) so no book is crossed (the book-sanity gate would fire first otherwise).
+        let mut q = triple_quote([50, 50, 50]);
+        for oc in q.outcomes.iter_mut() {
+            oc.q.pm = Book { yes_bid: Some(0.38), yes_ask: Some(0.40), age_s: 0.1 };
+            oc.q.k = Book { yes_bid: Some(0.40), yes_ask: Some(0.42), age_s: 0.0 };
+        }
+        let sig = sig_of(&q); // cheapest = pmus 0.40 each -> 1.20 -> negative
+        assert_eq!(evaluate_triple(&cfg(), &q, &sig, &Exposure::new(), 1000), Err(Reject::NonPositiveEdge));
+    }
+
+    /// The shared gates fire on the basket: kill-switch, settlement-unverified (when not clean + not
+    /// assumed), event-proximity (too early), and a stale outcome book.
+    #[test]
+    fn evaluate_triple_honors_shared_gates() {
+        let q = triple_quote([50, 50, 50]);
+        let sig = sig_of(&q);
+        // kill-switch
+        let mut c = cfg();
+        c.kill_switch = true;
+        assert_eq!(evaluate_triple(&c, &q, &sig, &Exposure::new(), 1000), Err(Reject::KillSwitch));
+        // settlement unverified: settle_clean=false + not assumed -> rejected
+        let mut q2 = triple_quote([50, 50, 50]);
+        q2.settle_clean = false;
+        assert_eq!(evaluate_triple(&cfg(), &q2, &sig_of(&q2), &Exposure::new(), 1000), Err(Reject::SettlementUnverified));
+        // ...but assume_sports_settled lets it through
+        let mut c3 = cfg();
+        c3.assume_sports_settled = true;
+        assert!(evaluate_triple(&c3, &q2, &sig_of(&q2), &Exposure::new(), 1000).is_ok());
+        // event-proximity: 5 days out (> the 2d window) -> TooEarly
+        let mut q3 = triple_quote([50, 50, 50]);
+        q3.days_to_event = Some(5.0);
+        assert_eq!(evaluate_triple(&cfg(), &q3, &sig_of(&q3), &Exposure::new(), 1000), Err(Reject::TooEarly));
+        // a STALE outcome book (any of the 6) -> StaleBook
+        let mut q4 = triple_quote([50, 50, 50]);
+        q4.outcomes[1].q.k.age_s = 9.0; // the draw's Kalshi book wedged
+        assert_eq!(evaluate_triple(&cfg(), &q4, &sig_of(&q4), &Exposure::new(), 1000), Err(Reject::StaleBook(Venue::Kalshi)));
+    }
+
+    /// The per-game notional cap binds the basket (cost_per = basket_cost): with $1/game and a ~0.92 basket
+    /// only 1 basket fits per game, and a game already at its cap rejects with PairCap.
+    #[test]
+    fn evaluate_triple_caps_on_per_game_notional() {
+        let q = triple_quote([100, 100, 100]);
+        let sig = sig_of(&q);
+        let mut c = cfg();
+        c.max_notional_per_pair = 1.0; // $1 per game -> floor(1.0 / 0.92) = 1 basket
+        let a = evaluate_triple(&c, &q, &sig, &Exposure::new(), 1000).unwrap();
+        assert_eq!(a.size, 1, "the $1 per-game cap allows one ~0.92 basket");
+        // the game already fully allocated -> PairCap.
+        let mut exp = Exposure::new();
+        exp.per_pair.insert(q.game.clone(), 1.0);
+        assert_eq!(evaluate_triple(&c, &q, &sig, &exp, 1000), Err(Reject::PairCap));
     }
 }

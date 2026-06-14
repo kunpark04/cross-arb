@@ -11,7 +11,7 @@
 //! this against ledger.py's selftest vectors.
 
 use crate::ledger::{marginal_taker_fee, KALSHI_TAKER_COEF, PMUS_TAKER_COEF};
-use crate::types::{Book, Dir, Edge};
+use crate::types::{Book, Dir, Edge, OutcomeQuote, Venue};
 
 /// pmus taker fee in dollars per contract at price `p` (linear, no ceil) — `pfee(p)` in ledger.py.
 fn pmus_marginal_fee(p: f64) -> f64 {
@@ -147,6 +147,117 @@ pub fn game_signal(pm_bid: Option<f64>, pm_ask: Option<f64>, ka_ask: Option<f64>
     // max by net; ties resolve to the first-pushed (PK before KP), matching Python's `max(opts)` stability.
     let best = opts.iter().copied().fold(opts[0], |acc, o| if o.1 > acc.1 { o } else { acc });
     GameSignal { edge: Edge { net: best.1, dir: best.0 }, no_arb: best.1 <= 0.0, crossed: false }
+}
+
+// ----------------------------------------------------------------------------------------------------
+// 3-LEG DUTCH-BOOK (World Cup) SIGNAL — a PARALLEL signal to `signal`/`game_signal`. Independent of them;
+// neither is touched. The 2-leg arb pays $1 if a single binary resolves the way you hedged; the Dutch
+// book buys YES on ALL THREE mutually-exclusive outcomes (each on its cheapest venue) so EXACTLY ONE of
+// them pays $1 regardless of the result — locked iff the 3 cheapest YES asks sum to < $1 net of fees +
+// the void tail.
+// ----------------------------------------------------------------------------------------------------
+
+/// Per-outcome leg of a priced Dutch book: which VENUE was cheapest, its YES-ask price, and that leg's
+/// at-scale marginal taker fee (all per `$1` of payout, like the 2-leg signal).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DutchLeg {
+    pub venue: Venue,
+    pub yes_ask: f64,
+    pub fee: f64,
+}
+
+/// The Dutch-book signal. `net > 0` iff the cheapest-venue basket locks a guaranteed profit; `no_arb`
+/// mirrors the 2-leg flag (the booking path must refuse a non-positive / unpriceable / crossed basket).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DutchSignal {
+    /// The 3 chosen legs (one YES per outcome, on its cheapest venue), index-aligned to the input outcomes.
+    pub legs: [DutchLeg; 3],
+    /// Sum of the 3 cheapest YES asks ($ per $1 payout) — what the basket COSTS, before fees.
+    pub basket_cost: f64,
+    /// `(1 - basket_cost) - sum(per-leg marginal fees) - void_tail` — the locked profit per $1 payout.
+    pub net: f64,
+    /// True when nothing priceable (an outcome has no YES ask on EITHER venue), the net is `<= 0`, or a
+    /// touched venue book is strictly crossed (a stale phantom — L12).
+    pub no_arb: bool,
+    /// True when ANY outcome's chosen-venue book is strictly crossed (`bid > ask`, both present).
+    pub crossed: bool,
+}
+
+/// The cheapest YES ask across the two venues for ONE outcome: `(venue, yes_ask)`, skipping a strictly
+/// crossed book (stale phantom — L12) on a venue so the cheap side can't be a crossed quote. `None` if
+/// neither venue offers a (non-crossed) YES ask.
+fn cheapest_yes(q: &OutcomeQuote) -> Option<(Venue, f64)> {
+    let leg = |b: &Book, v: Venue| {
+        // a strictly-crossed book (both touches present, bid>ask) is stale -> not a usable ask (L12).
+        if matches!((b.yes_bid, b.yes_ask), (Some(bid), Some(ask)) if bid > ask) {
+            return None;
+        }
+        b.yes_ask.map(|a| (v, a))
+    };
+    match (leg(&q.pm, Venue::Pmus), leg(&q.k, Venue::Kalshi)) {
+        (Some(p), Some(k)) => Some(if p.1 <= k.1 { p } else { k }), // tie -> pmus (stable, arbitrary)
+        (Some(p), None) => Some(p),
+        (None, Some(k)) => Some(k),
+        (None, None) => None,
+    }
+}
+
+/// Whether a venue book is strictly crossed (both touches present, `bid > ask`) — a stale phantom (L12).
+fn book_crossed(b: &Book) -> bool {
+    matches!((b.yes_bid, b.yes_ask), (Some(bid), Some(ask)) if bid > ask)
+}
+
+/// The per-outcome marginal taker fee on a chosen leg (the venue's at-scale fee at the YES-ask price —
+/// same model the 2-leg signal sums; detection uses the no-ceil marginal fee so nothing +EV at size is
+/// dropped, L10/L15).
+fn dutch_leg_fee(venue: Venue, yes_ask: f64) -> f64 {
+    match venue {
+        Venue::Pmus => pmus_marginal_fee(yes_ask),
+        Venue::Kalshi => kalshi_marginal_fee(yes_ask),
+    }
+}
+
+/// The 3-LEG DUTCH-BOOK signal: for each of the 3 outcomes pick the cheaper YES ask across the two venues;
+/// the basket cost is their sum; `net = (1 - basket_cost) - sum(marginal fees) - void_tail`; it's a real
+/// arb iff `net > 0`. `void_tail` is the WC void/postpone-tail cost per $1 (a small positive haircut, the
+/// caller passes it — 0.0 to disable). A strictly-crossed chosen book (L12) or an outcome with NO YES ask
+/// on either venue makes it `no_arb` (the booking path refuses it). Per-$1-of-payout throughout, like the
+/// 2-leg signal, so it composes with the same fee model + edge floor.
+pub fn dutch_book(outcomes: &[OutcomeQuote; 3], void_tail: f64) -> DutchSignal {
+    // ANY chosen-venue book strictly crossed -> stale; reject the whole basket (mirrors the 2-leg `crossed`).
+    let crossed = outcomes.iter().any(|q| book_crossed(&q.pm) || book_crossed(&q.k));
+
+    // pick the cheapest (non-crossed) YES ask per outcome; if any outcome is unpriceable the basket can't lock.
+    let mut legs = [DutchLeg { venue: Venue::Pmus, yes_ask: 0.0, fee: 0.0 }; 3];
+    let mut priceable = true;
+    let mut basket_cost = 0.0;
+    let mut fees = 0.0;
+    for (i, q) in outcomes.iter().enumerate() {
+        match cheapest_yes(q) {
+            Some((v, ask)) if !crossed => {
+                let fee = dutch_leg_fee(v, ask);
+                legs[i] = DutchLeg { venue: v, yes_ask: ask, fee };
+                basket_cost += ask;
+                fees += fee;
+            }
+            _ => {
+                priceable = false;
+            }
+        }
+    }
+
+    if !priceable || crossed {
+        // unpriceable (an outcome has no ask either side) or stale-crossed -> no lockable basket.
+        return DutchSignal { legs, basket_cost: 0.0, net: 0.0, no_arb: true, crossed };
+    }
+    let net = round4((1.0 - basket_cost) - fees - void_tail);
+    DutchSignal {
+        legs,
+        basket_cost: round4(basket_cost),
+        net,
+        no_arb: net <= 0.0,
+        crossed,
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +418,121 @@ mod tests {
         // no kB_ask AND no pm_bid -> nothing priceable -> no_arb, default dir PK.
         let g2 = game_signal(None, Some(0.52), None, None);
         assert!(g2.no_arb && !g2.crossed && g2.edge.dir == Dir::PK);
+    }
+
+    // ---- 3-LEG DUTCH-BOOK (World Cup) signal ----------------------------------------------------------
+
+    use crate::types::OutcomeTag;
+
+    /// Build an OutcomeQuote from (pm bid/ask, k bid/ask). Helper for the dutch_book vectors.
+    fn oc(tag: OutcomeTag, pmb: Option<f64>, pma: Option<f64>, kb: Option<f64>, ka: Option<f64>) -> OutcomeQuote {
+        OutcomeQuote { tag, pm: bk(pmb, pma), k: bk(kb, ka) }
+    }
+    /// Hand-recompute the dutch-book net the way the function does: (1 - sum cheapest) - sum fees - tail.
+    fn dutch_net(legs: [(Venue, f64); 3], tail: f64) -> f64 {
+        let fee = |v: Venue, p: f64| match v {
+            Venue::Pmus => 0.05 * p * (1.0 - p),
+            Venue::Kalshi => 0.07 * p * (1.0 - p),
+        };
+        let cost: f64 = legs.iter().map(|(_, p)| *p).sum();
+        let fees: f64 = legs.iter().map(|(v, p)| fee(*v, *p)).sum();
+        round4((1.0 - cost) - fees - tail)
+    }
+
+    /// A cross-venue basket summing to < $1 is a real arb. The 3 cheapest YES asks (pmus A 0.42, Kalshi
+    /// draw 0.20, pmus B 0.30) sum to 0.92 -> locked. Net matches the hand-recompute; cheapest VENUE per
+    /// outcome is selected (A/B from pmus, draw from Kalshi). This is THE Dutch-book lock case.
+    #[test]
+    fn dutch_book_basket_under_one_dollar_is_an_arb() {
+        let outs = [
+            oc(OutcomeTag::A, Some(0.40), Some(0.42), Some(0.44), Some(0.46)), // A cheap on pmus (0.42)
+            oc(OutcomeTag::D, Some(0.24), Some(0.26), Some(0.18), Some(0.20)), // draw cheap on Kalshi (0.20)
+            oc(OutcomeTag::B, Some(0.28), Some(0.30), Some(0.33), Some(0.35)), // B cheap on pmus (0.30)
+        ];
+        let s = dutch_book(&outs, 0.005);
+        assert!(!s.no_arb && !s.crossed, "a sub-$1 basket locks");
+        assert_eq!(s.legs[0].venue, Venue::Pmus, "outcome A cheapest on pmus");
+        assert_eq!(s.legs[1].venue, Venue::Kalshi, "draw cheapest on Kalshi");
+        assert_eq!(s.legs[2].venue, Venue::Pmus, "outcome B cheapest on pmus");
+        assert!((s.basket_cost - 0.92).abs() < 1e-9, "basket_cost = 0.42+0.20+0.30 = 0.92");
+        let expect = dutch_net([(Venue::Pmus, 0.42), (Venue::Kalshi, 0.20), (Venue::Pmus, 0.30)], 0.005);
+        assert!((s.net - expect).abs() < 1e-12, "net {} != {}", s.net, expect);
+        assert!(s.net > 0.0);
+    }
+
+    /// A basket whose 3 cheapest YES asks sum to >= $1 is NOT an arb (no_arb, net <= 0) — even though it
+    /// still picks the cheapest venue per outcome. Here the cheapest set is 0.40+0.35+0.30 = 1.05 > 1.
+    #[test]
+    fn dutch_book_basket_over_one_dollar_is_no_arb() {
+        let outs = [
+            oc(OutcomeTag::A, Some(0.38), Some(0.40), Some(0.45), Some(0.47)), // cheapest A = pmus 0.40
+            oc(OutcomeTag::D, Some(0.33), Some(0.35), Some(0.40), Some(0.42)), // cheapest draw = pmus 0.35
+            oc(OutcomeTag::B, Some(0.28), Some(0.30), Some(0.34), Some(0.36)), // cheapest B = pmus 0.30
+        ];
+        let s = dutch_book(&outs, 0.0);
+        assert!(s.no_arb && s.net <= 0.0, "basket 1.05 > $1 -> no lock");
+        // it still selected the cheapest venue per outcome (all pmus here).
+        assert!(s.legs.iter().all(|l| l.venue == Venue::Pmus));
+    }
+
+    /// The cheapest-venue-per-outcome selection MIXES venues correctly: when Kalshi is cheaper for one
+    /// outcome and pmus for the others, the basket sums the per-outcome minima — NOT a single venue's 3
+    /// asks (one venue's 3 YES always sum > 1, the overround). Proven: same outcomes, the single-venue
+    /// pmus sum (0.40+0.36+0.30=1.06) and Kalshi sum (0.38+0.34+0.46=1.18) BOTH exceed the cross sum (0.98).
+    #[test]
+    fn dutch_book_picks_cross_venue_minimum_not_one_venue() {
+        let outs = [
+            oc(OutcomeTag::A, Some(0.36), Some(0.40), Some(0.36), Some(0.38)), // A: Kalshi 0.38 < pmus 0.40
+            oc(OutcomeTag::D, Some(0.32), Some(0.36), Some(0.32), Some(0.34)), // draw: Kalshi 0.34 < pmus 0.36
+            oc(OutcomeTag::B, Some(0.28), Some(0.30), Some(0.44), Some(0.46)), // B: pmus 0.30 < Kalshi 0.46
+        ];
+        let s = dutch_book(&outs, 0.0);
+        // cheapest set = Kalshi 0.38 + Kalshi 0.34 + pmus 0.30 = 1.02. (still > 1 here; the point is the MIX.)
+        assert_eq!((s.legs[0].venue, s.legs[1].venue, s.legs[2].venue), (Venue::Kalshi, Venue::Kalshi, Venue::Pmus));
+        assert!((s.basket_cost - 1.02).abs() < 1e-9, "basket = cross-venue minima, not one venue's 3 asks");
+        // confirm neither single-venue sum is what we used (both overround > the cross sum 1.02... here equal-ish,
+        // but the venues DIFFER per leg, which a single-venue basket could never produce).
+        assert!(s.legs[0].venue != s.legs[2].venue, "the basket spans both venues");
+    }
+
+    /// An outcome with NO YES ask on EITHER venue makes the basket unpriceable -> no_arb (can't lock a
+    /// 3-outcome book with a missing leg). The other two outcomes being cheap doesn't rescue it.
+    #[test]
+    fn dutch_book_unpriceable_outcome_is_no_arb() {
+        let outs = [
+            oc(OutcomeTag::A, Some(0.10), Some(0.12), Some(0.11), Some(0.13)),
+            oc(OutcomeTag::D, None, None, None, None), // draw has no ask on either venue
+            oc(OutcomeTag::B, Some(0.20), Some(0.22), Some(0.21), Some(0.23)),
+        ];
+        let s = dutch_book(&outs, 0.0);
+        assert!(s.no_arb, "a missing outcome leg -> no lockable basket");
+    }
+
+    /// A strictly-crossed chosen book (bid > ask on an outcome's venue) is stale -> the whole basket is
+    /// rejected (no_arb + crossed), even if the apparent basket would sum < $1 (a phantom — L12).
+    #[test]
+    fn dutch_book_crossed_book_is_rejected() {
+        let outs = [
+            oc(OutcomeTag::A, Some(0.50), Some(0.40), Some(0.44), Some(0.46)), // pmus A crossed (bid .50 > ask .40)
+            oc(OutcomeTag::D, Some(0.24), Some(0.26), Some(0.18), Some(0.20)),
+            oc(OutcomeTag::B, Some(0.28), Some(0.30), Some(0.33), Some(0.35)),
+        ];
+        let s = dutch_book(&outs, 0.0);
+        assert!(s.crossed && s.no_arb, "a crossed outcome book makes the basket stale -> reject");
+    }
+
+    /// One-sided outcome books still price the basket from whatever YES ask exists per outcome: an outcome
+    /// quoted on only ONE venue uses that venue's ask. (Each outcome needs SOME ask, but not both venues.)
+    #[test]
+    fn dutch_book_one_sided_per_outcome_still_prices() {
+        let outs = [
+            oc(OutcomeTag::A, None, Some(0.40), None, None),           // A: only pmus ask 0.40
+            oc(OutcomeTag::D, None, None, None, Some(0.20)),           // draw: only Kalshi ask 0.20
+            oc(OutcomeTag::B, None, Some(0.30), None, None),           // B: only pmus ask 0.30
+        ];
+        let s = dutch_book(&outs, 0.0);
+        assert!(!s.no_arb, "every outcome has an ask -> priceable");
+        assert_eq!((s.legs[0].venue, s.legs[1].venue, s.legs[2].venue), (Venue::Pmus, Venue::Kalshi, Venue::Pmus));
+        assert!((s.basket_cost - 0.90).abs() < 1e-9);
     }
 }

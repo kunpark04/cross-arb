@@ -125,6 +125,87 @@ pub struct Edge {
     pub dir: Dir,
 }
 
+// ====================================================================================================
+// 3-LEG DUTCH-BOOK (World Cup) — a PARALLEL path to the 2-leg cross-venue arb above. NONE of the 2-leg
+// types (`Quote`/`Edge`/`Position`) change; these are additive. A WC game has 3 mutually-exclusive
+// outcomes (team-A / draw / team-B), each its own YES/NO market on BOTH venues. The Dutch book buys YES
+// on ALL THREE outcomes, each on whichever venue prices it cheapest; if the 3 cheapest YES asks sum to
+// < $1 (net fees + the void tail) it is LOCKED — exactly one outcome pays $1 at settlement, so the
+// profit `$1 - basket_cost` is realized regardless of the result. (On ONE venue the 3 YES sum > 1 — the
+// overround; only the cross-venue-cheapest set can sum < 1.)
+// ====================================================================================================
+
+/// The two venue YES books for ONE WC outcome, plus the venue-native ids the leg builder needs. The
+/// Dutch-book signal compares `pm.yes_ask` vs `k.yes_ask` to pick the cheaper venue for THIS outcome.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OutcomeQuote {
+    /// `'A'` (team A) / `'D'` (draw) / `'B'` (team B) — the leg tag carried into the order coid.
+    pub tag: OutcomeTag,
+    pub pm: Book,
+    pub k: Book,
+}
+
+/// Which of a WC game's three outcomes a leg backs. Drives the order `client_order_id` tag (`A`/`D`/`B`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OutcomeTag {
+    #[default]
+    A,
+    D,
+    B,
+}
+
+impl OutcomeTag {
+    pub fn as_char(self) -> char {
+        match self {
+            OutcomeTag::A => 'A',
+            OutcomeTag::D => 'D',
+            OutcomeTag::B => 'B',
+        }
+    }
+}
+
+/// A WORLD-CUP game as a SINGLE 3-leg Dutch-book tradeable unit — the LIVE QUOTE (parallel to the three
+/// per-outcome binary [`Quote`]s the same game also produces). Carries the 3 outcomes' dual-venue books +
+/// the basket depth, rebuilt from the live books each frame (the static venue-native ids live in the
+/// discovery spec / the live loop's `TripleMeta`, not here). The cheapest-venue-per-outcome basket is the
+/// lockable position. `cluster` is the per-GAME key (all 3 legs are correlated — at most one resolves YES).
+/// `settle_clean` is the WC regulation-clean TAIL verdict (same basis as the per-outcome pairs).
+#[derive(Clone, Debug)]
+pub struct SoccerTriple {
+    /// pair identity = the pmus game key (`<a>-<b>-<date>`), distinct from each outcome's venue-native id.
+    pub game: String,
+    /// The three outcomes (A / draw / B), each with both venue YES books.
+    pub outcomes: [TripleOutcome; 3],
+    pub cluster: String,
+    /// Settlement identity EMPIRICALLY clean (WC regulation TAIL): the small priceable void/postpone tail
+    /// is far below a tradeable edge — same verdict the per-outcome binary pairs carry.
+    pub settle_clean: bool,
+    /// Fillable depth (contract-baskets) — the MIN across the three outcomes' cheapest-venue YES-ask
+    /// ladders (all three must have depth to lock a basket).
+    pub depth: Depth,
+    /// Days until the game (the settlement event); feeds the event-proximity gate. `None` -> gate dormant.
+    pub days_to_event: Option<f64>,
+}
+
+/// One outcome's live dual-venue books inside a [`SoccerTriple`] (the tag + the pm/Kalshi YES bid/ask).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TripleOutcome {
+    pub tag: OutcomeTag,
+    /// the dual-venue books for this outcome (pm + Kalshi YES bid/ask).
+    pub q: OutcomeQuote,
+}
+
+/// One HELD 3-leg Dutch-book position — the three legs we own (one YES per outcome, each on the venue it
+/// filled cheapest). Mirrors [`Position`] but with `[PositionLeg; 3]`; the 3-leg unwind SELLs each leg
+/// with its exact (venue, venue-native market, side). `game` is the pair identity (the pmus game key).
+#[derive(Clone, Debug)]
+pub struct TriplePosition {
+    pub game: String,
+    pub legs: [PositionLeg; 3],
+    pub size: u32,
+    pub cluster: String,
+}
+
 /// One leg's order to place. Price is integer cents (venue tick = 1c, whole-share min qty).
 #[derive(Clone, Debug)]
 pub struct OrderIntent {

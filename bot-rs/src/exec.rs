@@ -72,6 +72,23 @@ impl PairAck {
     }
 }
 
+/// Result of firing a 3-leg DUTCH-BOOK basket — one ack per outcome leg (A / draw / B), index-aligned to
+/// the order intents. The PARALLEL of [`PairAck`] for the WC 3-leg path; `PairAck` is unchanged. A
+/// non-`all_filled` basket is a PARTIAL fill — 1 or 2 legs naked — that the naked-PAIR recovery must
+/// flatten (a 2-of-3 fill is a directional bet: you own 2 outcomes; if the 3rd wins you lose both).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleAck {
+    pub legs: [Result<Ack, ExecError>; 3],
+}
+impl TripleAck {
+    /// A COMPLETE Dutch-book lock requires ALL THREE legs `Ok` AND actually FILLED (same fill-vs-accept
+    /// semantics as `PairAck::both_filled` — a resting/0-fill leg is NOT filled). Anything less leaves a
+    /// naked directional basket the recovery must flatten.
+    pub fn all_filled(&self) -> bool {
+        self.legs.iter().all(|r| matches!(r, Ok(a) if a.filled))
+    }
+}
+
 /// `Send + Sync` so the live loop can hold the backend as `Arc<dyn ExecutionBackend>` and `tokio::spawn`
 /// a submission task that clones the Arc — the event loop never blocks on the two-leg network RTT (the
 /// concurrency-core fix). All methods take `&self`: `DryRunBackend` only logs and `LiveBackend` drives its
@@ -85,6 +102,12 @@ pub trait ExecutionBackend: Send + Sync {
     /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
     /// highest-leverage latency item from the rust review, and the only latency lever the code controls.
     fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
+    /// Fire all THREE legs of a Dutch-book basket (the WC 3-leg path). Same rule as `submit_pair`: the
+    /// legs MUST go out CONCURRENTLY (the live backend uses `tokio::join!` over three warm connections) —
+    /// serial legging multiplies latency AND widens the partial-fill window. The dry-run backend logs all
+    /// three. Returns one ack per outcome leg; a non-`all_filled` result is the naked-PAIR risk the caller
+    /// must flatten. Parallel to `submit_pair`, which is untouched.
+    fn submit_triple(&self, a: &OrderIntent, b: &OrderIntent, d: &OrderIntent) -> TripleAck;
     /// Fire ONE leg on its own. The pair is the normal unit (`submit_pair`); this single-leg primitive
     /// exists for the NAKED-LEG RECOVERY (`main::recover_naked_leg`): when only one entry leg filled, the
     /// other is cancelled and the filled leg is FLATTENED with a single marketable SELL — there is no second
@@ -121,6 +144,12 @@ impl ExecutionBackend for DryRunBackend {
         PairAck {
             a: self.log_leg(a),
             b: self.log_leg(b),
+        }
+    }
+    fn submit_triple(&self, a: &OrderIntent, b: &OrderIntent, d: &OrderIntent) -> TripleAck {
+        // all three legs logged together — mirrors the concurrent live fire.
+        TripleAck {
+            legs: [self.log_leg(a), self.log_leg(b), self.log_leg(d)],
         }
     }
     fn submit(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
@@ -509,6 +538,29 @@ impl LiveBackend {
         }
     }
 
+    /// Drive the THREE concurrent signed POSTs of a Dutch-book basket to completion, returning when all
+    /// three ack (or error). Same dyn-compat pattern + concurrency rationale as `run_pair` — `tokio::join!`
+    /// fires the legs together (serial legging multiplies latency AND the partial-fill window).
+    fn run_triple(&self, a: &OrderIntent, b: &OrderIntent, d: &OrderIntent) -> TripleAck {
+        let fut = async {
+            let (ra, rb, rd) = tokio::join!(self.post_leg(a), self.post_leg(b), self.post_leg(d));
+            TripleAck { legs: [ra, rb, rd] }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt.block_on(fut),
+                Err(_) => TripleAck {
+                    legs: [
+                        Err(ExecError::TransportNotWired),
+                        Err(ExecError::TransportNotWired),
+                        Err(ExecError::TransportNotWired),
+                    ],
+                },
+            },
+        }
+    }
+
     /// Drive ONE signed POST to completion off the ambient runtime (same dyn-compat pattern as `run_pair`)
     /// — the single-leg recovery flatten. No fabricated concurrency: it's intrinsically one order.
     fn run_one(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
@@ -613,6 +665,20 @@ impl ExecutionBackend for LiveBackend {
             };
         }
         self.run_pair(a, b)
+    }
+    fn submit_triple(&self, a: &OrderIntent, b: &OrderIntent, d: &OrderIntent) -> TripleAck {
+        // same keys-absent gate as submit_pair: a dry-run/no-creds build never sends, so the 3-leg path
+        // can't fire real money without keys (the safe-by-default rail, not a sandbox wall).
+        if self.keys.is_none() {
+            return TripleAck {
+                legs: [
+                    Err(ExecError::KeysUnavailable),
+                    Err(ExecError::KeysUnavailable),
+                    Err(ExecError::KeysUnavailable),
+                ],
+            };
+        }
+        self.run_triple(a, b, d)
     }
     fn submit(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
         // single-leg recovery flatten. KeysUnavailable when keys aren't loaded (dry-run/no-creds build) —
@@ -972,5 +1038,42 @@ mod tests {
         assert_eq!(path, "/v1/order/pm-9/cancel");
         // no keys loaded in the sandbox -> the actual cancel refuses to send (never silently no-ops).
         assert_eq!(bk.cancel(&kt), Err(ExecError::KeysUnavailable));
+    }
+
+    // ---- 3-LEG DUTCH-BOOK exec --------------------------------------------------------------------
+
+    fn yes_leg(market: &str, coid: &str) -> OrderIntent {
+        OrderIntent { venue: Venue::Pmus, market: market.into(), action: Action::Buy, side: Side::Yes, price_cents: 30, qty: 1, client_order_id: coid.into() }
+    }
+
+    /// `TripleAck::all_filled` requires ALL THREE legs Ok AND filled (same fill-vs-accept semantics as
+    /// `PairAck::both_filled`). One resting / one errored leg -> NOT all filled (a partial naked basket).
+    #[test]
+    fn triple_all_filled_requires_all_three() {
+        let f = || ack(true, false);
+        assert!(TripleAck { legs: [f(), f(), f()] }.all_filled(), "all 3 filled -> locked");
+        assert!(!TripleAck { legs: [f(), ack(false, false), f()] }.all_filled(), "one resting leg -> not locked");
+        assert!(!TripleAck { legs: [f(), f(), Err(ExecError::RateLimited)] }.all_filled(), "one errored leg -> not locked");
+        assert!(!TripleAck { legs: [Err(ExecError::RateLimited), Err(ExecError::RateLimited), Err(ExecError::RateLimited)] }.all_filled());
+    }
+
+    /// The dry-run backend logs + simulates all THREE basket legs (never sends), and the simulated ack is
+    /// `all_filled` (every simulated leg fills) — mirroring `submit_pair`'s dry-run behaviour.
+    #[test]
+    fn dry_run_fires_three_legs_simulated() {
+        let bk = DryRunBackend;
+        let r = bk.submit_triple(&yes_leg("ger", "xarb3-g-A"), &yes_leg("draw", "xarb3-g-D"), &yes_leg("cuw", "xarb3-g-B"));
+        assert!(r.all_filled(), "dry-run simulates all 3 legs filled");
+        assert!(r.legs.iter().all(|l| matches!(l, Ok(a) if a.simulated)), "all 3 are simulated");
+    }
+
+    /// The LIVE backend with no keys loaded refuses to send the basket — all three legs come back
+    /// `KeysUnavailable` (the safe-by-default rail, same gate as `submit_pair`). NEVER sends without keys.
+    #[test]
+    fn live_triple_without_keys_refuses_to_send() {
+        let bk = LiveBackend::new(&crate::config::Config::test_default()); // Demo, no keys
+        let r = bk.submit_triple(&yes_leg("ger", "a"), &yes_leg("draw", "d"), &yes_leg("cuw", "b"));
+        assert!(r.legs.iter().all(|l| matches!(l, Err(ExecError::KeysUnavailable))), "no keys -> all 3 legs refuse");
+        assert!(!r.all_filled());
     }
 }

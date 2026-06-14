@@ -65,11 +65,39 @@ pub struct Pair {
     pub pm_min_qty: Option<f64>,
 }
 
-/// What a discovery pass produces. `pairs` is the subscribable 1:1 set; the rest is the coverage report
-/// (`build_colisted_map`'s report) so an unmapped category / misaligned bucket is LOUD, not silent (L7).
+/// One WORLD-CUP game as a 3-leg DUTCH-BOOK SPEC — the static identity the live loop turns into a tradeable
+/// triple (the books are read live, keyed by the per-outcome slug/ticker). Emitted ALONGSIDE the 3
+/// per-outcome binary `Pair`s of the same game (both arbs coexist): the per-outcome pairs subscribe + price
+/// each binary; this spec lets the loop ALSO price the full-game basket (buy YES on all 3 outcomes, each on
+/// its cheapest venue). `game` = the pmus game key `<a>-<b>-<date>`; the 3 outcomes are A / draw / B.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleSpec {
+    pub game: String,
+    pub outcomes: [TripleOutcomeSpec; 3],
+    pub cluster: String,        // per-GAME correlated-exposure key (same as the 3 per-outcome pairs)
+    pub settle_clean: bool,     // WC regulation TAIL-clean (true) — same basis as the per-outcome pairs
+    pub days_to_event: Option<f64>,
+}
+
+/// One outcome's static identity inside a [`TripleSpec`]: the tag (A/draw/B), the pmus slug + Kalshi ticker
+/// the books key on, and the pmus per-market order constraints the leg builder needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleOutcomeSpec {
+    pub tag: crate::types::OutcomeTag,
+    pub slug: String,   // pmus market slug (pmus book key)
+    pub ticker: String, // Kalshi ticker (Kalshi book key)
+    pub pm_min_tick: Option<f64>,
+    pub pm_min_qty: Option<f64>,
+}
+
+/// What a discovery pass produces. `pairs` is the subscribable 1:1 set; `triples` is the parallel 3-leg
+/// Dutch-book WC set; the rest is the coverage report (`build_colisted_map`'s report) so an unmapped
+/// category / misaligned bucket is LOUD, not silent (L7).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Discovery {
     pub pairs: Vec<Pair>,
+    /// WORLD-CUP 3-leg Dutch-book specs (one per bound WC game) — parallel to the per-outcome `pairs`.
+    pub triples: Vec<TripleSpec>,
     pub weather_pairs: usize,
     pub econ_pairs: usize,
     pub sports_pairs: usize,                 // moneyline: matched + emitted as 2-ticker subscribable Pairs (team A + B)
@@ -807,6 +835,35 @@ where
                 _ => None,
             };
             let cluster = format!("{league}-{a}-{b}-{date}"); // per-GAME correlated-exposure cluster (3 outcomes)
+            // ADDITIONALLY emit ONE 3-leg DUTCH-BOOK spec per game (parallel to the per-outcome pairs below;
+            // both arbs coexist). Build it from the SAME 3 (outcome -> {slug, ticker, tick, min_qty}) — the
+            // basket buys YES on all three (A/draw/B), each on its cheapest venue, read live by the loop.
+            // Requires all 3 slugs present (the per-outcome loop tolerates a missing slug; the basket can't —
+            // a 2-outcome "basket" isn't a Dutch book), else SKIP the triple but still emit the binary pairs.
+            let triple_outcomes: Option<[TripleOutcomeSpec; 3]> = {
+                let mk = |pm_mkt: &Value, ticker: &str, tag: crate::types::OutcomeTag| -> Option<TripleOutcomeSpec> {
+                    let slug = field_str(pm_mkt, "slug")?;
+                    let (pm_min_tick, pm_min_qty) = pm_order_constraints(pm_mkt);
+                    Some(TripleOutcomeSpec { tag, slug, ticker: ticker.to_string(), pm_min_tick, pm_min_qty })
+                };
+                match (
+                    mk(pa, &ta, crate::types::OutcomeTag::A),
+                    mk(pdraw, &tie, crate::types::OutcomeTag::D),
+                    mk(pb, &tb, crate::types::OutcomeTag::B),
+                ) {
+                    (Some(oa), Some(od), Some(ob)) => Some([oa, od, ob]),
+                    _ => None,
+                }
+            };
+            if let Some(outcomes) = triple_outcomes {
+                d.triples.push(TripleSpec {
+                    game: format!("{a}-{b}-{date}"), // pmus game key (the basket's pair identity)
+                    outcomes,
+                    cluster: cluster.clone(),
+                    settle_clean: true, // WC regulation TAIL-clean — same basis as the per-outcome pairs
+                    days_to_event,
+                });
+            }
             // emit each outcome as its OWN binary Pair: -a<->team-A ticker, -b<->team-B ticker, -draw<->TIE.
             for (pm_mkt, ticker) in [(pa, ta), (pb, tb), (pdraw, tie)] {
                 let Some(slug) = field_str(pm_mkt, "slug") else { continue };
@@ -1469,6 +1526,41 @@ mod tests {
         // moneyline sports is untouched: no moneyline markets here -> no 2-ticker sports pairs.
         assert_eq!(d.sports_pairs, 0, "the soccer branch must not emit moneyline 2-ticker pairs");
         assert!(d.pairs.iter().all(|p| p.kalshi_b.is_none()), "WC pairs never carry a kalshi_b");
+
+        // ...AND the parallel 3-leg DUTCH-BOOK spec: ONE TripleSpec per game, with the 3 outcomes mapped
+        // A/draw/B -> (slug, ticker), the per-game cluster + days_to_event, settle_clean. The per-outcome
+        // binary pairs above and this basket spec COEXIST (both arbs on the same game).
+        assert_eq!(d.triples.len(), 1, "one WC game -> one 3-leg Dutch-book spec");
+        let t = &d.triples[0];
+        assert_eq!(t.game, "ger-cuw-2026-06-14");
+        assert_eq!(t.cluster, "fwc-ger-cuw-2026-06-14");
+        assert_eq!(t.days_to_event, Some(1.0));
+        assert!(t.settle_clean);
+        // outcomes are [A, draw, B] with their slug<->ticker bindings (A=GER, D=TIE, B=CUW).
+        assert_eq!((t.outcomes[0].tag, t.outcomes[1].tag, t.outcomes[2].tag), (crate::types::OutcomeTag::A, crate::types::OutcomeTag::D, crate::types::OutcomeTag::B));
+        assert_eq!(t.outcomes[0].slug, "atc-fwc-ger-cuw-2026-06-14-ger");
+        assert_eq!(t.outcomes[0].ticker, "KXWCGAME-26JUN14GERCUW-GER");
+        assert_eq!(t.outcomes[1].slug, "atc-fwc-ger-cuw-2026-06-14-draw");
+        assert_eq!(t.outcomes[1].ticker, "KXWCGAME-26JUN14GERCUW-TIE", "the draw leg binds the TIE ticker");
+        assert_eq!(t.outcomes[2].slug, "atc-fwc-ger-cuw-2026-06-14-cuw");
+        assert_eq!(t.outcomes[2].ticker, "KXWCGAME-26JUN14GERCUW-CUW");
+    }
+
+    /// A WC game MISSING one of its 3 sibling outcomes emits NO triple (a 2-outcome "basket" is not a Dutch
+    /// book) — but the binary pairs of the outcomes present are unaffected (both arbs are independent).
+    #[test]
+    fn soccer3_incomplete_game_emits_no_triple() {
+        // only 2 of the 3 siblings (no draw) -> pick_wc_game needs all 3 to BIND, so 0 pairs AND 0 triples
+        // here; but the point is the triple-emit guard. Use a complete game + remove draw to isolate: with a
+        // missing sibling, the per-outcome bind itself fails, so neither pairs nor a triple emit.
+        let pm_cat = vec![
+            pm("atc-fwc-ger-cuw-2026-06-14-ger", "sports", r#""marketType":"drawable_outcome""#),
+            pm("atc-fwc-ger-cuw-2026-06-14-cuw", "sports", r#""marketType":"drawable_outcome""#),
+            // draw sibling absent
+        ];
+        let d = assemble(&pm_cat, false, ymd_to_epoch_days("2026-06-13"), wc_kalshi_stub);
+        assert_eq!(d.soccer_pairs, 0, "a game missing the draw sibling does not bind (no partial game, L1)");
+        assert!(d.triples.is_empty(), "...and no 3-leg basket spec for an incomplete game");
     }
 
     /// ALIAS join: pmus `irn` must bind the Kalshi `...IRINZL` event (irn->iri), via the explicit alias table

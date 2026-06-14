@@ -51,6 +51,26 @@ pub fn unwind_orders(pos: &Position, exit_cents: [u8; 2]) -> [OrderIntent; 2] {
     })
 }
 
+/// The three closing orders to flatten a held 3-leg DUTCH-BOOK basket: SELL each of the position's three
+/// legs with the EXACT (venue, venue-native market, side) it holds — all three are YES legs (one per
+/// outcome, each on the venue it filled cheapest). The PARALLEL of `unwind_orders` for the WC 3-leg path;
+/// `unwind_orders` is untouched. The caller supplies a marketable exit price per leg (`exit_cents[i]` for
+/// `legs[i]`). Idempotent `unwind3-…-{0,1,2}` client_order_ids so a retry can't double-flatten.
+pub fn triple_unwind_orders(pos: &TriplePosition, exit_cents: [u8; 3]) -> [OrderIntent; 3] {
+    std::array::from_fn(|i| {
+        let leg = &pos.legs[i];
+        OrderIntent {
+            venue: leg.venue,
+            market: leg.market.clone(),
+            action: Action::Sell,
+            side: leg.side,
+            price_cents: exit_cents[i],
+            qty: pos.size,
+            client_order_id: format!("unwind3-{}-{}", pos.game, i),
+        }
+    })
+}
+
 /// Scan held positions against detected postponements; return the unwind orders for every SPORTS
 /// position that should be flattened. (Weather/econ have no postponement concept.)
 pub fn postponement_unwinds(
@@ -113,6 +133,31 @@ mod tests {
         assert_eq!(o[1].market, "KXMLBGAME-26JUN14-PIT"); // Kalshi leg carries the TICKER (leg-market fix)
         assert_eq!((o[0].price_cents, o[1].price_cents), (53, 45));
         assert!(o[0].qty == 10 && o[1].qty == 10);
+    }
+
+    /// The 3-leg unwind SELLs back each of the basket's three YES legs with its exact (venue, market,
+    /// side), priced at the supplied per-leg exit cents, with idempotent `unwind3-…-{0,1,2}` coids.
+    #[test]
+    fn triple_unwind_orders_sell_all_three_legs() {
+        let pos = TriplePosition {
+            game: "ger-cuw-2026-06-14".into(),
+            legs: [
+                PositionLeg { venue: Venue::Pmus, market: "atc-fwc-ger-cuw-2026-06-14-ger".into(), side: Side::Yes, ..Default::default() },
+                PositionLeg { venue: Venue::Kalshi, market: "KXWCGAME-26JUN14GERCUW-TIE".into(), side: Side::Yes, ..Default::default() },
+                PositionLeg { venue: Venue::Pmus, market: "atc-fwc-ger-cuw-2026-06-14-cuw".into(), side: Side::Yes, ..Default::default() },
+            ],
+            size: 5,
+            cluster: "fwc-ger-cuw-2026-06-14".into(),
+        };
+        let o = triple_unwind_orders(&pos, [40, 22, 33]);
+        // each leg SOLD with its exact venue/market/side (all YES — a Dutch book holds YES on all 3 outcomes).
+        for (i, leg) in pos.legs.iter().enumerate() {
+            assert_eq!((o[i].action, o[i].venue, o[i].side), (Action::Sell, leg.venue, Side::Yes));
+            assert_eq!(o[i].market, leg.market);
+            assert_eq!(o[i].qty, 5);
+            assert_eq!(o[i].client_order_id, format!("unwind3-ger-cuw-2026-06-14-{i}"));
+        }
+        assert_eq!((o[0].price_cents, o[1].price_cents, o[2].price_cents), (40, 22, 33));
     }
 
     #[test]
