@@ -15,6 +15,7 @@ mod bookkeeping;
 mod config;
 mod discovery;
 mod exec;
+mod exec_log;
 mod ledger;
 mod live;
 mod matcher;

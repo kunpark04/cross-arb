@@ -106,6 +106,8 @@ impl DryRunBackend {
             "[DRY-RUN] would submit: {:?} {:?} {}x @ {}c  market={}  coid={}",
             intent.venue, intent.side, intent.qty, intent.price_cents, intent.market, intent.client_order_id
         );
+        // log the simulated execution too ("ALL executions"): mode=dry-run, no real ack.
+        crate::exec_log::order_submit(intent, "dry-run", None, "SIMULATED", true, 0.0, "dry-run (no order sent)");
         Ok(Ack {
             client_order_id: intent.client_order_id.clone(),
             venue_order_id: "SIMULATED".into(),
@@ -448,23 +450,22 @@ impl LiveBackend {
         for (k, v) in hdrs {
             req = req.header(k, v);
         }
-        let resp = req.body(body).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ExecError::RateLimited
-            } else {
-                ExecError::Rejected(format!("transport: {e}"))
+        let t0 = std::time::Instant::now();
+        let resp = match req.body(body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = if e.is_timeout() { ExecError::RateLimited } else { ExecError::Rejected(format!("transport: {e}")) };
+                // a transport failure IS an execution attempt — log it too (no http/body).
+                crate::exec_log::order_submit(intent, "live", None, "", false, t0.elapsed().as_secs_f64() * 1000.0, &format!("{err:?}"));
+                return Err(err);
             }
-        })?;
+        };
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(ExecError::RateLimited);
-        }
-        if !status.is_success() {
-            return Err(ExecError::Rejected(format!("{} {}", status.as_u16(), text.chars().take(160).collect::<String>())));
-        }
-        // parse the venue order id out of the ack — VERIFIED live 2026-06-11 (Kalshi: {"order":{"order_id":..}}
-        // parsed from a real placed order; pmus: top-level {"id":..} from a real BUY_LONG/BUY_SHORT).
+        let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // Parse the ack — HARMLESS on a non-2xx error body (no `order`/fill fields -> "" / false). We parse +
+        // LOG *before* the status-gate returns, so a reject/429 is recorded too, with its raw body.
+        // venue_order_id: VERIFIED live (Kalshi `{"order":{"order_id":..}}`; pmus top-level `{"id":..}`).
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         let venue_order_id = v
             .get("order")
@@ -474,24 +475,30 @@ impl LiveBackend {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        // FILLED vs merely ACCEPTED: a 2xx create is acceptance, not a fill (the core real-money bug). Read
-        // the venue body for the FULL requested qty actually filling — Kalshi reports it synchronously; pmus
-        // only with `synchronousExecution` (set in build_pmus_payload). A non-fill (resting/0-exec) is NOT a
-        // hedge leg -> `filled:false` -> the loop routes it down the naked-leg path, never records a hedge.
+        // FILLED vs merely ACCEPTED: a 2xx create is acceptance, not a fill (the core real-money bug). Read the
+        // venue body for the FULL requested qty actually filling — Kalshi synchronously (`fill_count_fp`); pmus
+        // with `synchronousExecution`. A non-fill (resting/0-exec) is NOT a hedge leg -> `filled:false`.
         let filled = match intent.venue {
             Venue::Kalshi => kalshi_order_filled(&v, intent.qty),
             Venue::Pmus => pmus_order_filled(&v, intent.qty),
         };
-        // DIAGNOSTIC (env-gated, default OFF): dump the raw create-response body + the parsed `filled` so a
-        // live probe can confirm the SYNCHRONOUS fill-detection (`PROBE_LOG_RAW=1`). Logs only the order ack
-        // body (never key material), truncated. This is how we tell "rested then hit later" from "filled
-        // synchronously but mis-parsed".
+        // EXECUTION LOG (always-on, exec_log.rs): one line per submit — success OR reject — with the RAW ack
+        // next to the parsed `filled`/`venue_order_id`, so a parser-vs-reality drift (the fill_count_fp class)
+        // is visible by eye/jq ([L32]).
+        crate::exec_log::order_submit(intent, "live", Some(status.as_u16()), &venue_order_id, filled, latency_ms, &text);
+        // DIAGNOSTIC (env-gated console echo, default OFF): PROBE_LOG_RAW=1 also mirrors the raw ack to stderr.
         if std::env::var("PROBE_LOG_RAW").as_deref() == Ok("1") {
             eprintln!(
                 "[raw] {:?} http={} parsed_filled={} body={}",
                 intent.venue, status.as_u16(), filled,
                 text.chars().take(400).collect::<String>()
             );
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ExecError::RateLimited);
+        }
+        if !status.is_success() {
+            return Err(ExecError::Rejected(format!("{} {}", status.as_u16(), text.chars().take(160).collect::<String>())));
         }
         Ok(Ack {
             client_order_id: intent.client_order_id.clone(),
@@ -585,15 +592,26 @@ impl LiveBackend {
         for (k, v) in hdrs {
             req = req.header(k, v);
         }
-        let resp = req.body(body).send().await.map_err(|e| {
-            if e.is_timeout() { ExecError::RateLimited } else { ExecError::Rejected(format!("transport: {e}")) }
-        })?;
+        let venue = format!("{:?}", target.venue);
+        let t0 = std::time::Instant::now();
+        let resp = match req.body(body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = if e.is_timeout() { ExecError::RateLimited } else { ExecError::Rejected(format!("transport: {e}")) };
+                crate::exec_log::order_cancel(&venue, &target.market, &target.venue_order_id, None, false, t0.elapsed().as_secs_f64() * 1000.0, &format!("{err:?}"));
+                return Err(err);
+            }
+        };
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // EXECUTION LOG: every cancel, with its raw response (a 404 not_found means the order wasn't resting —
+        // already filled/gone; the probe's filled-then-404 was exactly this).
+        crate::exec_log::order_cancel(&venue, &target.market, &target.venue_order_id, Some(status.as_u16()), status.is_success(), latency_ms, &text);
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(ExecError::RateLimited);
         }
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
             return Err(ExecError::Rejected(format!("{} {}", status.as_u16(), text.chars().take(160).collect::<String>())));
         }
         Ok(())

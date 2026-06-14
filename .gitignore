@@ -16,3 +16,6 @@ bot-rs/target/
 bot-rs/.env
 bot-rs/*.pem
 bot-rs/*.key
+# bot-rs execution log (runtime audit trail; CROSSARB_EXEC_LOG, default executions.jsonl) — never committed
+executions.jsonl
+**/executions.jsonl
