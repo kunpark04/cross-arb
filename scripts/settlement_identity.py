@@ -2,9 +2,18 @@
 
 Where verify_settlement.py / verify_sports_settlement.py / verify_econ_settlement.py PRINT both venues'
 rules side-by-side for a HUMAN to eyeball, this module returns a STRUCTURED VERDICT per co-listed pair:
-`settlement_identity(pm_market, kalshi, cat) -> {status, dims, reasons}` with status in
-IDENTICAL | DIVERGENT | NEEDS_MANUAL. It is the "every discovered market gets gated" capability the live
-bot needs before sizing into a "locked" pair.
+`settlement_identity(pm_market, kalshi, cat) -> {status, tail_cost_cents, dims, reasons}` with status in
+IDENTICAL | TAIL | DIVERGENT | NEEDS_MANUAL. It is the "every discovered market gets gated" capability the
+live bot needs before sizing into a "locked" pair.
+
+THE 4TH VERDICT: TAIL (owner refinement 2026-06-13, decision 0010's all-in-cost philosophy)
+-------------------------------------------------------------------------------------------
+The old binary IDENTICAL/DIVERGENT was too blunt: most "DIVERGENT" sports verdicts are really a SMALL
+PRICEABLE TAIL RISK (the void/reschedule-window difference), not a structural divergence. TAIL = "settlement
+differs only on a low-probability tail whose EXPECTED COST is X ¢/contract — tradeable iff edge > X". It
+carries `tail_cost_cents` (float, ¢/contract). DIVERGENT is reserved for STRUCTURAL / un-priceable conflicts
+(boundary mismatch, opposite orientation, outcome-count mismatch, wrong event/date, agency mismatch). This
+matches 0010: price risks into the all-in edge, don't binary-exclude a tradeable pair.
 
 THE KEY DESIGN PRINCIPLE (owner's refinement of decision 0001, 2026-06-13)
 -------------------------------------------------------------------------
@@ -22,20 +31,25 @@ rule is exactly right for weather/econ and exactly wrong for sports source strin
 CONSERVATIVE DISCIPLINE (load-bearing — the no-false-positive invariant, lesson L1)
 -----------------------------------------------------------------------------------
 Default is NEEDS_MANUAL. Return IDENTICAL only when EVERY outcome-determining dimension for the category
-PROVABLY matches; return DIVERGENT only when a dimension PROVABLY differs; anything unextractable/uncertain
-stays NEEDS_MANUAL (NEVER silently IDENTICAL). A false IDENTICAL is a both-legs-loss (L1/L2). DIVERGENT
-beats IDENTICAL when both fire (a proven conflict is decisive); NEEDS_MANUAL is the floor, never overriding
-a proven IDENTICAL/DIVERGENT but catching every gap. This mirrors L17: the underlying boundary/inequality
-conventions this leans on were live-reverified (colisted_map), but the rules-text extractors here are
-HEURISTIC — when they can't prove a dimension, they must abstain, not guess.
+PROVABLY matches (no TAIL/DIVERGENT/NEEDS_MANUAL on any dim); return DIVERGENT only when a dimension PROVABLY
+differs STRUCTURALLY; a priceable-tail-only difference returns TAIL with its quantified cost; anything
+unextractable/uncertain stays NEEDS_MANUAL (NEVER silently IDENTICAL or TAIL — you cannot price an unknown).
+A false IDENTICAL is a both-legs-loss (L1/L2). The precedence (decisive -> floor):
+  DIVERGENT > NEEDS_MANUAL > TAIL > IDENTICAL
+A proven STRUCTURAL conflict is decisive (never downgraded to TAIL). An unknown could itself be structural,
+so NEEDS_MANUAL outranks TAIL (resolve the unknown before pricing the rest). This mirrors L17: the underlying
+boundary/inequality conventions this leans on were live-reverified (colisted_map), but the rules-text
+extractors here are HEURISTIC — when they can't prove a dimension, they must abstain, not guess.
 
 Per-category outcome-determining dimensions (checked EXACTLY these):
-  weather: STATION (a SPECIFIC id — ICAO code/landmark, never the generic word "airport") + SOURCE is CLI
-           (not METAR/ASOS) + BOUNDARY (colisted_map pm_bounds/kbounds inclusive-[lo,hi] equality). The
-           8AM-vs-11AM CLI read-timing residual -> a NEEDS_MANUAL note, never auto-DIVERGENT (a downward-
-           correction tail, not a source split).
-  sports : EVENT (teams+date sanity, already joined) + RESULT-TIMING basis + VOID/POSTPONE (reschedule
-           window + fallback) + OUTCOME-COUNT (2 vs 3-way). SOURCE STRING IS IGNORED (owner's refinement).
+  weather: STATION (a SPECIFIC id — ICAO code/landmark, never the generic word "airport") + SOURCE (both CLI
+           -> IDENTICAL; CLI-vs-METAR/ASOS same station -> TAIL [CLI revision/QC residual]; CLI-vs-non-NWS
+           provider -> DIVERGENT) + BOUNDARY (colisted_map pm_bounds/kbounds inclusive-[lo,hi] equality). The
+           8AM-vs-11AM CLI read-timing residual -> a note, never auto-DIVERGENT.
+  sports : EVENT (teams+date sanity, already joined) + OUTCOME-COUNT (2 vs 3-way, DISCOVERED from marketSides/
+           bound-markets STRUCTURE) + RESULT-TIMING basis (SCORED ONLY for draw-capable sports: soccer or a
+           discovered draw — N/A for definite-result mlb/nba/nhl/...) + VOID/POSTPONE (reschedule window +
+           fallback; a difference is a PRICEABLE TAIL via 0010's void EV, not structural). SOURCE STRING IGNORED.
   econ   : RELEASE (colisted_map econ_parse family+period) + AGENCY (BLS/BEA/Fed) + BOUNDARY/INEQUALITY
            (colisted_map econ_twin, the 0013 grid-step-twin logic).
 
@@ -46,17 +60,35 @@ READ-ONLY, public APIs. A verdict is a GATE input, not a trade decision — the 
 """
 import os, sys, re, argparse, collections
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
+sys.path.insert(0, os.path.dirname(__file__))                           # for capital_sim / cli_revisions (sibling scripts)
 from colisted_map import (get, build_colisted_map, pm_catalog, econ_parse, econ_twin, ECON, _FEDLBL,  # noqa: E402
-                          pm_bounds, kbounds, KAL)
+                          pm_bounds, kbounds, pmlg, KAL)
 from verify_settlement import fuzzy_rule_fields, kalshi_detail           # weather rule-field extractor + detail pull
 from verify_sports_settlement import k_text                              # joins Kalshi rules fields -> one str
+from capital_sim import void_haircut                                     # 0010 sports void EV ($-fraction; *100 = ¢)
+import cli_revisions                                                     # NWS CLI revision rate -> weather TAIL cost
 
-IDENTICAL, DIVERGENT, NEEDS_MANUAL = "IDENTICAL", "DIVERGENT", "NEEDS_MANUAL"
+IDENTICAL, TAIL, DIVERGENT, NEEDS_MANUAL = "IDENTICAL", "TAIL", "DIVERGENT", "NEEDS_MANUAL"
+
+# Soccer is the ONLY sports family that can DRAW / go to extra-time+penalties — so the result-timing dim
+# (regulation vs extended) and the 3-way outcome-count apply there. Other leagues (mlb/nba/nhl/wnba/esports)
+# have a DEFINITE result, so timing is N/A (scoring it would fire a spurious NEEDS_MANUAL — owner bug report).
+# A league with a draw outcome DISCOVERED from market structure (step-5 outcome-count) is treated as draw-capable
+# too. League is the pmus slug seg-2 (pmlg): soccer pmus slugs are 'atc-fwc-...'/'atc-fifa-...'/'mls-...'.
+_DRAW_LEAGUES = frozenset({"fwc", "fifa", "mls"})
+
+# Conservative documented prior for the weather CLI-vs-METAR TAIL when no live CLI-revision data is available.
+# The NWS CLI Daily IS the station's METAR daily-max with QC, so the only residual is the CLI revision/QC; this
+# accrues empirically from cli_revisions.py (monitor cli.jsonl). 0.05¢ ~ a small downward-on-boundary-day rate.
+_CLI_METAR_TAIL_PRIOR_CENTS = 0.05
 
 # A weather settlement SOURCE is one of these. CLI (the NWS Climatological Report) is the clean basis both
-# venues must name; METAR/ASOS/Wunderground are DIFFERENT thermometers (a real number divergence, L2).
+# venues must name. METAR/ASOS are the SAME STATION's raw observations the CLI Daily is itself the QC'd
+# daily-max OF — so a CLI-vs-METAR(same station) split is only the CLI revision/QC TAIL, NOT a different
+# thermometer. A NON-NWS provider (Wunderground) IS a different thermometer -> a structural source divergence (L2).
 _CLI = re.compile(r"climatolog\w*|\bCLI\b", re.I)
-_NONCLI_WX = re.compile(r"\bMETAR\b|\bASOS\b|wunderground|weather underground", re.I)
+_METAR_ASOS = re.compile(r"\bMETAR\b|\bASOS\b", re.I)                      # same-station raw obs -> CLI-vs-METAR is a TAIL
+_NONNWS_WX = re.compile(r"wunderground|weather underground", re.I)        # different provider -> structural DIVERGENT
 # A SPECIFIC station identifier — an ICAO airport code (KNYC/KSFO/...) or a named landmark (central park,
 # laguardia, o'hare, midway). NOT the generic words "airport"/"NWS"/"national weather service": two
 # DIFFERENT cities both say "airport", so matching on the generic word is a false station-identity (L1).
@@ -152,12 +184,20 @@ def _weather(pm_market, kalshi):
     else:
         statuses.append(NEEDS_MANUAL); reasons.append(f"station not specifically named on >=1 venue (Kalshi {sorted(k_st)}, pmus {sorted(p_st)}) — generic 'airport' is not station-identity; rely on the primary-source station check (verify_settlement.py)")
 
-    # (b) SOURCE — both must be the NWS CLI; one CLI vs one METAR/ASOS = a real number divergence (L2).
+    # (b) SOURCE — both NWS CLI -> IDENTICAL. One CLI vs the other METAR/ASOS (SAME station) -> TAIL: the CLI
+    #     Daily IS that station's METAR daily-max with QC, so the only residual is the CLI revision/QC (cost from
+    #     cli_revisions.py, else a documented prior). A NON-NWS provider (Wunderground) IS a different thermometer
+    #     -> structural DIVERGENT (L2). (The station dim above independently catches a genuinely different airport.)
     k_cli, p_cli = bool(_CLI.search(k_text_all)), bool(_CLI.search(p_text))
-    k_non, p_non = bool(_NONCLI_WX.search(k_text_all)), bool(_NONCLI_WX.search(p_text))
-    dims["source"] = {"kalshi_cli": k_cli, "pm_cli": p_cli, "kalshi_nonCLI": k_non, "pm_nonCLI": p_non}
-    if (k_cli and p_non and not p_cli) or (p_cli and k_non and not k_cli):
-        statuses.append(DIVERGENT); reasons.append("SOURCE differs: one venue grades on NWS CLI, the other on METAR/ASOS/Wunderground (different thermometers, L2)")
+    k_metar, p_metar = bool(_METAR_ASOS.search(k_text_all)), bool(_METAR_ASOS.search(p_text))
+    k_nonnws, p_nonnws = bool(_NONNWS_WX.search(k_text_all)), bool(_NONNWS_WX.search(p_text))
+    dims["source"] = {"kalshi_cli": k_cli, "pm_cli": p_cli, "kalshi_metar": k_metar, "pm_metar": p_metar,
+                      "kalshi_nonNWS": k_nonnws, "pm_nonNWS": p_nonnws}
+    if (k_cli and p_nonnws and not p_cli) or (p_cli and k_nonnws and not k_cli):
+        statuses.append(DIVERGENT); reasons.append("SOURCE differs structurally: one venue grades on NWS CLI, the other on a NON-NWS provider (Wunderground) — different thermometers (L2)")
+    elif (k_cli and p_metar and not p_cli) or (p_cli and k_metar and not k_cli):
+        tcost = _cli_metar_tail_cents()
+        statuses.append((TAIL, tcost)); reasons.append(f"SOURCE tail: one venue CLI, the other METAR/ASOS at the SAME station — the CLI Daily IS that station's QC'd METAR daily-max, so the only residual is the CLI revision/QC ~{tcost:.2f}c/contract (accrues from cli_revisions.py); tradeable iff edge > {tcost:.2f}c")
     elif k_cli and p_cli:
         statuses.append(IDENTICAL); reasons.append("source match: both NWS Climatological Report (CLI)")
     else:
@@ -207,47 +247,66 @@ def _sports(pm_market, kalshi):
     dims["source_IGNORED"] = {"kalshi": [s.get("name") for s in _series_sources(_series_ticker(kms[0]))] if kms else [],
                               "note": "source string deliberately NOT scored for sports (same reporter-independent outcome)"}
 
-    # (c) RESULT-TIMING basis — regulation (90-min/full-time) vs extended (extra time/penalties).
-    k_basis, p_basis = _timing_basis(k_all), _timing_basis(p_text)
-    dims["result_timing"] = {"kalshi": k_basis, "pm": p_basis}
-    if k_basis and p_basis:
-        if k_basis == p_basis:
-            statuses.append(IDENTICAL); reasons.append(f"result-timing basis match: both {k_basis}")
+    # (c) OUTCOME-COUNT — 3-way (a SETTLEABLE draw/tie) vs 2-way, DISCOVERED FROM STRUCTURE (owner directive):
+    #     pmus = distinct settleable sides in marketSides (L23; fall back to `outcomes` length); Kalshi = distinct
+    #     bound outcome-markets (a separate Tie/Draw market => 3-way). NOT prose: a "tie -> settle 50-50" void
+    #     clause is NOT a side (baseball pmus has 2 marketSides + a 50-50 clause = 2-way). A provable mismatch
+    #     (one 2-way, the other 3-way) is STRUCTURAL -> DIVERGENT (a draw settles incompatibly).
+    k_3, p_3 = _kalshi_three_way(kms), _pm_three_way(pm_market)
+    dims["outcome_count"] = {"kalshi_3way": k_3, "pm_3way": p_3}
+    if k_3 is not None and p_3 is not None:
+        if k_3 == p_3:
+            statuses.append(IDENTICAL); reasons.append(f"outcome-count match (discovered from structure): both {'3-way (draw possible)' if k_3 else '2-way'}")
         else:
-            statuses.append(DIVERGENT); reasons.append(f"RESULT-TIMING differs: Kalshi {k_basis} vs pmus {p_basis} (one settles at regulation, the other incl. extra time/penalties)")
+            statuses.append(DIVERGENT); reasons.append(f"OUTCOME-COUNT differs: Kalshi {'3-way' if k_3 else '2-way'} vs pmus {'3-way' if p_3 else '2-way'} (a draw settles incompatibly — structural)")
     else:
-        statuses.append(NEEDS_MANUAL); reasons.append(f"result-timing basis silent on >=1 venue (Kalshi {k_basis or 'silent'}, pmus {p_basis or 'silent'}) — verify rulebook")
+        statuses.append(NEEDS_MANUAL); reasons.append(f"outcome-count not determinable on >=1 venue (Kalshi {k_3}, pmus {p_3})")
 
-    # (d) VOID/POSTPONE — reschedule WINDOW + fallback price. The known MLB-2d-vs-pmus-2wk risk.
+    # (d) RESULT-TIMING basis — regulation (90-min/full-time) vs extended (extra time/penalties). SPORT-APPROPRIATE
+    #     (owner bug report): only score it for a sport that CAN draw / go to ET+penalties (soccer, or a draw
+    #     discovered above). For a DEFINITE-result sport (mlb/nba/nhl/...) timing is N/A — DO NOT append any
+    #     status (a non-applicable dim must not fire a spurious NEEDS_MANUAL).
+    if _can_draw(pm_market, p_3):
+        k_basis, p_basis = _timing_basis(k_all), _timing_basis(p_text)
+        dims["result_timing"] = {"kalshi": k_basis, "pm": p_basis}
+        if k_basis and p_basis:
+            if k_basis == p_basis:
+                statuses.append(IDENTICAL); reasons.append(f"result-timing basis match: both {k_basis}")
+            else:
+                statuses.append(DIVERGENT); reasons.append(f"RESULT-TIMING differs: Kalshi {k_basis} vs pmus {p_basis} (one settles at regulation, the other incl. extra time/penalties)")
+        else:
+            statuses.append(NEEDS_MANUAL); reasons.append(f"result-timing basis silent on >=1 venue (Kalshi {k_basis or 'silent'}, pmus {p_basis or 'silent'}) — verify rulebook")
+    else:
+        dims["result_timing"] = {"applicable": False, "note": f"definite-result sport ({pmlg(pm_market.get('slug'))}) — no extra-time/penalties ambiguity; timing N/A"}
+
+    # (e) VOID/POSTPONE — reschedule WINDOW + fallback price. The known MLB-2d-vs-pmus-2wk risk. A WINDOW or
+    #     FALLBACK difference is NOT structural — it is a PRICEABLE TAIL (only a postponement replayed in the
+    #     gap breaks the lock) -> TAIL with tail_cost_cents = 100 * void_haircut(pm_slug) (0010's model; ~0.26¢
+    #     MLB / ~0.10¢ other aec- sports). Same window AND same fallback -> IDENTICAL. Silent on >=1 venue ->
+    #     NEEDS_MANUAL (can't price an unknown). If the model returns 0 for this market (e.g. a non-aec- slug
+    #     0010 doesn't yet model), the tail is un-priced -> stay NEEDS_MANUAL rather than emit a degenerate TAIL.
+    pm_slug = pm_market.get("slug")
     k_win, p_win = _resched_window(k_all), _resched_window(p_text)
     k_fb, p_fb = _void_fallback(k_all), _void_fallback(p_text)
-    dims["void"] = {"kalshi_window_days": k_win, "pm_window_days": p_win, "kalshi_fallback": sorted(k_fb), "pm_fallback": sorted(p_fb)}
+    vcost = round(100.0 * void_haircut(pm_slug, 1.0), 4)   # $-fraction -> ¢/contract (0010)
+    dims["void"] = {"kalshi_window_days": k_win, "pm_window_days": p_win, "kalshi_fallback": sorted(k_fb),
+                    "pm_fallback": sorted(p_fb), "tail_cost_cents_if_differs": vcost}
     if k_win is not None and p_win is not None:
-        if k_win != p_win:
-            statuses.append(DIVERGENT); reasons.append(f"VOID reschedule WINDOW differs: Kalshi {k_win}d vs pmus {p_win}d (a game replayed in the gap settles the legs OPPOSITELY — the known MLB risk)")
-        elif k_fb and p_fb:
-            if k_fb & p_fb:
-                statuses.append(IDENTICAL); reasons.append(f"void match: same reschedule window ({k_win}d) and same fallback price {sorted(k_fb & p_fb)}")
+        differs = (k_win != p_win) or (k_fb and p_fb and not (k_fb & p_fb))
+        same = (k_win == p_win) and (k_fb and p_fb and (k_fb & p_fb))
+        why = (f"reschedule WINDOW Kalshi {k_win}d vs pmus {p_win}d" if k_win != p_win
+               else f"same window ({k_win}d) but fallback Kalshi {sorted(k_fb)} vs pmus {sorted(p_fb)}")
+        if differs:
+            if vcost > 0:
+                statuses.append((TAIL, vcost)); reasons.append(f"VOID tail ({why}): only a postponement replayed in the gap breaks the lock -> priceable tail {vcost:.2f}c/contract (0010 void EV); tradeable iff edge > {vcost:.2f}c")
             else:
-                statuses.append(DIVERGENT); reasons.append(f"VOID fallback price differs: Kalshi {sorted(k_fb)} vs pmus {sorted(p_fb)} (same window, but the un-replayed game settles to different prices — legs don't net)")
+                statuses.append(NEEDS_MANUAL); reasons.append(f"VOID {why} but 0010's void model returns 0c for this slug ({pm_slug!r}) — tail un-priced -> resolve before trading")
+        elif same:
+            statuses.append(IDENTICAL); reasons.append(f"void match: same reschedule window ({k_win}d) and same fallback price {sorted(k_fb & p_fb)}")
         else:
             statuses.append(NEEDS_MANUAL); reasons.append(f"void window matches ({k_win}d) but fallback price not both-provable (Kalshi {sorted(k_fb) or 'silent'}, pmus {sorted(p_fb) or 'silent'}) — confirm the un-replayed-game price")
     else:
         statuses.append(NEEDS_MANUAL); reasons.append(f"void/postpone reschedule window silent on >=1 venue (Kalshi {k_win}, pmus {p_win}) — the void tail is the #1 sports risk, verify")
-
-    # (e) OUTCOME-COUNT — 3-way (a SETTLEABLE draw/tie) vs 2-way. A structural mismatch grades incompatibly.
-    #     Use STRUCTURE, not prose: a "tie -> settle 50-50" void clause is NOT a third outcome (baseball pmus
-    #     says "tie or draw -> $0.50" with only 2 marketSides). pmus -> marketSides count; Kalshi -> a distinct
-    #     "Tie" MARKET named in the rules (or a Tie leg in the bound set), not a bare "ends in a tie" clause.
-    k_3, p_3 = _kalshi_three_way(k_all, kms), _pm_three_way(pm_market)
-    dims["outcome_count"] = {"kalshi_3way": k_3, "pm_3way": p_3}
-    if k_3 is not None and p_3 is not None:
-        if k_3 == p_3:
-            statuses.append(IDENTICAL); reasons.append(f"outcome-count match: both {'3-way (draw possible)' if k_3 else '2-way'}")
-        else:
-            statuses.append(DIVERGENT); reasons.append(f"OUTCOME-COUNT differs: Kalshi {'3-way' if k_3 else '2-way'} vs pmus {'3-way' if p_3 else '2-way'} (a draw settles incompatibly)")
-    else:
-        statuses.append(NEEDS_MANUAL); reasons.append("outcome-count not determinable on >=1 venue")
     return _combine(statuses, dims, reasons)
 
 
@@ -266,7 +325,7 @@ def _econ(pm_market, kalshi):
     # (a) RELEASE — econ_parse must recognize the pmus family+period (the SAME parser the matcher uses).
     dims["release"] = {"pm_parsed": p}
     if not p or not p.get("fam") or not p.get("period"):
-        return {"status": NEEDS_MANUAL, "dims": dims,
+        return {"status": NEEDS_MANUAL, "tail_cost_cents": 0.0, "dims": dims,
                 "reasons": ["pmus econ slug not parseable by econ_parse (family/period) -> cannot establish the release"]}
     fam = p["fam"]
     statuses.append(IDENTICAL); reasons.append(f"release: {fam} {p['period']}")
@@ -364,35 +423,76 @@ def _void_fallback(text):
     return out
 
 
+def _pm_settleable_sides(pm_market):
+    """pmus DISTINCT settleable sides from STRUCTURE (L23: marketSides is authoritative, each side self-labels
+    its team/title). Fall back to `outcomes` length only when marketSides is absent. Returns an int count or
+    None if neither is determinable. A 'tie/draw -> settle 50-50' VOID clause is NOT a side here — it never
+    appears as a marketSides entry (baseball has 2 sides + a 50-50 void clause = 2-way)."""
+    sides = [s for s in (pm_market.get("marketSides") or [])
+             if (s.get("team") or {}).get("name") or s.get("title") or s.get("name")]
+    if sides:
+        return len({((s.get("team") or {}).get("name") or s.get("title") or s.get("name")).strip().lower() for s in sides})
+    outs = [o for o in (pm_market.get("outcomes") or []) if str(o).strip()]
+    if outs:
+        return len({str(o).strip().lower() for o in outs})
+    return None
+
+
+def _kalshi_settleable_sides(markets):
+    """Kalshi DISTINCT settleable outcome-markets bound for the event, from STRUCTURE (count the bound markets'
+    distinct yes_sub_titles). A separate 'Tie'/'Draw' market in the set is itself a distinct settleable side ->
+    its presence makes the event 3-way; two TEAM legs only -> 2-way. Returns an int count or None if no bound
+    market is identifiable. STRUCTURE not prose: a 'if the game ends in a tie ...' clause inside a team leg's
+    rules text is NOT counted — only an actual bound Tie/Draw market is."""
+    subs = [str(m.get("yes_sub_title") or "").strip().lower() for m in (markets or []) if m]
+    subs = [s for s in subs if s]
+    if not subs:
+        return None
+    return len(set(subs))
+
+
 def _pm_three_way(pm_market):
-    """pmus outcome-count from STRUCTURE: marketSides count (3+ -> 3-way draw, 2 -> 2-way). A 'tie/draw ->
-    settle 50-50' clause with only 2 sides is 2-way, NOT 3-way (baseball). marketSides is authoritative;
-    fall back to '3 possible outcomes' prose only when marketSides is absent."""
-    sides = [s for s in (pm_market.get("marketSides") or []) if (s.get("team") or {}).get("name") or s.get("title")]
-    if len(sides) >= 3:
-        return True
-    if len(sides) == 2:
-        return False
-    t = str(pm_market.get("description") or "").lower()
-    if "three possible outcome" in t or "three outcomes" in t:
-        return True
-    if "two possible outcome" in t or "two outcomes" in t:
-        return False
-    return None
+    """pmus 3-way (settleable draw) iff >=3 distinct settleable sides; 2 -> 2-way; None -> undetermined."""
+    n = _pm_settleable_sides(pm_market)
+    return None if n is None else n >= 3
 
 
-def _kalshi_three_way(text, markets):
-    """Kalshi outcome-count: 3-way iff a DISTINCT 'Tie'/'Draw' MARKET exists — a 'Tie'/'Draw' yes_sub_title
-    among the bound legs, or the rules naming a separate tie market ("the market called 'Tie'"). A bare
-    "if the game ends in a tie ..." 50-50-style clause is NOT a third settleable outcome -> not 3-way.
-    (colisted_map binds only the two TEAM legs, so the rules-text signal is the primary one in --audit.)"""
-    subs = " ".join(str(m.get("yes_sub_title") or "").lower() for m in (markets or []))
-    if re.search(r"\b(tie|draw)\b", subs):
+def _kalshi_three_way(markets):
+    """Kalshi 3-way iff a distinct Tie/Draw market is bound (>=3 distinct outcome-markets, OR a Tie/Draw
+    yes_sub_title among them); 2 team legs -> 2-way; None -> undetermined (no bound market identifiable)."""
+    n = _kalshi_settleable_sides(markets)
+    if n is None:
+        return None
+    if n >= 3:
         return True
-    t = (text or "").lower()
-    if re.search(r'market called\s*["\']?(tie|draw)|["\'](tie|draw)["\']?\s*market|(tie|draw)\s*market resolves', t):
+    subs = " ".join(str(m.get("yes_sub_title") or "").lower() for m in (markets or []) if m)
+    if re.search(r"\b(tie|draw)\b", subs):   # a Tie/Draw market bound alongside a team leg is the 3rd side
         return True
-    return None
+    return False
+
+
+def _can_draw(pm_market, pm_3way):
+    """Whether this sport CAN draw / go to extra-time+penalties -> the result-timing dim is in scope. True for
+    soccer (league seg-2 in _DRAW_LEAGUES) OR when a draw was DISCOVERED from market structure (3 settleable
+    sides). For a definite-result sport (mlb/nba/nhl/...) timing is N/A and is not scored (owner bug report)."""
+    return pmlg(pm_market.get("slug")) in _DRAW_LEAGUES or pm_3way is True
+
+
+def _cli_metar_tail_cents():
+    """Weather CLI-vs-METAR TAIL cost in ¢/contract from the live CLI downward-revision rate when available,
+    FLOORED at the documented conservative prior. The CLI Daily IS the station METAR daily-max with QC, so the
+    only residual is a downward CLI revision on a boundary day -> ~ downward_rate ¢ (accrues from cli_revisions.py).
+    The floor matters: an empirically-observed 0% downward-rate is an UPPER-BOUND-not-yet-violated (cli_revisions
+    is explicit that a low rate is 'reassuring', NOT proof of zero risk) — a 0¢ TAIL would read as 'always
+    tradeable', defeating the purpose of flagging it, so the prior keeps the tail strictly positive."""
+    try:
+        rows = cli_revisions.load(cli_revisions.DEFAULT_DATA)
+        a = cli_revisions.analyze(rows)
+        if a["n_station_days"] > 0:
+            return round(max(a["downward_rate"] * 100.0, _CLI_METAR_TAIL_PRIOR_CENTS), 4)
+    except Exception:
+        pass
+    return _CLI_METAR_TAIL_PRIOR_CENTS
 
 
 def _slug_date(slug):
@@ -409,16 +509,24 @@ def _ticker_date(ticker):
 
 
 def _combine(statuses, dims, reasons):
-    """Verdict combiner enforcing the conservative discipline: DIVERGENT if ANY dimension provably differs
-    (a proven conflict is decisive); else NEEDS_MANUAL if ANY dimension is uncertain (the floor — never
-    silently IDENTICAL on a gap); IDENTICAL only when EVERY scored dimension provably matched."""
-    if DIVERGENT in statuses:
-        status = DIVERGENT
-    elif NEEDS_MANUAL in statuses or not statuses:
-        status = NEEDS_MANUAL
+    """Verdict combiner enforcing the conservative-discipline precedence DIVERGENT > NEEDS_MANUAL > TAIL >
+    IDENTICAL. `statuses` entries are either a bare status string or a (TAIL, cost_cents) tuple.
+      - any dim DIVERGENT  -> DIVERGENT  (a proven STRUCTURAL conflict is decisive)
+      - else any NEEDS_MANUAL (or no scored dims) -> NEEDS_MANUAL (an unknown could be structural; resolve
+        first — never silently TAIL/IDENTICAL on a gap)
+      - else any TAIL -> TAIL, tail_cost_cents = SUM of the TAIL dims' costs (all-in priceable tail)
+      - else -> IDENTICAL (EVERY dim provably IDENTICAL — the no-false-IDENTICAL discipline, L1)."""
+    plain = [s if isinstance(s, str) else s[0] for s in statuses]
+    tail_cost = sum(s[1] for s in statuses if not isinstance(s, str) and s[0] == TAIL)
+    if DIVERGENT in plain:
+        status, cost = DIVERGENT, 0.0
+    elif NEEDS_MANUAL in plain or not plain:
+        status, cost = NEEDS_MANUAL, 0.0
+    elif TAIL in plain:
+        status, cost = TAIL, tail_cost
     else:
-        status = IDENTICAL
-    return {"status": status, "dims": dims, "reasons": reasons}
+        status, cost = IDENTICAL, 0.0
+    return {"status": status, "tail_cost_cents": round(cost, 4), "dims": dims, "reasons": reasons}
 
 
 def settlement_identity(pm_market, kalshi, cat):
@@ -429,8 +537,9 @@ def settlement_identity(pm_market, kalshi, cat):
                 carries rules_primary/rules_secondary/strike_type/floor_strike/cap_strike/yes_sub_title.
     cat       : 'weather' | 'sports' | 'econ'.
 
-    Returns {"status": IDENTICAL|DIVERGENT|NEEDS_MANUAL, "dims": {...}, "reasons": [str]}. Default
-    NEEDS_MANUAL — IDENTICAL requires EVERY outcome-determining dimension to PROVABLY match (L1)."""
+    Returns {"status": IDENTICAL|TAIL|DIVERGENT|NEEDS_MANUAL, "tail_cost_cents": float, "dims": {...},
+    "reasons": [str]}. Precedence DIVERGENT > NEEDS_MANUAL > TAIL > IDENTICAL; IDENTICAL requires EVERY
+    outcome-determining dimension to PROVABLY match with no tail (L1). tail_cost_cents>0 only for TAIL."""
     c = (cat or "").lower()
     if c == "weather":
         return _weather(pm_market, kalshi)
@@ -438,7 +547,7 @@ def settlement_identity(pm_market, kalshi, cat):
         return _sports(pm_market, kalshi)
     if c == "econ":
         return _econ(pm_market, kalshi)
-    return {"status": NEEDS_MANUAL, "dims": {}, "reasons": [f"unknown category {cat!r} — cannot gate"]}
+    return {"status": NEEDS_MANUAL, "tail_cost_cents": 0.0, "dims": {}, "reasons": [f"unknown category {cat!r} — cannot gate"]}
 
 
 # =========================================================================================================
@@ -457,10 +566,16 @@ def _selftest():
     r = settlement_identity(pm_wx, k_wx, "weather")
     assert r["status"] == IDENTICAL, ("weather same station+CLI+boundary -> IDENTICAL", r)
 
-    # CLI (Kalshi) vs METAR (pmus) -> DIVERGENT (source identity MATTERS for weather)
+    # CLI (Kalshi) vs METAR/ASOS at the SAME station (pmus) -> TAIL (the CLI Daily IS that station's QC'd
+    # METAR daily-max, so the only residual is the CLI revision/QC; priced from cli_revisions, else the prior).
     pm_metar = dict(pm_wx, description="highest temperature at Central Park (KNYC) per the METAR/ASOS observation")
     r = settlement_identity(pm_metar, k_wx, "weather")
-    assert r["status"] == DIVERGENT and any("METAR" in s or "thermometer" in s for s in r["reasons"]), ("weather CLI-vs-METAR -> DIVERGENT", r)
+    assert r["status"] == TAIL and r["tail_cost_cents"] > 0 and any("METAR" in s for s in r["reasons"]), ("weather CLI-vs-METAR(same station) -> TAIL", r["status"], r["tail_cost_cents"], r["reasons"])
+
+    # CLI (Kalshi) vs a NON-NWS provider (Wunderground, pmus) -> DIVERGENT (a genuinely different thermometer)
+    pm_wu = dict(pm_wx, description="highest temperature at Central Park (KNYC) per Weather Underground (wunderground)")
+    r = settlement_identity(pm_wu, k_wx, "weather")
+    assert r["status"] == DIVERGENT and any("NON-NWS" in s or "thermometer" in s for s in r["reasons"]), ("weather CLI-vs-nonNWS -> DIVERGENT", r["status"], r["reasons"])
 
     # boundary mismatch (pm 84-85 vs kalshi 85-86) -> DIVERGENT
     r = settlement_identity(pm_wx, dict(k_wx, floor_strike=85, cap_strike=86), "weather")
@@ -504,27 +619,22 @@ def _selftest():
     # the source dim is RECORDED (ESPN vs FIFA) but explicitly NOT scored — IDENTICAL despite the mismatch
     assert "source_IGNORED" in r["dims"] and r["dims"]["source_IGNORED"]["kalshi"], "sports source must be recorded as IGNORED"
 
-    # Void FALLBACK PRICE conflict is a REAL settle-time divergence even when the source+timing+window match:
-    # the actual live WC texts have Kalshi 'fair price' vs pmus 'last-traded' — proven different -> DIVERGENT
-    # (not a source issue; the un-replayed game settles the legs to different prices). This is correct, and is
-    # a genuine finding about real World Cup pairs (see self-review): they are NOT source-clean-therefore-OK.
-    k_soc_fair = [dict(k_soc[0], rules_secondary="If a tie, the 'Tie' market resolves Yes. If cancelled or rescheduled over two weeks away, the market resolves to a fair price."), k_soc[1]]
-    r_fair = settlement_identity(pm_soc, k_soc_fair, "sports")
-    assert r_fair["status"] == DIVERGENT and any("fallback" in s for s in r_fair["reasons"]), ("sports fair-vs-last void fallback -> DIVERGENT", r_fair["status"], r_fair["reasons"])
-
-    # 90-min (Kalshi regulation) vs extra-time/penalties (pmus extended) -> DIVERGENT
+    # 90-min (Kalshi regulation) vs extra-time/penalties (pmus extended) -> DIVERGENT (STRUCTURAL: the two
+    # venues settle a drawn-at-90 match to OPPOSITE winners). Soccer, so the timing dim IS scored.
     pm_ext = dict(pm_soc, description=pm_soc["description"].replace("full time (90 minutes plus stoppage time)", "the result including extra time and penalty shootout"))
     r = settlement_identity(pm_ext, k_soc, "sports")
     assert r["status"] == DIVERGENT and any("RESULT-TIMING" in s for s in r["reasons"]), ("sports 90min-vs-ET -> DIVERGENT", r)
 
-    # one venue SILENT on void -> NEEDS_MANUAL (the void tail is the #1 sports risk; never assume)
+    # one venue SILENT on void -> NEEDS_MANUAL (the void tail is the #1 sports risk; never assume / never TAIL it)
     k_silent = [dict(k_soc[0], rules_secondary="If the game ends in a tie, the 'Tie' market resolves to Yes."), k_soc[1]]  # no reschedule clause
     r = settlement_identity(pm_soc, k_silent, "sports")
     assert r["status"] == NEEDS_MANUAL and any("void" in s.lower() for s in r["reasons"]), ("sports one-venue-silent-on-void -> NEEDS_MANUAL", r)
 
-    # void WINDOW differs (Kalshi 2 days [MLB] vs pmus 2 weeks) -> DIVERGENT (the known MLB risk). Also a
-    # baseball "tie or draw -> settle $0.50" clause with only 2 marketSides must read as 2-way, NOT 3-way
-    # (regression: the prose word "draw" in a void clause was falsely tripping a 3-way signal in --audit).
+    # VOID WINDOW differs (Kalshi 2 days [MLB] vs pmus 2 weeks) -> TAIL with a QUANTIFIED cost (0010 void EV,
+    # ~0.26c MLB), NOT DIVERGENT (only a postponement replayed in the gap breaks the lock — a priceable tail).
+    # Also: a baseball "tie or draw -> settle $0.50" clause with only 2 marketSides must read 2-way (structure,
+    # not the prose word "draw"); and MLB has a DEFINITE result so the result-timing dim must be N/A (NOT a
+    # spurious NEEDS_MANUAL — the owner's bug report). The MLB pmus slug is aec- so void_haircut prices it.
     pm_mlb = {"slug": "aec-mlb-min-tex-2026-06-16",
               "marketSides": [{"team": {"name": "Minnesota"}}, {"team": {"name": "Texas"}}],
               "description": "baseball game Minnesota vs Texas on 2026-06-16. In the case of a tie or draw, the instrument will settle at $0.50. If postponed, remains open; if not rescheduled within two weeks, settle at last-traded prices."}
@@ -534,8 +644,36 @@ def _selftest():
               "yes_sub_title": "Texas"},
              {"ticker": "KXMLBGAME-26JUN16MINTEX-MIN", "yes_sub_title": "Minnesota", "rules_primary": "Minnesota leg"}]
     r = settlement_identity(pm_mlb, k_mlb, "sports")
-    assert r["status"] == DIVERGENT and any("WINDOW" in s for s in r["reasons"]), ("sports void-window 2d-vs-2wk -> DIVERGENT", r)
+    assert r["status"] == TAIL and any("VOID" in s for s in r["reasons"]), ("sports void-window 2d-vs-2wk -> TAIL", r["status"], r["reasons"])
+    assert abs(r["tail_cost_cents"] - 0.26) < 0.01, ("MLB void TAIL cost ~0.26c (0010 void EV)", r["tail_cost_cents"])
     assert r["dims"]["outcome_count"]["pm_3way"] is False, ("baseball 'tie->50-50' clause + 2 marketSides must be 2-way, not 3-way", r["dims"]["outcome_count"])
+    assert r["dims"]["result_timing"].get("applicable") is False, ("MLB result-timing must be N/A (definite-result sport), not scored", r["dims"]["result_timing"])
+    assert not any("result-timing" in s.lower() and ("silent" in s.lower() or "NEEDS_MANUAL" in s) for s in r["reasons"]), ("MLB must NOT emit a result-timing NEEDS_MANUAL", r["reasons"])
+
+    # OUTCOME-COUNT discovered-from-structure mismatch (one 2-way, the other 3-way) -> DIVERGENT (structural: a
+    # draw settles incompatibly). pmus has a 3rd settleable side (Draw in marketSides); Kalshi binds only 2 team
+    # legs (no Tie market) -> 2-way. Use a soccer slug so timing is also in scope but the count drives the verdict.
+    pm_3way_only = {"slug": "atc-fwc-bra-arg-2026-06-20-bra",
+                    "marketSides": [{"team": {"name": "Brazil"}}, {"team": {"name": "Argentina"}}, {"title": "Draw"}],
+                    "description": ("World Cup Brazil vs Argentina 2026-06-20, three outcomes. Determined at full time (90 minutes "
+                                    "plus stoppage). If not rescheduled within two weeks, settle at last-traded prices.")}
+    k_2way_only = [{"ticker": "KXWCGAME-26JUN20BRAARG-BRA", "yes_sub_title": "Brazil",
+                    "rules_primary": "If Brazil wins the Brazil vs Argentina game scheduled for Jun 20, 2026 after 90 minutes plus stoppage time, then Yes.",
+                    "rules_secondary": "If cancelled or rescheduled over two weeks away, the market resolves to the last-traded price."},
+                   {"ticker": "KXWCGAME-26JUN20BRAARG-ARG", "yes_sub_title": "Argentina", "rules_primary": "Argentina leg"}]
+    r = settlement_identity(pm_3way_only, k_2way_only, "sports")
+    assert r["status"] == DIVERGENT and any("OUTCOME-COUNT" in s for s in r["reasons"]), ("sports 2way-vs-3way discovered -> DIVERGENT", r["status"], r["dims"]["outcome_count"], r["reasons"])
+    assert r["dims"]["outcome_count"] == {"kalshi_3way": False, "pm_3way": True}, ("discovered counts", r["dims"]["outcome_count"])
+
+    # PRECEDENCE: one TAIL dim (void window) + every other dim IDENTICAL -> TAIL with the cost. The pm_mlb case
+    # above IS this end-to-end (event-date matches, outcome-count 2-way matches, timing N/A, only the void TAIL),
+    # proven by its `status == TAIL` + `tail_cost_cents ~ 0.26` asserts.
+    # PRECEDENCE: one TAIL dim (void window) + one NEEDS_MANUAL dim (event date unextractable) -> NEEDS_MANUAL
+    # (an unknown could itself be structural; resolve it before pricing the rest — NEEDS_MANUAL outranks TAIL).
+    pm_mlb_nodate = dict(pm_mlb, slug="aec-mlb-min-tex")    # no date in slug -> event-date dim unextractable
+    k_mlb_nodate = [dict(k_mlb[0], ticker="KXMLBGAME-MINTEX-TEX"), dict(k_mlb[1], ticker="KXMLBGAME-MINTEX-MIN")]
+    r = settlement_identity(pm_mlb_nodate, k_mlb_nodate, "sports")
+    assert r["status"] == NEEDS_MANUAL, ("precedence: TAIL + NEEDS_MANUAL -> NEEDS_MANUAL (unknown outranks tail)", r["status"], r["reasons"])
 
     # ---- ECON ----
     # pmus '>= 4.4' U-3 <-> Kalshi 'Above 4.3' (identical twin on the 0.1 grid), BLS both -> IDENTICAL
@@ -566,18 +704,21 @@ def _selftest():
     r = settlement_identity({"slug": "x"}, {}, "bogus-category")
     assert r["status"] == NEEDS_MANUAL, ("unknown category -> NEEDS_MANUAL", r)
 
-    print("OK - weather station/CLI/boundary; sports ESPN-vs-FIFA IDENTICAL (source ignored), timing/void-window/3way DIVERGENT, silent-void NEEDS_MANUAL; econ twin IDENTICAL / off-by-one DIVERGENT / <=-tail+unparseable NEEDS_MANUAL")
+    print("OK - weather station/boundary IDENTICAL, CLI-vs-METAR TAIL, CLI-vs-nonNWS DIVERGENT; "
+          "sports ESPN-vs-FIFA IDENTICAL (source ignored), void-window TAIL(~0.26c MLB), ET-timing & 2v3-way DIVERGENT, "
+          "silent-void NEEDS_MANUAL, MLB timing N/A (no spurious NEEDS_MANUAL), precedence TAIL+NEEDS_MANUAL->NEEDS_MANUAL; "
+          "econ twin IDENTICAL / off-by-one DIVERGENT / <=-tail+unparseable NEEDS_MANUAL")
 
 
 # =========================================================================================================
 # AUDIT — run the gate over the LIVE co-listed universe (every discovered pair gets checked).
 # =========================================================================================================
 def _decisive_reasons(r, n=2):
-    """Pick the reasons that DROVE the verdict for the example display: a DIVERGENT/NEEDS_MANUAL reason names
-    its dimension in CAPS or 'not ...' — surface those first so the example explains WHY (the void-window
-    DIVERGENT shouldn't be hidden behind an earlier 'timing silent' note)."""
+    """Pick the reasons that DROVE the verdict for the example display: a TAIL/DIVERGENT/NEEDS_MANUAL reason
+    names its dimension in CAPS or 'tail'/'not ...' — surface those first so the example explains WHY (the
+    void-window TAIL shouldn't be hidden behind an earlier 'timing silent' note)."""
     reasons = r.get("reasons", [])
-    decisive = [s for s in reasons if re.search(r"differs|DIFFERS|phantom|off by|not (?:extractable|provable|specifically|determinable|both-provable|resolvable|parseable)|silent|OPPOSITE|point bucket", s)]
+    decisive = [s for s in reasons if re.search(r"differs|DIFFERS|phantom|off by|tail|TAIL|not (?:extractable|provable|specifically|determinable|both-provable|resolvable|parseable)|silent|OPPOSITE|point bucket", s)]
     picked = decisive[:n] or reasons[:n]
     return picked
 
@@ -588,6 +729,7 @@ def _audit():
     pm_by_slug = {m.get("slug"): m for m in pm_catalog()}
     counts = collections.defaultdict(lambda: collections.Counter())
     examples = collections.defaultdict(list)
+    tail_costs = collections.defaultdict(list)   # (cat) -> [(tag, slug, cost_cents)] for the TAIL pairs
 
     for cat in ("weather", "sports", "econ"):
         for e in colisted.get(cat, []):
@@ -599,25 +741,35 @@ def _audit():
                     kalshi = kalshi_detail(e["kalshi"])
                 r = settlement_identity(pm, kalshi, cat)
             except Exception as ex:
-                r = {"status": NEEDS_MANUAL, "reasons": [f"audit fetch/eval error {ex!r}"], "dims": {}}
+                r = {"status": NEEDS_MANUAL, "tail_cost_cents": 0.0, "reasons": [f"audit fetch/eval error {ex!r}"], "dims": {}}
             counts[cat][r["status"]] += 1
+            tag = e.get("city") or e.get("league") or e.get("family") or "?"
+            if r["status"] == TAIL:
+                tail_costs[cat].append((tag, e["slug"], r.get("tail_cost_cents", 0.0)))
             if len(examples[(cat, r["status"])]) < 3:
-                tag = e.get("city") or e.get("league") or e.get("family") or "?"
-                examples[(cat, r["status"])].append((tag, e["slug"], _decisive_reasons(r)))
+                examples[(cat, r["status"])].append((tag, e["slug"], r.get("tail_cost_cents", 0.0), _decisive_reasons(r)))
 
-    print(f"{'category':10} {'IDENTICAL':>10} {'DIVERGENT':>10} {'NEEDS_MANUAL':>13}   total")
+    print(f"{'category':10} {'IDENTICAL':>10} {'TAIL':>8} {'DIVERGENT':>10} {'NEEDS_MANUAL':>13}   total")
     grand = collections.Counter()
     for cat in ("weather", "sports", "econ"):
         c = counts[cat]; grand.update(c)
         tot = sum(c.values())
-        print(f"{cat:10} {c[IDENTICAL]:>10} {c[DIVERGENT]:>10} {c[NEEDS_MANUAL]:>13}   {tot}")
-    print(f"{'TOTAL':10} {grand[IDENTICAL]:>10} {grand[DIVERGENT]:>10} {grand[NEEDS_MANUAL]:>13}   {sum(grand.values())}")
+        print(f"{cat:10} {c[IDENTICAL]:>10} {c[TAIL]:>8} {c[DIVERGENT]:>10} {c[NEEDS_MANUAL]:>13}   {tot}")
+    print(f"{'TOTAL':10} {grand[IDENTICAL]:>10} {grand[TAIL]:>8} {grand[DIVERGENT]:>10} {grand[NEEDS_MANUAL]:>13}   {sum(grand.values())}")
+
+    # TAIL pairs with their quantified ¢/contract cost (the priceable-but-tradeable set: edge must beat the cost)
+    if any(tail_costs.values()):
+        print("\nTAIL pairs (settlement differs only on a priceable tail — tradeable iff edge > cost):")
+        for cat in ("weather", "sports", "econ"):
+            for tag, slug, cost in tail_costs[cat]:
+                print(f"  [{cat}] {tag:6} {slug:50} tail_cost = {cost:.2f}c/contract")
 
     print("\nexample reasons by (category, status):")
     for (cat, status), exs in sorted(examples.items()):
         print(f"\n  [{cat} / {status}]")
-        for tag, slug, reasons in exs:
-            print(f"    {tag:6} {slug}")
+        for tag, slug, cost, reasons in exs:
+            costtag = f"  (tail {cost:.2f}c)" if status == TAIL else ""
+            print(f"    {tag:6} {slug}{costtag}")
             for rs in reasons:
                 print(f"        - {rs}")
 
@@ -625,7 +777,8 @@ def _audit():
         print(f"\n(universe: {rep['counts']['weather_pairs']} weather, {rep['counts']['sports_pairs']} sports, "
               f"{rep['counts']['econ_pairs']} econ co-listed pairs from build_colisted_map)")
     print("\nGATE SEMANTICS: IDENTICAL = every outcome-determining dimension provably matched (clean arb input). "
-          "DIVERGENT = a dimension provably differs (a 'locked' pair can lose BOTH legs — do NOT trade as an arb). "
+          "TAIL = differs only on a low-prob priceable tail (tail_cost_cents ¢/contract; tradeable iff edge > cost). "
+          "DIVERGENT = a dimension provably differs STRUCTURALLY (a 'locked' pair can lose BOTH legs — do NOT trade as an arb). "
           "NEEDS_MANUAL = something unextractable (default; read the rules + decide). A verdict gates; the bot sizes.")
 
 
