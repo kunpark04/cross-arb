@@ -102,11 +102,21 @@ VOID_LOSS_FRAC    = 0.5      # when the lock breaks the hedge is gone (coin-flip
                              # expected-shortfall charge ~half notional. ESTIMATE.
 SPORTS_VOID_RATE  = 0.005    # generic non-MLB sports void/walkover/no-contest divergence rate (esports abandonment,
                              # pre-match walkover). ESTIMATE - per-league rates are a TODO (0010).
+# World Cup (pmus slug prefix 'atc-fwc-'). Same void MECHANISM as aec- sports (Kalshi <=2wk fair-price vs pmus
+# <=2wk last-traded fallback diverge on an un-replayed game) but a FIRM ~4-week tournament schedule -> a much
+# lower postpone rate than MLB's rain-prone 162-game season. Conservative prior ~0.4% -> ~0.08c/contract; small
+# but NON-ZERO (modeling it 0 would let settlement_identity reach a degenerate 'TAIL' at 0c i.e. 'always
+# tradeable', defeating the gate — and the un-replayed-game fallback genuinely differs). ESTIMATE - tune w/ data.
+WC_POSTPONE_RATE  = 0.004
 
 def void_haircut(market, mult=1.0):
     """Expected per-contract settlement-void cost for a market (0 for weather; weather's void risk is the
-    CLI-revision path, handled separately). Sports: P(postpone & replayed-in-gap) * loss_fraction, MLB-weighted."""
+    CLI-revision path, handled separately). Sports (aec- moneyline / atc-fwc World Cup): P(postpone &
+    replayed-in-gap) * loss_fraction, league-weighted. A WC per-outcome binary is settlement-clean on
+    regulation; this prices only its postpone/void tail (firm tournament schedule -> low rate)."""
     m = str(market)
+    if m.startswith("atc-fwc-"):                  # World Cup soccer (per-outcome binary) -> low-rate postpone tail
+        return mult * WC_POSTPONE_RATE * P_GAP * VOID_LOSS_FRAC
     if not m.startswith("aec-"):                  # weather (tc-) / unknown -> no sports-void term
         return 0.0
     parts = m.split("-")
@@ -242,6 +252,11 @@ def _selftest():
     # C5: sports settlement-void haircut — MLB > other sports > 0 ; weather = 0 ; it reduces sports profit
     assert void_haircut("tc-temp-laxhigh-2026-06-09-gte73") == 0.0    # weather: no sports-void term
     assert void_haircut("aec-mlb-x-y-2026-06-10") > void_haircut("aec-atp-x-y-2026-06-10") > 0.0
+    # World Cup (atc-fwc-): small but NON-ZERO postpone tail (firm schedule -> below MLB, ~0.05-0.10c). Must be
+    # >0 so settlement_identity can reach TAIL (a 0c haircut would degenerate to 'always tradeable').
+    wc_c = void_haircut("atc-fwc-ger-cuw-2026-06-14-ger") * 100
+    assert 0.0 < wc_c < void_haircut("aec-mlb-x", 1.0) * 100, ("WC void 0<cost<MLB", wc_c)
+    assert 0.05 <= round(wc_c, 4) <= 0.10, ("WC void tail ~0.05-0.10c/contract", wc_c)
     _, _, _, pf_void = simulate(cap, 500, 0.0, 28)                    # MLB market WITH void term (default mult=1)
     assert abs(pf_void - 500 * (avg_edge - void_haircut("aec-mlb-x-y-2026-06-10"))) < 1e-9
     assert pf_void < profit, "void haircut must reduce the MLB sports profit"

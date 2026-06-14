@@ -58,7 +58,7 @@ Per-category outcome-determining dimensions (checked EXACTLY these):
 
 READ-ONLY, public APIs. A verdict is a GATE input, not a trade decision — the bot still decides size.
 """
-import os, sys, re, argparse, collections
+import os, sys, re, json, argparse, collections
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 sys.path.insert(0, os.path.dirname(__file__))                           # for capital_sim / cli_revisions (sibling scripts)
 from colisted_map import (get, build_colisted_map, pm_catalog, econ_parse, econ_twin, ECON, _FEDLBL,  # noqa: E402
@@ -423,18 +423,31 @@ def _void_fallback(text):
     return out
 
 
+def _pm_outcomes_list(pm_market):
+    """pmus `outcomes` as a LIST of strings. The LIVE API returns it as a JSON-encoded STRING ('["Yes","No"]'),
+    not a parsed list — iterating the raw value yields individual CHARACTERS (the L23 family: validate the raw
+    shape, don't assume). Tolerate both the JSON-string and already-parsed-list forms; [] if neither parses."""
+    o = pm_market.get("outcomes")
+    if isinstance(o, str):
+        try: o = json.loads(o)
+        except (ValueError, TypeError): return []
+    return [str(x).strip() for x in o if str(x).strip()] if isinstance(o, list) else []
+
+
 def _pm_settleable_sides(pm_market):
     """pmus DISTINCT settleable sides from STRUCTURE (L23: marketSides is authoritative, each side self-labels
-    its team/title). Fall back to `outcomes` length only when marketSides is absent. Returns an int count or
-    None if neither is determinable. A 'tie/draw -> settle 50-50' VOID clause is NOT a side here — it never
-    appears as a marketSides entry (baseball has 2 sides + a 50-50 void clause = 2-way)."""
+    its team/title). Fall back to `outcomes` length only when marketSides carries no labels. Returns an int count
+    or None if neither is determinable. A 'tie/draw -> settle 50-50' VOID clause is NOT a side here — it never
+    appears as a marketSides entry (baseball has 2 sides + a 50-50 void clause = 2-way). The DRAW outcome market
+    carries team:null + no side title, so it falls through to `outcomes` (["Yes","No"] = 2-way) — correct for the
+    per-outcome WC binary."""
     sides = [s for s in (pm_market.get("marketSides") or [])
              if (s.get("team") or {}).get("name") or s.get("title") or s.get("name")]
     if sides:
         return len({((s.get("team") or {}).get("name") or s.get("title") or s.get("name")).strip().lower() for s in sides})
-    outs = [o for o in (pm_market.get("outcomes") or []) if str(o).strip()]
+    outs = _pm_outcomes_list(pm_market)
     if outs:
-        return len({str(o).strip().lower() for o in outs})
+        return len({o.lower() for o in outs})
     return None
 
 
@@ -459,15 +472,20 @@ def _pm_three_way(pm_market):
 
 def _kalshi_three_way(markets):
     """Kalshi 3-way iff a distinct Tie/Draw market is bound (>=3 distinct outcome-markets, OR a Tie/Draw
-    yes_sub_title among them); 2 team legs -> 2-way; None -> undetermined (no bound market identifiable)."""
+    yes_sub_title bound ALONGSIDE >=1 other leg); 2 team legs -> 2-way; None -> undetermined (no bound market
+    identifiable). A SINGLE bound market is ONE binary outcome (the per-outcome WC model passes one ticker —
+    even the TIE leg is then just that outcome's binary, NOT evidence of a 3-way event): the tie-regex 3rd-side
+    inference requires >=2 markets so a lone 'Tie' ticker is not mis-read 3-way."""
     n = _kalshi_settleable_sides(markets)
     if n is None:
         return None
     if n >= 3:
         return True
-    subs = " ".join(str(m.get("yes_sub_title") or "").lower() for m in (markets or []) if m)
-    if re.search(r"\b(tie|draw)\b", subs):   # a Tie/Draw market bound alongside a team leg is the 3rd side
-        return True
+    ms = [m for m in (markets or []) if m]
+    if len(ms) >= 2:                              # a Tie/Draw market bound ALONGSIDE a team leg is the 3rd side
+        subs = " ".join(str(m.get("yes_sub_title") or "").lower() for m in ms)
+        if re.search(r"\b(tie|draw)\b", subs):
+            return True
     return False
 
 
@@ -675,6 +693,45 @@ def _selftest():
     r = settlement_identity(pm_mlb_nodate, k_mlb_nodate, "sports")
     assert r["status"] == NEEDS_MANUAL, ("precedence: TAIL + NEEDS_MANUAL -> NEEDS_MANUAL (unknown outranks tail)", r["status"], r["reasons"])
 
+    # WORLD CUP per-outcome BINARY pair (the new tradeable model): each outcome (teamA / teamB / draw<->TIE) is
+    # its OWN binary YES/NO on BOTH venues, joined 1:1 — so the gate reads it as 2-WAY-vs-2-WAY (NOT 3-way), and
+    # must reach TAIL (regulation timing matches both sides; the only residual is the void 2wk-window-with-
+    # different-fallback, now priced by the atc-fwc void_haircut ~0.08c). NOT a false DIVERGENT, NOT NEEDS_MANUAL,
+    # and (because the fallback differs) NOT a false IDENTICAL. pmus side = ONE outcome market (2 marketSides,
+    # both team Germany); Kalshi side = ONE outcome ticker (the GER leg). This is the per-outcome shape the
+    # colisted_map soccer3 branch emits (one record per outcome, single Kalshi ticker).
+    pm_wc_out = {"slug": "atc-fwc-ger-cuw-2026-06-14-ger",
+                 "marketSides": [{"description": "Yes", "long": True, "team": {"name": "Germany"}, "price": "0.94"},
+                                 {"description": "No", "long": False, "team": {"name": "Germany"}, "price": "0.07"}],
+                 "description": ("Will Germany win the World Cup game vs Curacao scheduled for 2026-06-14? The result is "
+                                 "determined at full time (90 minutes plus stoppage time). Settled per FIFA official result. "
+                                 "If postponed and not rescheduled within two weeks, settle at last-traded prices.")}
+    k_wc_out = {"ticker": "KXWCGAME-26JUN14GERCUW-GER", "yes_sub_title": "Germany",
+                "rules_primary": ("If Germany wins the Germany vs Curacao FIFA World Cup game scheduled for Jun 14, 2026 "
+                                  "after 90 minutes plus stoppage time (does not include extra time or penalties), then Yes. Result per ESPN."),
+                "rules_secondary": "If the game is cancelled or rescheduled to over two weeks away, the market resolves to a fair price."}
+    r = settlement_identity(pm_wc_out, k_wc_out, "sports")
+    assert r["status"] == TAIL, ("WC per-outcome binary -> TAIL (regulation matches; void-fallback tail)", r["status"], r["reasons"])
+    assert r["tail_cost_cents"] > 0, ("WC TAIL must carry the atc-fwc void cost (>0)", r["tail_cost_cents"])
+    assert abs(r["tail_cost_cents"] - 0.08) < 0.02, ("WC void tail ~0.08c/contract (atc-fwc void_haircut)", r["tail_cost_cents"])
+    assert r["dims"]["outcome_count"] == {"kalshi_3way": False, "pm_3way": False}, ("WC per-outcome pair reads 2-way-vs-2-way", r["dims"]["outcome_count"])
+    assert r["dims"]["result_timing"] == {"kalshi": "regulation", "pm": "regulation"}, ("WC both regulation (soccer timing scored)", r["dims"]["result_timing"])
+    # the DRAW outcome is binary too: team:null on both marketSides + no side title (identified ONLY by the -draw
+    # slug), so the gate's pmus-side count falls back to `outcomes`. CRITICAL live-shape regression: the pmus API
+    # returns `outcomes` as a JSON-encoded STRING, NOT a parsed list -- char-iterating it yields 9 distinct chars,
+    # mis-reading the draw leg as 3-way -> a false DIVERGENT on EVERY draw outcome (caught in the live --audit;
+    # L23 family). The fixture uses the STRING form to lock the parse fix; the draw reads 2-way and reaches TAIL.
+    pm_wc_draw = {"slug": "atc-fwc-ger-cuw-2026-06-14-draw",
+                  "outcomes": '["Yes","No"]', "outcomePrices": '["0.0500","0.96"]',   # LIVE shape: JSON-string, not a list
+                  "marketSides": [{"description": "Yes", "long": True, "team": None, "price": "0.05"},
+                                  {"description": "No", "long": False, "team": None, "price": "0.96"}],
+                  "description": pm_wc_out["description"].replace("Will Germany win", "Will the game end in a draw")}
+    k_wc_tie = {"ticker": "KXWCGAME-26JUN14GERCUW-TIE", "yes_sub_title": "Tie",
+                "rules_primary": k_wc_out["rules_primary"].replace("If Germany wins", "If the game ends in a tie"),
+                "rules_secondary": k_wc_out["rules_secondary"]}
+    r = settlement_identity(pm_wc_draw, k_wc_tie, "sports")
+    assert r["status"] == TAIL and r["dims"]["outcome_count"]["pm_3way"] is False, ("WC draw outcome -> binary TAIL", r["status"], r["dims"]["outcome_count"])
+
     # ---- ECON ----
     # pmus '>= 4.4' U-3 <-> Kalshi 'Above 4.3' (identical twin on the 0.1 grid), BLS both -> IDENTICAL
     pm_u3 = {"slug": "urc-us-seasonadj-gte-june-2026-07-02-atl4pt4",
@@ -706,7 +763,8 @@ def _selftest():
 
     print("OK - weather station/boundary IDENTICAL, CLI-vs-METAR TAIL, CLI-vs-nonNWS DIVERGENT; "
           "sports ESPN-vs-FIFA IDENTICAL (source ignored), void-window TAIL(~0.26c MLB), ET-timing & 2v3-way DIVERGENT, "
-          "silent-void NEEDS_MANUAL, MLB timing N/A (no spurious NEEDS_MANUAL), precedence TAIL+NEEDS_MANUAL->NEEDS_MANUAL; "
+          "silent-void NEEDS_MANUAL, MLB timing N/A (no spurious NEEDS_MANUAL), precedence TAIL+NEEDS_MANUAL->NEEDS_MANUAL, "
+          "WC per-outcome binary (team + draw) TAIL(~0.08c, 2-way-vs-2-way, regulation); "
           "econ twin IDENTICAL / off-by-one DIVERGENT / <=-tail+unparseable NEEDS_MANUAL")
 
 
@@ -731,15 +789,21 @@ def _audit():
     examples = collections.defaultdict(list)
     tail_costs = collections.defaultdict(list)   # (cat) -> [(tag, slug, cost_cents)] for the TAIL pairs
 
-    for cat in ("weather", "sports", "econ"):
+    for cat in ("weather", "sports", "soccer3", "econ"):
         for e in colisted.get(cat, []):
             pm = pm_by_slug.get(e["slug"], {"slug": e["slug"]})
             try:
                 if cat == "sports":
                     kalshi = [kalshi_detail(e["kalshi_a"]), kalshi_detail(e["kalshi_b"])]
+                    r = settlement_identity(pm, kalshi, "sports")
+                elif cat == "soccer3":
+                    # per-outcome WC pair is BINARY: ONE Kalshi outcome ticker, gated via the (single-market)
+                    # _sports path (2-way-vs-2-way) -> TAIL on the atc-fwc void tail (regulation timing matches).
+                    kalshi = kalshi_detail(e["kalshi"])
+                    r = settlement_identity(pm, kalshi, "sports")
                 else:
                     kalshi = kalshi_detail(e["kalshi"])
-                r = settlement_identity(pm, kalshi, cat)
+                    r = settlement_identity(pm, kalshi, cat)
             except Exception as ex:
                 r = {"status": NEEDS_MANUAL, "tail_cost_cents": 0.0, "reasons": [f"audit fetch/eval error {ex!r}"], "dims": {}}
             counts[cat][r["status"]] += 1
@@ -751,7 +815,7 @@ def _audit():
 
     print(f"{'category':10} {'IDENTICAL':>10} {'TAIL':>8} {'DIVERGENT':>10} {'NEEDS_MANUAL':>13}   total")
     grand = collections.Counter()
-    for cat in ("weather", "sports", "econ"):
+    for cat in ("weather", "sports", "soccer3", "econ"):
         c = counts[cat]; grand.update(c)
         tot = sum(c.values())
         print(f"{cat:10} {c[IDENTICAL]:>10} {c[TAIL]:>8} {c[DIVERGENT]:>10} {c[NEEDS_MANUAL]:>13}   {tot}")
@@ -760,7 +824,7 @@ def _audit():
     # TAIL pairs with their quantified ¢/contract cost (the priceable-but-tradeable set: edge must beat the cost)
     if any(tail_costs.values()):
         print("\nTAIL pairs (settlement differs only on a priceable tail — tradeable iff edge > cost):")
-        for cat in ("weather", "sports", "econ"):
+        for cat in ("weather", "sports", "soccer3", "econ"):
             for tag, slug, cost in tail_costs[cat]:
                 print(f"  [{cat}] {tag:6} {slug:50} tail_cost = {cost:.2f}c/contract")
 
@@ -775,6 +839,7 @@ def _audit():
 
     if rep["counts"]:
         print(f"\n(universe: {rep['counts']['weather_pairs']} weather, {rep['counts']['sports_pairs']} sports, "
+              f"{rep['counts'].get('soccer3_pairs', 0)} soccer3 (WC per-outcome), "
               f"{rep['counts']['econ_pairs']} econ co-listed pairs from build_colisted_map)")
     print("\nGATE SEMANTICS: IDENTICAL = every outcome-determining dimension provably matched (clean arb input). "
           "TAIL = differs only on a low-prob priceable tail (tail_cost_cents ¢/contract; tradeable iff edge > cost). "

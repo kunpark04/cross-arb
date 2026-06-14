@@ -36,6 +36,19 @@ LEAGUES = {"mlb": ("KXMLBGAME", "abbrev"), "wnba": ("KXWNBAGAME", "abbrev"), "nb
            "wta": ("KXWTAMATCH", "surname"), "itfm": ("KXITFMATCH", "surname"),
            "itfw": ("KXITFWMATCH", "surname"), "ufc": ("KXUFCFIGHT", "surname")}
 
+# SOCCER 3-way (kept SEPARATE from LEAGUES so the moneyline path above is untouched). A World Cup game is
+# NOT a 2-team complementary market: pmus lists each outcome as its OWN binary (atc-fwc-<a>-<b>-<date>-<a|b|draw>,
+# marketType="drawable_outcome") and so does Kalshi (KXWCGAME-...-<A>|-TIE|-<B>). So each outcome is a clean
+# binary co-listed pair — emitted as a PER-OUTCOME BINARY record, routed through the weather/econ 1:1 machinery
+# (buy YES cheap venue + NO dear venue; it locks regardless of the other two outcomes). Only `fwc` (live
+# match-winners) this build; `fifa`/`mls` (futures/offseason) deferred.
+SOCCER3 = {"fwc": ("KXWCGAME", "abbrev")}
+# pmus country-code -> Kalshi country-code, ONLY where they differ. 51/59 live WC games bind on the exact
+# abbrev join; these 3 remaps bind the other 8 (verified live 2026-06-13 by full team name + identical date:
+# pmus "IR Iran"==Kalshi "IR Iran" etc). The bel/egy/jor/mar partners in those 8 games are EXACT on Kalshi
+# (self-mapping), so they need no entry. NO fuzzy 3-letter matching — an explicit table keeps L1 (no false join).
+SOCCER_CC_ALIAS = {"irn": "iri", "alg": "dza", "hai": "hti"}
+
 UA = {"User-Agent": "cross-arb/1.0", "Accept": "application/json"}
 MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 PM_CATALOG_CAP = 25000   # safety cap on catalog pagination; hitting it = TRUNCATED coverage (warn loudly).
@@ -87,6 +100,20 @@ def pm_lo(s):
     m = re.search(r"-lt(\d+)f", s); m2 = re.search(r"gte(\d+)", s)
     return (int(m.group(1)) - 100) if m else (int(m2.group(1)) if m2 else 0)
 def pmlg(s): p = str(s).split("-"); return p[1] if len(p) > 1 else "?"
+def pm_yes_price(m):
+    """pmus YES touch price (float) from the SELF-LABELING marketSides — the side with description=="Yes",
+    NEVER outcomePrices[0] (the flat arrays are No-first on some markets; pairing by index is the L23 trap
+    that manufactured phantom divergences). Returns None if no Yes side / unparseable."""
+    for s in (m.get("marketSides") or []):
+        if str(s.get("description", "")).strip().lower() == "yes":
+            try: return float(s.get("price"))
+            except (TypeError, ValueError): return None
+    return None
+def soc_parts(slug):
+    """atc-fwc-<a>-<b>-<YYYY>-<MM>-<DD>-<outcome> -> (a, b, date, outcome) or None. outcome in {a, b, 'draw'}."""
+    p = str(slug).split("-")
+    if len(p) < 8 or p[0] != "atc" or p[1] != "fwc": return None
+    return (p[2], p[3], "-".join(p[4:7]), p[-1])
 
 # --- WEATHER bucket boundary equality. The settlement-identity guard: pair pm[i] with kalshi[i] ONLY when
 #     their (floor, cap) boundary NUMBERS are identical, never by sorted-index alone. The pm SLUG encodes the
@@ -138,6 +165,28 @@ def _match_game(pl, kA, kB, join):
     mA = next((s for s in ks if (s == kA if join == "abbrev" else smatch(s, kA))), None)
     mB = next((s for s in ks if (s == kB if join == "abbrev" else smatch(s, kB))), None)
     return (pl, mA, mB) if (mA and mB and mA != mB) else None
+def soccer3_emit(pm_soc, kbydate, league, join, used=None):
+    """Pure (offline-testable) core of the WC soccer-3way bind. pm_soc: {(a,b,date): {outcome_token: pm_market}}.
+    kbydate: {date: [ {suffix: ticker}, ... ]} (Kalshi KXWCGAME events). For each game with all 3 sibling
+    outcome slugs, bind the GAME (pick_game + country-code alias) then emit ONE PER-OUTCOME BINARY record per
+    outcome (team A / team B / draw<->TIE) — each carries a SINGLE Kalshi ticker (binary 1:1, like weather/econ),
+    void_clean=False + settle_basis='regulation'. Returns the list of records. NO fuzzy matching (L1)."""
+    out = []
+    if used is None: used = set()
+    for (a, b, date), outs in sorted(pm_soc.items()):
+        if not all(t in outs for t in (a, b, "draw")): continue
+        kA, kB = SOCCER_CC_ALIAS.get(a, a), SOCCER_CC_ALIAS.get(b, b)
+        found = pick_game(kbydate, kA, kB, join, date, slug_dated=True, used=used)
+        if not found: continue
+        pl, mA, mB = found
+        if "tie" not in pl: continue
+        for tok, ktk in ((a, pl[mA]), (b, pl[mB]), ("draw", pl["tie"])):
+            pm_mkt = outs[tok]
+            out.append({"cat": "soccer3", "league": league, "date": date, "slug": str(pm_mkt.get("slug")),
+                        "kalshi": ktk, "outcome": ("draw" if tok == "draw" else "team"),
+                        "team": (None if tok == "draw" else tok), "void_clean": False,
+                        "settle_basis": "regulation", "game": f"{a}-{b}-{date}"})
+    return out
 def pick_game(kbydate, kA, kB, join, date, slug_dated, used=None):
     """Bind a pm game to its Kalshi event. The pm SLUG date (ET) == the Kalshi ticker date, so an EXACT-date
     match is correct and kills the adjacent-series wrong-game mispair. The +/-1-day window is used ONLY as a
@@ -278,7 +327,7 @@ def build_colisted_map():
     DEGRADED (missing markets are fetch failures, not settlements; the monitor must not prune on it)."""
     errs = []
     allm = pm_catalog(errs=errs)
-    weather, sports, bucket_misaligned = [], [], []   # bucket_misaligned: pm buckets w/o an identical-bounds twin
+    weather, sports, soccer, bucket_misaligned = [], [], [], []   # bucket_misaligned: pm buckets w/o an identical-bounds twin
 
     # ---- WEATHER (pm slug <-> kalshi ticker, 1:1 per bucket, joined on IDENTICAL canonical bounds) ----
     clim = [m for m in allm if m.get("category") == "climate"]
@@ -341,6 +390,29 @@ def build_colisted_map():
                            "kalshi_a": pl[mA], "kalshi_b": pl[mB], "void_clean": False,
                            "teamA": (lo.get("team") or {}).get("name"), "teamB": (ot.get("team") or {}).get("name")})
 
+    # ---- SOCCER 3-way (World Cup): each of the 3 outcomes is its OWN binary on BOTH venues -> emit each as a
+    #      PER-OUTCOME BINARY record (NOT a 2-team complementary game). pmus is 3 sibling slugs grouped per
+    #      (a,b,date); Kalshi is the KXWCGAME event's 3 tickers (team A/B + TIE). Reuses pick_game/_match_game
+    #      for the GAME bind (+ a country-code alias for the 8/59 code-convention mismatches). ----
+    pm_soc = collections.defaultdict(dict)            # (a,b,date) -> {outcome_token: pm_market}
+    for x in allm:
+        if x.get("category") != "sports" or x.get("marketType") != "drawable_outcome": continue
+        sp = soc_parts(x.get("slug"))
+        if sp: pm_soc[(sp[0], sp[1], sp[2])][sp[3]] = x
+    pm_soc_leagues = {"fwc"} if pm_soc else set()     # only fwc is discovered (slug seg1=='fwc'); report coverage
+    for L, (series, join) in SOCCER3.items():
+        if not pm_soc: continue
+        kd = get(f"{KAL}?series_ticker={series}&status=open&limit=1000", errs=errs); time.sleep(0.3)
+        byev, evd = collections.defaultdict(dict), {}
+        for m in kd.get("markets", []):
+            ev = m.get("event_ticker"); tk = str(m.get("ticker", ""))
+            key = tk.split("-")[-1].lower()           # WC suffix is the country code or 'tie' (always abbrev)
+            dm = re.search(r"-(\d{2}[A-Z]{3}\d{2})", tk); evd[ev] = ktok_iso(dm.group(1)) if dm else None
+            if key: byev[ev][key] = tk
+        kbydate = collections.defaultdict(list)
+        for ev, pl in byev.items(): kbydate[evd.get(ev)].append(pl)
+        soccer += soccer3_emit(pm_soc, kbydate, L, join)   # single source of truth (also offline-tested)
+
     # ---- ECON (macro): pmus '>=T' <-> the IDENTICAL Kalshi 'Above T-step' twin + Fed categorical (0013) ----
     econ, econ_flags = econ_colisted(allm, errs=errs)
     pm_macro_fams = {str(m.get("slug", "")).split("-")[0] for m in allm if m.get("category") == "macro"}
@@ -350,14 +422,17 @@ def build_colisted_map():
         "weather_cities_UNMAPPED": sorted(c for c in pm_cities if c not in WX),
         "sports_leagues_mapped": sorted(l for l in pm_leagues if l in LEAGUES),
         "sports_leagues_UNMAPPED": sorted(l for l in pm_leagues if l not in LEAGUES),
+        "soccer3_leagues_mapped": sorted(l for l in pm_soc_leagues if l in SOCCER3),
+        "soccer3_leagues_UNMAPPED": sorted(l for l in pm_soc_leagues if l not in SOCCER3),
         "weather_bucket_MISALIGNED": bucket_misaligned,   # pm buckets w/o an identical-bounds Kalshi twin (NOT paired)
         "econ_families_mapped": sorted(f for f in pm_macro_fams if f in ECON),
         "econ_families_UNMAPPED": sorted(f for f in pm_macro_fams if f not in ECON),
         "econ_SKIPPED": econ_flags,                       # <=tails (opposite orient) + point-buckets + no listed twin
         "fetch_errors": errs,                             # non-empty = DEGRADED discovery pass (do NOT prune on it)
-        "counts": {"weather_pairs": len(weather), "sports_pairs": len(sports), "econ_pairs": len(econ)},
+        "counts": {"weather_pairs": len(weather), "sports_pairs": len(sports),
+                   "soccer3_pairs": len(soccer), "econ_pairs": len(econ)},
     }
-    return {"weather": weather, "sports": sports, "econ": econ}, report
+    return {"weather": weather, "sports": sports, "soccer3": soccer, "econ": econ}, report
 
 def weather_monitor_map(colisted):
     """The 1:1 {slug: ticker} dict the current monitor consumes (weather subset; sports needs the
@@ -434,7 +509,50 @@ def _selftest():
     # pmus '>=4.4' == Kalshi 'Above 4.3' on the 0.1 grid; '>=250k' == 'Above 249k' on the 1000 grid.
     assert econ_twin(4.4, ECON["urc"][2]) == 4.3 and econ_twin(250000.0, ECON["nfpc"][2]) == 249000.0
     assert econ_twin(2.0, ECON["gdpc"][2]) == 1.9 and econ_twin(4.0, ECON["urc"][2]) == 3.9   # float-safe rounding
-    print("OK - helpers, smatch L1-collision rejection, C4 bounds-dict join, C2 exact-date + doubleheader binding, econ twin/year parse")
+    # --- SOCCER 3-way (World Cup): per-outcome BINARY emission, alias join, L23 YES-read, no false join ---
+    # slug + YES-read helpers
+    assert soc_parts("atc-fwc-ger-cuw-2026-06-14-ger") == ("ger", "cuw", "2026-06-14", "ger")
+    assert soc_parts("atc-fwc-ger-cuw-2026-06-14-draw")[3] == "draw"
+    assert soc_parts("aec-mlb-min-tex-2026-06-16") is None and soc_parts("tc-temp-x-2026-06-09-gte64") is None
+    # L23: YES price is the marketSides description=="Yes" entry, NOT outcomePrices[0]. The -ger market is
+    # No-FIRST in the flat arrays (outcomes ["No","Yes"], outcomePrices[0] is the NO price), so a naive index
+    # read would take the wrong leg; the self-labeling read must still return the Yes side's price.
+    ger_mkt = {"slug": "atc-fwc-ger-cuw-2026-06-14-ger", "outcomes": ["No", "Yes"], "outcomePrices": ["0.9400", "0.07"],
+               "marketSides": [{"description": "Yes", "long": True, "team": {"abbreviation": "ger"}, "price": "0.9400"},
+                               {"description": "No", "long": False, "team": {"abbreviation": "ger"}, "price": "0.07"}]}
+    draw_mkt = {"slug": "atc-fwc-ger-cuw-2026-06-14-draw", "outcomes": ["Yes", "No"], "outcomePrices": ["0.0500", "0.96"],
+                "marketSides": [{"description": "Yes", "long": True, "team": None, "price": "0.0500"},
+                                {"description": "No", "long": False, "team": None, "price": "0.96"}]}
+    assert pm_yes_price(ger_mkt) == 0.94, "L23: YES read must be marketSides Yes side (0.94), not outcomePrices[0]"
+    assert pm_yes_price(draw_mkt) == 0.05 and pm_yes_price({"marketSides": []}) is None
+    # END-TO-END soccer3_emit: 3 sibling pmus slugs (one GAME) -> exactly 3 PER-OUTCOME BINARY records, each
+    # with ONE Kalshi ticker; draw maps to the event TIE ticker. Kalshi event dict {suffix: ticker} as built
+    # by the discovery loop.
+    pm_gc = {("ger", "cuw", "2026-06-14"): {"ger": ger_mkt, "cuw": {"slug": "atc-fwc-ger-cuw-2026-06-14-cuw"}, "draw": draw_mkt}}
+    ev_gc = {"ger": "KXWCGAME-26JUN14GERCUW-GER", "cuw": "KXWCGAME-26JUN14GERCUW-CUW", "tie": "KXWCGAME-26JUN14GERCUW-TIE"}
+    recs = soccer3_emit(pm_gc, {"2026-06-14": [ev_gc]}, "fwc", "abbrev")
+    assert len(recs) == 3, ("3 siblings -> 3 per-outcome binary records", recs)
+    assert all(isinstance(r["kalshi"], str) and "kalshi_b" not in r for r in recs), "each record is BINARY (one Kalshi ticker, no kalshi_b)"
+    by_out = {(r["outcome"], r["team"]): r["kalshi"] for r in recs}
+    assert by_out[("team", "ger")] == "KXWCGAME-26JUN14GERCUW-GER"
+    assert by_out[("team", "cuw")] == "KXWCGAME-26JUN14GERCUW-CUW"
+    assert by_out[("draw", None)] == "KXWCGAME-26JUN14GERCUW-TIE", "draw <-> TIE"
+    assert all(r["cat"] == "soccer3" and r["void_clean"] is False and r["settle_basis"] == "regulation" for r in recs)
+    # ALIAS join: pmus 'irn'/'nzl' must bind Kalshi event ...IRINZL (irn->iri), NOT fail. No fuzzy matching.
+    pm_in = {("irn", "nzl", "2026-06-15"): {"irn": {"slug": "atc-fwc-irn-nzl-2026-06-15-irn"},
+             "nzl": {"slug": "atc-fwc-irn-nzl-2026-06-15-nzl"}, "draw": {"slug": "atc-fwc-irn-nzl-2026-06-15-draw"}}}
+    ev_in = {"iri": "KXWCGAME-26JUN15IRINZL-IRI", "nzl": "KXWCGAME-26JUN15IRINZL-NZL", "tie": "KXWCGAME-26JUN15IRINZL-TIE"}
+    recs_in = soccer3_emit(pm_in, {"2026-06-15": [ev_in]}, "fwc", "abbrev")
+    assert len(recs_in) == 3 and any(r["kalshi"] == "KXWCGAME-26JUN15IRINZL-IRI" for r in recs_in), ("alias irn->iri binds", recs_in)
+    # NO FALSE JOIN: an unknown code that is neither exact nor aliased to a Kalshi suffix must emit NOTHING
+    # (pick_game refuses; no fuzzy fallback, L1) — never a phantom pair.
+    pm_bad = {("xxx", "nzl", "2026-06-15"): {"xxx": {"slug": "s-xxx"}, "nzl": {"slug": "s-nzl"}, "draw": {"slug": "s-draw"}}}
+    assert soccer3_emit(pm_bad, {"2026-06-15": [ev_in]}, "fwc", "abbrev") == [], "no false join on an unknown code"
+    # incomplete game (only 2 of 3 sibling outcomes) -> emit nothing (need all 3)
+    pm_partial = {("ger", "cuw", "2026-06-14"): {"ger": ger_mkt, "cuw": {"slug": "x"}}}   # no draw
+    assert soccer3_emit(pm_partial, {"2026-06-14": [ev_gc]}, "fwc", "abbrev") == [], "incomplete game (no draw sibling) -> skip"
+    print("OK - helpers, smatch L1-collision rejection, C4 bounds-dict join, C2 exact-date + doubleheader binding, "
+          "econ twin/year parse, soccer3 per-outcome/L23-YES/alias-join/no-false-join")
 
 
 if __name__ == "__main__":
@@ -442,9 +560,16 @@ if __name__ == "__main__":
         _selftest(); sys.exit(0)
     print("full co-listed discovery (read-only)...\n")
     colisted, rep = build_colisted_map()
-    print(f"weather pairs: {rep['counts']['weather_pairs']}   sports pairs: {rep['counts']['sports_pairs']}   econ pairs: {rep['counts']['econ_pairs']}\n")
+    print(f"weather pairs: {rep['counts']['weather_pairs']}   sports pairs: {rep['counts']['sports_pairs']}   "
+          f"soccer3 pairs: {rep['counts']['soccer3_pairs']}   econ pairs: {rep['counts']['econ_pairs']}\n")
     print(f"weather cities mapped:   {rep['weather_cities_mapped']}")
     print(f"sports leagues mapped:   {rep['sports_leagues_mapped']}")
+    print(f"soccer3 leagues mapped:  {rep['soccer3_leagues_mapped']}")
+    if colisted["soccer3"]:
+        gms = sorted({e["game"] for e in colisted["soccer3"]})
+        print(f"  soccer3 games: {len(gms)}  outcomes(records): {len(colisted['soccer3'])}  (3 per-outcome binaries/game)")
+        for e in colisted["soccer3"][:6]:
+            print(f"    {e['outcome']:4} {e['slug']} <-> {e['kalshi']}")
     print(f"econ families mapped:    {rep['econ_families_mapped']}   (skipped: {rep['econ_SKIPPED']})")
     if colisted["econ"]:
         print("  econ pairs (sample):")
