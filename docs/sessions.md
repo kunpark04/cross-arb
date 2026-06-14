@@ -6,6 +6,27 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 (cont. 6) — ENGINE REFACTOR: hot-path time-complexity + split the 2970-line main.rs monolith
+
+Owner: "complete refactor of the engine + related parts; minimize time complexity." Scope (owner-chosen):
+surgical hot-path wins + split the monolith, **ZERO behavior change** (147 tests + every invariant held).
+Caveat surfaced: execution is network-bound (~86–261 ms RTT) so this buys CPU/allocation efficiency + clean
+scaling + maintainability, **not faster fills**; the `discovery` join was already pre-indexed O(P+K) (not a target).
+
+- **Phase 1 — complexity wins (`51c4e9a`):** `book.rs` `PmusBook` now keeps its ladders PRE-SORTED at apply
+  time → `best()` O(n)→**O(1)** (front element, closes the pmus-vs-Kalshi asymmetry), ladder reads drop the
+  per-frame clone+sort (O(n log n)→O(n)). `signal.rs` `signal`/`game_signal` drop the per-call `opts` Vec
+  (fixed `Option` locals). `main.rs` hot loop: non-allocating freshness check + `by_slug` behind
+  `Arc<LivePair>` (per-frame `.cloned()` = refcount bump, not a deep multi-String clone). Numerics bit-identical.
+- **Phase 2 — monolith split (`5e27e85`):** `main.rs` **2970→142 lines** → 7 focused modules (`pair`/`pricing`/
+  `bookkeeping`/`refresh`/`smoke`/`live` + cfg-test `test_support`); pure mechanical relocation, all moved items
+  `pub(crate)` (incl. cross-module struct fields). Delegated to the coding-agent against hard gates, then
+  **independently re-verified**: `cargo test` 147/0, clippy clean, `--smoke` program output byte-identical, only
+  `main.rs` modified + the 7 new files (other 13 modules + Cargo.toml byte-untouched). W-1 FlatKind branch
+  verbatim. Bus: `tasks/_agent_bus/20260614-mainrs-split/`.
+
+---
+
 ## 2026-06-14 (cont. 5) — SCALE-IN + RE-ENTRY built into the live bot (multi-position-per-slug, owner-directed)
 
 Owner: "build both … to the live" — scale-in (pile onto a still-live edge) + re-entry (a new arb on a held
