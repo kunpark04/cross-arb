@@ -6,6 +6,35 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 — World Cup tradeable (live, dry-run): per-outcome BINARY arbs, not a 3-leg basket
+
+Owner directive: make the FIFA World Cup (the coverage audit's one real untracked block, ~60 games, +34%)
+tradeable live. Plan-mode → approved → built in 2 committed chunks (`17ab0ea` Python, `e50ecbb` bot-rs).
+
+- **The model (the key win):** a WC game is NOT a 3-way basket — pmus + Kalshi each list the 3 outcomes
+  (teamA / draw / teamB) as **separate binary YES/NO markets**. So each outcome is a clean binary co-listed
+  pair = exactly the weather/econ 1:1 model (buy YES cheap venue + NO dear venue; locks regardless of the
+  other outcomes — the **same pattern weather buckets** already use). So WC **reuses the bot's 2-leg core
+  entirely** — `build_legs`/`exec`/`unwind`/`Position`/`game_signal` UNTOUCHED; the only changes are discovery
+  + a routing marker. Far lower-risk than a basket (which would need 3-leg exec + naked-pair recovery — deferred).
+- **Discovery** (`colisted_map.py` + `discovery.rs`): a soccer-3way branch — filter pmus `drawable_outcome`
+  `atc-fwc`, group the 3 sibling slugs/game, bind via `pick_game` (exact-date + doubleheader guard) + a
+  3-entry country-code alias (`irn→iri`/`alg→dza`/`hai→hti`; binds 59/59 = 51 exact + 8 alias, 0 false), map
+  `-draw`↔`-TIE`, emit each outcome as a **per-outcome binary `Pair`** (`kalshi_b=None`, soccer marker). L23
+  YES-read (marketSides `description=="Yes"`; pmus `outcomes` is a JSON STRING). **Join differential-verified
+  byte-identical Python↔Rust.**
+- **Routing**: a WC pair (`kalshi_b=None`) **structurally** takes the binary `signal` arm — no routing-logic
+  change. `Cat::Sports` reused (correct lock-days); `track_position` skips the MLB postpone poll for WC.
+- **Settlement**: both venues settle on **REGULATION** (90 min, excl. ET/penalties), 2-week window — the only
+  residual is the void fallback (fair-price vs last-traded) = a priceable **TAIL** ([0018]). `void_haircut`
+  extended for `atc-fwc` (0.08¢); the gate verdicts all **174 WC outcome pairs → TAIL** (0 DIVERGENT).
+- **Verified**: bot-rs **135 tests** (was 128), `selftest_all` 20/20, clippy clean; smoke fires a WC arb
+  `Pmus YES + Kalshi NO on the SAME outcome` (the 1:1 lock). Self-reviews PROCEED (0 CRITICAL).
+- **Still open**: WC in the monitor (research persistence, gated redeploy); arming WC past dry-run = owner
+  gated (independent review + demo, 0006); the cross-venue 3-leg Dutch book (optional, deferred).
+
+---
+
 ## 2026-06-13 (cont.) — Breadth audit + cap fix, velocity-gate enable, $250/$250 backtest, settlement-identity GATE (0018)
 
 Continued from the edge-RATE work below. Owner pushed on breadth ("100% more arbs out there") + meticulous
