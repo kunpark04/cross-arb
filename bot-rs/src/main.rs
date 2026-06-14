@@ -207,6 +207,19 @@ enum SubmitKind {
     Recovery,
 }
 
+/// WHAT holds a slug's in-flight `flattening` slot (W-1). The bare `HashSet<slug>` couldn't distinguish a
+/// RECOVERY (the single-leg flatten of THIS slug's one naked leg) from an UNWIND (a postpone flatten that
+/// targets only the FRONT held leg `legs[0]`). That conflation let an unwind-held slot make a concurrently
+/// half-filled ADD's recovery short-circuit as "already covered" — but the unwind does NOT cover the add's
+/// just-naked leg, so the add leg was silently abandoned. Recording the kind lets `recover_naked_leg` treat
+/// ONLY a recovery-held slot as covering this naked leg; an unwind-held slot fails CLOSED (halt). Both kinds
+/// still de-dup a second concurrent flatten on the slug (the slot-occupied check is kind-agnostic).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FlatKind {
+    Recovery,
+    Unwind,
+}
+
 /// The result of a SPAWNED `submit_pair`, sent back to the event loop so ALL position/exposure bookkeeping
 /// happens on the loop's own turn (never on the network task). Decouples the two-leg RTT from the
 /// `select!` so the unwind arm stays hot while an entry is in flight (concurrency-core fix C4/C5/W14/W16).
@@ -293,10 +306,12 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
     let positions: Arc<Mutex<HashMap<String, postpone::SlugPositions>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // IN-FLIGHT de-dup (C5): a slug with a SPAWNED-but-unacked entry is in `pending_entries`; a slug with a
-    // spawned-but-unacked unwind is in `flattening`. The loop refuses a second entry/unwind for a slug
-    // already in-flight, so a burst of frames (or the poll's per-cycle re-emit) can't double-fire.
+    // spawned-but-unacked flatten (unwind OR recovery) is a key in `flattening`, mapped to WHICH kind holds
+    // it (W-1). The loop refuses a second entry/unwind for a slug already in-flight, so a burst of frames (or
+    // the poll's per-cycle re-emit) can't double-fire; the recorded kind lets recovery tell an unwind-held
+    // slot (which doesn't cover a freshly-naked add leg) apart from a recovery-held one.
     let mut pending_entries: HashSet<String> = HashSet::new();
-    let mut flattening: HashSet<String> = HashSet::new();
+    let mut flattening: HashMap<String, FlatKind> = HashMap::new();
 
     // SCALE-IN vs RE-ENTRY proxy (design §3): a slug is in `edge_live` while a same-direction qualifying arb
     // is currently present on it (inserted/removed each frame, below). At ADD time `edge_live.contains(slug)`
@@ -536,7 +551,7 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
         // cap=1 — `qualifying_add` ALWAYS returns None for a held slug => `continue`, i.e. today's behavior).
         if halt.load(Ordering::Relaxed)
             || pending_entries.contains(&slug)
-            || flattening.contains(&slug)
+            || flattening.contains_key(&slug)
         {
             continue;
         }
@@ -787,7 +802,7 @@ fn apply_outcome(
     pmus_books: &std::collections::HashMap<String, book::PmusBook>,
     exposure: &mut Exposure,
     pending_entries: &mut std::collections::HashSet<String>,
-    flattening: &mut std::collections::HashSet<String>,
+    flattening: &mut std::collections::HashMap<String, FlatKind>,
     outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
     halt: &std::sync::atomic::AtomicBool,
     out: SubmitOutcome,
@@ -906,7 +921,7 @@ fn recover_naked_leg(
     backend: &std::sync::Arc<dyn ExecutionBackend>,
     kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
     pmus_books: &std::collections::HashMap<String, book::PmusBook>,
-    flattening: &mut std::collections::HashSet<String>,
+    flattening: &mut std::collections::HashMap<String, FlatKind>,
     outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
     slug: &str,
     ack: &exec::PairAck,
@@ -921,9 +936,18 @@ fn recover_naked_leg(
     let filled_leg = &pos.legs[filled_idx];
     let resting_ack = if resting_idx == 0 { &ack.a } else { &ack.b };
 
-    // already flattening this slug (a prior recovery / unwind in flight) -> don't double-fire.
-    if flattening.contains(slug) {
-        return true; // recovery is already underway; treat as launched (not a halt)
+    // W-1: the slug's flatten slot is occupied — by WHAT decides whether this naked leg is covered.
+    //   * Recovery: a prior recovery for THIS slug's naked leg is already in flight -> genuinely covered ->
+    //     return true (don't double-fire; the in-flight recovery flattens it).
+    //   * Unwind: a postpone-unwind holds the slot, but it targets only the FRONT held leg (`legs[0]`), NOT
+    //     this freshly-naked add leg. Treating it as "covered" would ABANDON the add leg silently (the W-1
+    //     bug). FAIL CLOSED: return false so the caller engages the halt and the unhedged leg surfaces for a
+    //     manual flatten. (We can't safely fire a second flatten here either — `flattening` is per-slug and a
+    //     second SELL would race the unwind's pop of legs[0]; halt is the correct fail-safe.)
+    match flattening.get(slug) {
+        Some(FlatKind::Recovery) => return true, // this naked leg's recovery is already underway
+        Some(FlatKind::Unwind) => return false,  // unwind covers a DIFFERENT leg -> NOT covered -> caller halts
+        None => {}                               // slot free -> fire the recovery below
     }
 
     // PRICE the filled leg's marketable SELL from its LIVE book. Unpriceable (one-sided book / no book) ->
@@ -969,7 +993,7 @@ fn recover_naked_leg(
          (cancel resting leg + SELL {:?} {:?} {}x @ {}c to flatten). No hedge recorded.",
         sell.venue, sell.side, sell.qty, sell.price_cents
     );
-    flattening.insert(slug.to_string());
+    flattening.insert(slug.to_string(), FlatKind::Recovery);
     spawn_flatten(backend, outcome_tx, slug.to_string(), sell);
     true
 }
@@ -1048,12 +1072,12 @@ fn spawn_unwind(
     positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
     kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
     pmus_books: &std::collections::HashMap<String, book::PmusBook>,
-    flattening: &mut std::collections::HashSet<String>,
+    flattening: &mut std::collections::HashMap<String, FlatKind>,
     outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
     slug: &str,
 ) {
-    if flattening.contains(slug) {
-        return; // a flatten for this slug is already in flight -> don't double-fire (C5)
+    if flattening.contains_key(slug) {
+        return; // a flatten (unwind OR recovery) for this slug is already in flight -> don't double-fire (C5)
     }
     // the FRONT held leg on this slug (one-at-a-time, §1.5). `None`/empty -> already flattened / gone.
     let front = lock(positions).get(slug).and_then(|sp| sp.legs.first().cloned());
@@ -1071,7 +1095,7 @@ fn spawn_unwind(
         return; // not marked flattening -> the poll's re-emit retries once a book is two-sided
     };
     let orders = unwind::unwind_orders(&front.pos, exits);
-    flattening.insert(slug.to_string());
+    flattening.insert(slug.to_string(), FlatKind::Unwind);
     // carry the front leg's pos + cost_per so the outcome arm subtracts EXACTLY this leg (defensive; the arm
     // pops the front and uses the popped leg's OWN stored cost_per — the exact-release guarantee).
     spawn_submit(backend, outcome_tx, SubmitKind::Unwind, slug.to_string(), orders, Some(front.pos), None, front.cost_per, 0.0, Dir::PK);
@@ -2241,7 +2265,7 @@ mod tests {
         pmus_books: &std::collections::HashMap<String, book::PmusBook>,
         exp: &mut Exposure,
         pending: &mut std::collections::HashSet<String>,
-        flat: &mut std::collections::HashSet<String>,
+        flat: &mut std::collections::HashMap<String, FlatKind>,
         halt: &AtomicBool,
         out: SubmitOutcome,
     ) -> tokio::sync::mpsc::UnboundedReceiver<SubmitOutcome> {
@@ -2265,7 +2289,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair();
         let slug = pos.market.clone();
@@ -2290,7 +2314,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair();
         let slug = pos.market.clone();
@@ -2314,7 +2338,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair();
         let slug = pos.market.clone();
@@ -2342,19 +2366,19 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair();
         let slug = pos.market.clone();
         // an open, recorded position with its reservation, now mid-flatten.
         reserve_exposure(&mut exp, &pos, cp);
         track_position(&positions, &pair, pos, cp, 0.03, Dir::PK);
-        flat.insert(slug.clone());
+        flat.insert(slug.clone(), FlatKind::Unwind);
         let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("u0"), b: sim_ack("u1") }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(!positions.lock().unwrap().contains_key(&slug), "position removed on flatten");
         assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "exposure decremented on flatten");
-        assert!(!flat.contains(&slug), "flattening marker cleared");
+        assert!(!flat.contains_key(&slug), "flattening marker cleared");
     }
 
     /// FIX 3: a both-filled entry PERSISTS each leg's exchange order id (from its fill ack, positionally:
@@ -2366,7 +2390,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair();
         let slug = pos.market.clone();
@@ -2396,7 +2420,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair();
         let slug = pos.market.clone();
@@ -2424,7 +2448,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let (pair, pos, cp) = wx_entry_pair(); // leg0 = YES@pmus(slug); leg1 = NO@Kalshi(ticker)
         let slug = pos.market.clone();
@@ -2444,7 +2468,7 @@ mod tests {
         assert!(!positions.lock().unwrap().contains_key(&slug), "recovery records NO hedge");
         assert!(exp.total.abs() < 1e-9, "the entry reservation is released");
         assert!(!halt.load(Ordering::Relaxed), "recovery flattens -> does NOT engage the halt backstop");
-        assert!(flat.contains(&slug), "the slug is marked flattening (dedup against a double-fire)");
+        assert!(flat.contains_key(&slug), "the slug is marked flattening (dedup against a double-fire)");
         assert!(!pending.contains(&slug), "the entry in-flight marker is cleared");
         // the spawned flatten reports a RECOVERY outcome (the dry-run SELL fills): drain it to confirm a SELL
         // was actually fired (dry-run `submit` returns a simulated filled ack -> the recovery completes).
@@ -2483,7 +2507,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         // a weather PK pair whose pmus market has a coarse 0.05 tick -> the held pmus leg carries it (W2).
         let pair = LivePair {
@@ -2515,7 +2539,7 @@ mod tests {
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // RECOVERY launched (not the halt backstop): the coarse-tick SELL was priceable.
         assert!(!halt.load(Ordering::Relaxed), "a coarse-tick pmus leg recovers -> does NOT halt");
-        assert!(flat.contains(&slug), "recovery launched (slug marked flattening)");
+        assert!(flat.contains_key(&slug), "recovery launched (slug marked flattening)");
         let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
         assert_eq!(recovered.kind, SubmitKind::Recovery, "the floored flatten fires and routes back as Recovery");
     }
@@ -2529,19 +2553,19 @@ mod tests {
         let positions: Arc<Mutex<std::collections::HashMap<String, postpone::SlugPositions>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
-        flat.insert("s".to_string()); // a recovery flatten is in flight for this slug
+        flat.insert("s".to_string(), FlatKind::Recovery); // a recovery flatten is in flight for this slug
         // the recovery SELL came back rate-limited (did NOT fill); leg b is the unused Err placeholder.
         let ack = exec::PairAck { a: Err(exec::ExecError::RateLimited), b: Err(exec::ExecError::Rejected("recovery has no second leg".into())) };
         let out = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(halt.load(Ordering::Relaxed), "a recovery SELL that did not fill leaves a naked leg -> halt");
-        assert!(!flat.contains("s"), "the flattening marker is cleared either way");
+        assert!(!flat.contains_key("s"), "the flattening marker is cleared either way");
         // and a recovery SELL that DID fill clears cleanly without halting.
         let halt2 = AtomicBool::new(false);
-        let mut flat2: std::collections::HashSet<String> = std::collections::HashSet::new();
-        flat2.insert("s".to_string());
+        let mut flat2: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        flat2.insert("s".to_string(), FlatKind::Recovery);
         let ok = exec::PairAck { a: Ok(exec::Ack { client_order_id: "r".into(), venue_order_id: "v".into(), filled: true, simulated: false }), b: Err(exec::ExecError::Rejected("recovery has no second leg".into())) };
         let out2 = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack: ok, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat2, &halt2, out2);
@@ -2601,7 +2625,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let pair = wx_pair();
         // A: cost_per 0.90, B: cost_per 0.95 (DISTINCT so a desync — subtracting the wrong amount — is
@@ -2618,7 +2642,7 @@ mod tests {
         assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 2);
 
         // DECREMENT A (front leg) via the real both-filled Unwind outcome arm.
-        flat.insert(slug.clone());
+        flat.insert(slug.clone(), FlatKind::Unwind);
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind_both_filled(&slug));
         // buckets now equal EXACTLY B's contribution (the desync would have wiped the whole bucket to 0).
         assert!((exp.per_pair[&slug] - want_b).abs() < 1e-9, "after A: per_pair == B exactly (NOT 0 — the old desync)");
@@ -2629,7 +2653,7 @@ mod tests {
         assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 1, "B is the remaining leg");
 
         // DECREMENT B (now the front leg) -> everything to ~0, slug key gone.
-        flat.insert(slug.clone());
+        flat.insert(slug.clone(), FlatKind::Unwind);
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind_both_filled(&slug));
         assert!(exp.per_pair.get(&slug).copied().unwrap_or(0.0).abs() < 1e-9, "after B: per_pair ~0");
         assert!(exp.per_cluster.get(&pair.cluster).copied().unwrap_or(0.0).abs() < 1e-9, "after B: per_cluster ~0");
@@ -2756,7 +2780,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let pair = wx_pair();
         // a base position is HELD (reserved 0.90*3) and recorded as one leg.
@@ -2795,7 +2819,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let pair = wx_pair();
         let slug = seed_legs(&positions, &mut exp, &pair, &[(0.90, 0.03), (0.92, 0.05), (0.95, 0.08)], Dir::PK);
@@ -2803,7 +2827,7 @@ mod tests {
         assert_eq!(exp.open_positions, 3);
         // three re-emit cycles, each flattens ONE front leg.
         for remaining in (0..3).rev() {
-            flat.insert(slug.clone());
+            flat.insert(slug.clone(), FlatKind::Unwind);
             run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind_both_filled(&slug));
             assert_eq!(exp.open_positions, remaining, "one position closed per cycle");
             let still_held = positions.lock().unwrap().contains_key(&slug);
@@ -2828,7 +2852,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let halt = AtomicBool::new(false);
         let pair = wx_pair();
         // one held leg already.
@@ -2867,5 +2891,71 @@ mod tests {
         // the from_env defaults match (the real shipped config, not just test_default).
         // (env is process-global; we assert the constants the from_env literals use instead of mutating env.)
         assert_eq!(qualifying_add(&add_cfg(false, false, 1), &held, &huge, true), None);
+    }
+
+    /// W-1 REGRESSION (the independent review's R4-A repro, ASSERTION FLIPPED to halt==true). An armed
+    /// scale-in/re-entry can have an ADD in flight on a held slug when a postponement fires. `spawn_unwind`
+    /// marks the slug `flattening` (an UNWIND of the BASE leg `legs[0]`). If the ADD then lands HALF-FILLED,
+    /// `recover_naked_leg` USED to see `flattening.contains(slug)` and return true ("already covered") — but
+    /// the in-flight UNWIND covers `legs[0]`, NOT the add's freshly-naked leg, so that add leg was abandoned
+    /// as a SILENT live unhedged position (the W-1 bug: spawned_recovery=false, halted=false). The fix records
+    /// WHICH kind holds the slot; an UNWIND-held slot is NOT "covered" for a recovery -> FAIL CLOSED (halt).
+    /// The invariant this guards: a filled leg is NEVER left without EITHER a fired recovery OR a halt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn w1_halffilled_add_while_unwind_in_flight_fails_closed() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let pair = wx_pair();
+        // a BASE leg is held; a postpone-unwind of it is already IN FLIGHT (slug marked Unwind, targeting
+        // legs[0]). This is exactly the state `spawn_unwind` leaves once it fires the base leg's two SELLs.
+        let slug = seed_legs(&positions, &mut exp, &pair, &[(0.90, 0.03)], Dir::PK);
+        flat.insert(slug.clone(), FlatKind::Unwind);
+        // the in-flight ADD is spawn-reserved on top, then lands HALF-FILLED (leg A live, leg B errored).
+        let add_legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "add-a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "add-b".into() },
+        ];
+        let add_pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs);
+        reserve_exposure(&mut exp, &add_pos, 0.95);
+        pending.insert(slug.clone());
+        // CRUCIAL: the pmus book for the add's filled leg IS priceable (a YES bid), so the add leg COULD be
+        // flattened in isolation. The bot must STILL halt — a recovery here would race the unwind's pop of
+        // legs[0] through the single per-slug flatten slot, so fail-closed is the only safe outcome.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("add-a"), b: Err(exec::ExecError::RateLimited) }, position: Some(add_pos), pair: Some(pair.clone()), cost_per: 0.95, entry_net: 0.06, entry_dir: Dir::PK };
+        let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
+        // THE FIX: the add's naked leg is NOT silently abandoned — the bot FAIL-CLOSES (halt). (Pre-fix this
+        // was halt==false, the abandon.) The add's reservation is still released; the base position + its
+        // in-flight unwind slot are untouched (the unwind still owns legs[0]); no SECOND flatten was spawned.
+        assert!(halt.load(Ordering::Relaxed), "W-1: a half-filled add racing an unwind must FAIL-CLOSE, never silently abandon");
+        assert!((exp.total - 0.90 * 3.0).abs() < 1e-9, "the add's reservation is released; the base reservation is intact");
+        assert_eq!(exp.open_positions, 1, "back to the one held BASE position");
+        assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 1, "the base leg is intact (the add never recorded a leg)");
+        assert_eq!(flat.get(&slug), Some(&FlatKind::Unwind), "the in-flight UNWIND still owns the flatten slot (recovery did NOT clobber it)");
+        assert!(rx.try_recv().is_err(), "no recovery flatten was spawned (no competing SELL races the unwind's legs[0] pop)");
+
+        // SAFE BRANCH 1: a slot held by a prior RECOVERY for THIS slug's naked leg DOES short-circuit (the
+        // genuine "already covered" — the in-flight recovery flattens this very leg; don't double-fire).
+        let mut flat_rec: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        flat_rec.insert(slug.clone(), FlatKind::Recovery);
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let covered = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat_rec, &tx2,
+            &slug, &exec::PairAck { a: live_ack("x"), b: Err(exec::ExecError::RateLimited) }, Some(&position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs)));
+        assert!(covered, "a recovery-held slot is genuinely covered -> recover_naked_leg returns true (no double-fire, no halt)");
+
+        // SAFE BRANCH 2 (mirror of the bug, isolated): an UNWIND-held slot returns FALSE so the caller halts.
+        let mut flat_unw: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        flat_unw.insert(slug.clone(), FlatKind::Unwind);
+        let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let covered_unw = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat_unw, &tx3,
+            &slug, &exec::PairAck { a: live_ack("x"), b: Err(exec::ExecError::RateLimited) }, Some(&position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs)));
+        assert!(!covered_unw, "an unwind-held slot does NOT cover a fresh naked leg -> false -> caller fail-closes");
     }
 }
