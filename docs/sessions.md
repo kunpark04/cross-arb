@@ -6,6 +6,65 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-13 (cont.) — Breadth audit + cap fix, velocity-gate enable, $250/$250 backtest, settlement-identity GATE (0018)
+
+Continued from the edge-RATE work below. Owner pushed on breadth ("100% more arbs out there") + meticulous
+settlement gating. Five focused commits (`f2dda9b` edge-rate · `fb8b132` cap+coverage · `4860af9` backtests ·
+`675f44d` settlement-gate · `87cb5b1` refinement), then this doc pass.
+
+- **Velocity gate ENABLED live @1.0** (`MIN_EDGE_RATE_CPD`, [0017]): conservative floor below the fast-category
+  rates — inert on current data, positioned to bite only once slow arbs (econ / far-sports) appear; `edge_rate`
+  logged per live ENTRY. (`velocity_gate_experiment.py`: the gates are **inert** on current data — econ never
+  clears the 2¢ floor, sports are all near-game. A capital-efficiency tool, not an edge source.)
+- **Breadth audit** (`coverage_audit.py`): the owner's "100% more" is **mostly raw-count illusion** — pmus has
+  15.3k open markets but ~12k are sports PROPS/FUTURES with no head-to-head Kalshi twin. The one real untracked
+  block is the **FIFA World Cup** (Kalshi `KXWCGAME`, ~60 games, **+34%**) — but **3-way (win/tie/lose)** +
+  ESPN-vs-FIFA source, not a drop-in. **Bug found+fixed:** `PM_CATALOG_CAP=12k` silently truncated ~3k live
+  markets (WC surge to 15.3k) incl. tracked-league tail games → 25k (`colisted_map.py` + `discovery.rs`).
+- **$250/$250 per-venue backtest** (`venue_split_backtest.py`): **+1.39% weather / +4.55% all-verified** over
+  ~4.3 d, but **method-demo only** — a stats-ml-reviewer audit caught 2 CRITICALs first (**L20 flat-ladder
+  phantoms = 57% of pre-fix PnL**; a `leg_split` single-letter-dir bug); even post-fix effective-n≈1, 1–2
+  concentrated bets (61% in one), paper/gross, sports unverified ([L28]).
+- **Settlement-identity GATE** (`settlement_identity.py`, **[0018]**): the programmatic invariant-#1 gate.
+  Owner refinement — identity is of the **OUTCOME not the source STRING** (ESPN vs FIFA = same winner), and
+  **4 categories** with the tail PRICED (`IDENTICAL / TAIL[¢-cost] / DIVERGENT[structural] / NEEDS_MANUAL`,
+  precedence in that order; [L29]). Live: weather 24 IDENTICAL, sports **52 TAIL** (MLB 0.26¢ / ATP-WTA-UFC
+  0.10¢, tradeable iff edge>cost), econ 13 IDENTICAL, **0 structural DIVERGENT**. Outcome-count discovered from
+  `marketSides`. No-false-IDENTICAL preserved (review SOUND).
+- **Still open:** wire the gate into live discovery + the bot trading path (gated deploy); the soccer/WC
+  prerequisites (bind the Tie market in `colisted_map`; extend `void_haircut` for `atc-`); the **0016/L27**
+  prior-session doc gap still unfilled.
+
+---
+
+## 2026-06-13 — Edge-RATE allocation shipped in `bot-rs` (0014-H2, live); corrected days-to-grade lock-days; 0016/L27 hygiene gap found
+
+Status-check → owner chose "edge-RATE allocation" (the last deferred `bot-rs` code feature) from the
+next-steps menu. Plan-mode → approved → implemented + verified. Decision
+[0017](../decisions/0017-live-edge-rate-lock-days.md); plan at `~/.claude/plans/deep-waddling-barto.md`.
+
+- **What shipped** (`risk.rs`/`config.rs`/`exec.rs`/`main.rs`): `risk::lock_days` re-derives per-category
+  lock-days to **corrected days-to-grade** — weather 1.2 floor / **sports = dynamic `days_to_event`** (was a
+  flat 15) / econ 21 fallback (no release calendar in the bot). `edge_rate = booked_edge ÷ lock_days` is
+  **always** computed + returned in `Approved` (logged); a **reservation floor** `MIN_EDGE_RATE_CPD`
+  (`Reject::BelowEdgeRateFloor`, **default 0 = OFF**) skips low-velocity arbs. Reservation-only — **sizing
+  untouched** (H1's caps own that); batch-ranking deliberately out of scope (latency tax, capital binds at ~10
+  anyway). **128 tests** (+3), clippy clean, smoke: a 1-day-out sports arb rates **3.0¢/$-day > weather 2.5**.
+- **Pre-registration integrity preserved (L19):** the live bot uses corrected (dynamic) lock-days; **0014-H2's
+  frozen backtest priors (sports 15) are NOT rewritten**. Which lock-days the confirmatory backtest uses at
+  data-arrival is a **labelled sensitivity arm**, not a silent re-tune (this was a prior correction from a
+  direct account observation, not a change motivated by the multi-week data).
+- **A test caught a real bug pre-commit:** `lock_days(Sports, +inf)` leaked non-finite (`f64::max` collapses
+  NaN but not `+inf`) → added an explicit `is_finite` guard so `edge_rate` can never divide-by-zero/go
+  non-finite even with the proximity gate off.
+- **Hygiene gap found (prior session):** the committed 2026-06-11 session log references **decision 0016** +
+  lesson **L27**, but neither file exists (decisions stop at 0015; only L25/L26 are filed). Not fabricated —
+  flagged for owner backfill; my entry took the correct next slot **0017**. The decisions index now shows the
+  0016 gap explicitly.
+- Doc commit of the prior session log (`249ed02`) + this feature pending commit.
+
+---
+
 ## 2026-06-11 (UTC, latest+5) — Venue-contract order bugs (a real unintended live position) → autonomous fix loop → CLEAN money path; Context7 security review
 
 The owner pressed on meticulousness ("be more meticulous — you missed this even after several passes") and

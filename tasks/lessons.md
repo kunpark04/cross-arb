@@ -388,3 +388,39 @@ price; pmus (and Kalshi) want the side-matching field (`1 − NO` in YES terms f
 Kalshi). Live-testing on REAL money is where these surface — size every such probe so a *wrong* assumption
 (unexpected fill, wrong side) is bounded to near-zero, and treat "it rested / I cancelled it" as a hypothesis
 to verify against positions, not a fact.
+
+## L27 — (reserved) venue-contract verification lesson, referenced by the 2026-06-11 session log but never filed
+
+The 2026-06-11 venue-contract session log cites L25/L26/**L27**; L25/L26 are filed, L27 is not. Its intended
+content is the venue-contract review lens ("verify what the venue actually DOES, not the code's internal
+logic"). Left as a flagged gap for owner backfill (mirrors the missing decision 0016). Not fabricated here.
+
+## L28 — A new backtest harness must re-apply the project's phantom filters + verify field shapes against REAL records
+
+`venue_split_backtest.py` (a fresh per-venue capital model) silently re-admitted two known traps that a
+stats-ml-reviewer audit caught before they reached the owner: (1) **L20 flat-ladder book-init phantoms** were
+**57% of the headline PnL** — the new walk reused the cohort but not `capturable(drop_flat)`/the `open_flat`
+drop, so 0-duration flat-ladder "edges" counted as profit (cohort collapsed 16→5 weather / 57→24 sports once
+filtered); (2) a `leg_split` branch keyed on `dir=="PK"` mis-handled the SINGLE-letter binary dirs (`"P"`/`"K"`)
+that real weather/econ records use — the selftest passed only because it fed synthetic two-letter dirs.
+
+**Rule:** any NEW harness over the persistence data must (a) re-apply the established phantom filters —
+`drop_restart` AND `drop_flat` ([L20] book-init, [L21] econ quarantine) — never re-derive a "clean" cohort from
+scratch; and (b) verify every venue/dir/field SHAPE against an actual record before branching on it (single-
+vs two-letter dirs, `marketSides` vs `outcomes`, async vs sync fills — [L23]/[L26]). Reuse the proven
+loaders/economics ([L15]); a fresh model re-imports the bugs the shared code already fixed. And run a
+methodology audit on any "total return" before quoting it — the stats reviewer is the standing guard against
+over-reading thin data.
+
+## L29 — A settlement DIVERGENCE is not binary — price the tail, don't hard-exclude
+
+The first settlement-identity gate labeled every sports void/reschedule-window difference `DIVERGENT` (never
+trade). The owner corrected it: that "divergence" is a ~1.3%-postpone tail [0010] already prices at
+~0.26¢/contract — smaller than a typical edge — so binary-excluding ~52 sports pairs over it forfeits the bulk
+of the tradeable universe.
+
+**Rule:** distinguish a STRUCTURAL divergence (genuinely incompatible settlement — boundary mismatch, opposite
+orientation, outcome-count mismatch; un-priceable → never trade) from a TAIL divergence (a low-probability
+difference whose expected cost is QUANTIFIABLE → tradeable iff edge > cost). Price the tail ([0010] philosophy),
+don't binary-exclude it. And different *reporters* of one deterministic outcome (ESPN vs FIFA) are not a
+divergence at all — settlement identity is of the OUTCOME, not the source string ([0018]).
