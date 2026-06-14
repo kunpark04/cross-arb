@@ -49,6 +49,14 @@ pub struct Config {
     pub require_settle_clean: bool,       // only trade settlement-verified pairs (econ/sports)
     pub discovery_refresh_s: u64,         // periodic re-discovery interval (monitor.py heartbeat = 300s)
 
+    // --- SCALE-IN + RE-ENTRY (adding to a held position; design tasks/scale-in-reentry-design.md) ---
+    // SAFE BY DEFAULT: both flags FALSE + cap 1 => the entry guard's add path always `continue`s, so a
+    // held slug is never added to and behavior is byte-identical to the one-position-per-slug bot.
+    pub enable_scale_in: bool,       // arm SCALE-IN (a bigger same-dir add while the base edge is still live)
+    pub enable_reentry: bool,        // arm RE-ENTRY (a bigger same-dir add after the base edge has closed)
+    pub add_tau_gain: f64,           // an add must beat max(held entry_net) by >= this (parity w/ add_events)
+    pub max_positions_per_slug: u32, // hard count cap on stacked positions per slug (default 1 = no stacking)
+
     pub kill_switch: bool, // CROSSARB_KILL=1 -> halt everything
 }
 
@@ -90,6 +98,12 @@ impl Config {
             leg_fill_timeout_ms: env_u64("LEG_FILL_TIMEOUT_MS", 500),
             require_settle_clean: env_bool("REQUIRE_SETTLE_CLEAN", true),
             discovery_refresh_s: env_u64("DISCOVERY_REFRESH_S", 300),
+
+            // SCALE-IN/RE-ENTRY arming — both OFF, cap 1 by default (safe: no adds to a held slug).
+            enable_scale_in: env_bool("ENABLE_SCALE_IN", false),
+            enable_reentry: env_bool("ENABLE_REENTRY", false),
+            add_tau_gain: env_f64("ADD_TAU_GAIN", 0.01),
+            max_positions_per_slug: env_u32("MAX_POSITIONS_PER_SLUG", 1),
 
             kill_switch: env_bool("CROSSARB_KILL", false),
         }
@@ -134,6 +148,10 @@ impl Config {
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             discovery_refresh_s: 300,
+            enable_scale_in: false,
+            enable_reentry: false,
+            add_tau_gain: 0.01,
+            max_positions_per_slug: 1,
             kill_switch: false,
         }
     }

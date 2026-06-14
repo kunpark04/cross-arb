@@ -701,6 +701,10 @@ mod tests {
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             discovery_refresh_s: 300,
+            enable_scale_in: false,
+            enable_reentry: false,
+            add_tau_gain: 0.01,
+            max_positions_per_slug: 1,
             kill_switch: false,
         };
         let bk = LiveBackend::new(&cfg);
@@ -753,6 +757,10 @@ mod tests {
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             discovery_refresh_s: 300,
+            enable_scale_in: false,
+            enable_reentry: false,
+            add_tau_gain: 0.01,
+            max_positions_per_slug: 1,
             kill_switch: false,
         };
         let bk = LiveBackend::new(&cfg);
@@ -826,6 +834,10 @@ mod tests {
             leg_fill_timeout_ms: 500,
             require_settle_clean: true,
             discovery_refresh_s: 300,
+            enable_scale_in: false,
+            enable_reentry: false,
+            add_tau_gain: 0.01,
+            max_positions_per_slug: 1,
             kill_switch: false,
         };
         let bk = LiveBackend::new(&cfg);

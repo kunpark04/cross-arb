@@ -16,7 +16,7 @@
 //! == the Kalshi ticker date == the original game date), NEVER from `officialDate` — measuring from
 //! `officialDate` computes makeup−makeup = 0 days and misses every unwind.
 
-use crate::types::Position;
+use crate::types::{Dir, Position};
 use crate::unwind::Postponement;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -161,24 +161,47 @@ pub fn detect_postponement(
 
 const STATS_API: &str = "https://statsapi.mlb.com/api/v1";
 
-/// A held cross-arb position the poll tracks for postponements. `team_a`/`team_b` are the lowercase Kalshi
-/// abbrevs (from the two Kalshi tickers) used to match the statsapi game; `prev` is last poll's snapshot
-/// (None on first sight -> the Python first-sight `prev=None`). Non-MLB sports leave the match fields empty
-/// (there is no statsapi source for them — logged once, never auto-unwound here).
+/// One held leg (one entry's worth of contracts) on a slug, with the exposure-release inputs STORED so a
+/// per-position unwind/decrement subtracts EXACTLY what `reserve_exposure` added (`cost_per * size`), never
+/// the whole per-pair bucket (design §1.3 / R1 — the desync the one-position guard used to prevent).
+/// `entry_net`/`entry_dir` gate a later qualifying ADD (same-direction + `net >= max(entry_net)+tau`).
 #[derive(Clone, Debug)]
-pub struct HeldPosition {
+pub struct HeldLeg {
     pub pos: Position,
+    pub cost_per: f64,
+    pub entry_net: f64,
+    pub entry_dir: Dir,
+}
+
+/// All held positions on ONE pmus slug (the pair identity) the poll tracks for postponements. Multiple
+/// `legs` can stack (scale-in / re-entry); the GAME metadata + `prev` are slug-level (one per slug, NEVER
+/// per-position — a postponement voids the whole game, and `team_a`/`team_b`/`date` are shared by every add),
+/// so the poll still does ONE statsapi match + ONE `prev` update per slug. `team_a`/`team_b` are the
+/// lowercase Kalshi abbrevs; `prev` is last poll's snapshot (None on first sight). Non-MLB sports leave the
+/// match fields empty (no statsapi source — logged once, never auto-unwound here).
+#[derive(Clone, Debug)]
+pub struct SlugPositions {
     pub league: String,
     pub date: String,
     pub team_a: String,
     pub team_b: String,
     pub prev: Option<GameStatus>,
+    pub legs: Vec<HeldLeg>,
 }
 
 /// A request to flatten a held position (sent by the poll, consumed by the main loop's unwind handler).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnwindRequest {
     pub slug: String,
+}
+
+/// A lock-free snapshot of ONE held MLB slug's match fields — cloned out of the `positions` map so the poll
+/// can do its (awaited) statsapi pulls without holding the lock. `slug` IS the pair identity / map key.
+struct HeldSlug {
+    slug: String,
+    date: String,
+    team_a: String,
+    team_b: String,
 }
 
 /// Live MLB-postponement poll (stage-2, owner droplet). Caches `teams` (id->lowercase abbrev) once, then
@@ -189,7 +212,7 @@ pub struct UnwindRequest {
 /// auto-unwind source. NEVER called from a test (no live HTTP on a test path).
 pub async fn poll_mlb_postponements(
     http: reqwest::Client,
-    positions: Arc<Mutex<HashMap<String, HeldPosition>>>,
+    positions: Arc<Mutex<HashMap<String, SlugPositions>>>,
     unwind_tx: tokio::sync::mpsc::UnboundedSender<UnwindRequest>,
     poll_s: u64,
     kalshi_void_window_days: f64,
@@ -210,20 +233,22 @@ pub async fn poll_mlb_postponements(
             }
         }
 
-        // snapshot the held MLB sports positions (clone out; don't hold the lock across awaits). Non-MLB
-        // held sports get a one-time "no auto-unwind source" log.
-        let held: Vec<HeldPosition> = {
+        // snapshot the held MLB sports SLUGS (clone out the slug-level metadata; don't hold the lock across
+        // awaits). One entry per slug = one game (its `legs` may stack — irrelevant to the postpone match,
+        // which is a game property). Non-MLB sports get a one-time "no auto-unwind source" log.
+        let held: Vec<HeldSlug> = {
             let map = positions.lock().unwrap();
             let mut v = Vec::new();
-            for hp in map.values() {
-                // an EMPTY league = a position enrolled WITHOUT poll metadata (weather/econ never reach here
-                // with cat==Sports; a WORLD-CUP `Cat::Sports` pair does, on purpose — it has no statsapi
-                // source). Skip the "no source" warning for it: there is no league name to report.
-                if hp.pos.cat == crate::types::Cat::Sports && !hp.league.is_empty() && hp.league != "mlb" && warned_non_mlb.insert(hp.league.clone()) {
-                    println!("[postpone] no auto-unwind source for league {} (statsapi is MLB-only)", hp.league);
+            for (slug, sp) in map.iter() {
+                // an EMPTY league = a slug enrolled WITHOUT poll metadata (weather/econ never reach here with
+                // cat==Sports — only Sports legs carry metadata; a WORLD-CUP `Cat::Sports` pair does, on
+                // purpose — it has no statsapi source). Skip the "no source" warning for it (no league name).
+                let is_sports = sp.legs.iter().any(|l| l.pos.cat == crate::types::Cat::Sports);
+                if is_sports && !sp.league.is_empty() && sp.league != "mlb" && warned_non_mlb.insert(sp.league.clone()) {
+                    println!("[postpone] no auto-unwind source for league {} (statsapi is MLB-only)", sp.league);
                 }
-                if hp.league == "mlb" && !hp.team_a.is_empty() && !hp.team_b.is_empty() {
-                    v.push(hp.clone());
+                if sp.league == "mlb" && !sp.team_a.is_empty() && !sp.team_b.is_empty() {
+                    v.push(HeldSlug { slug: slug.clone(), date: sp.date.clone(), team_a: sp.team_a.clone(), team_b: sp.team_b.clone() });
                 }
             }
             v
@@ -252,17 +277,19 @@ pub async fn poll_mlb_postponements(
             let cur = snap(game);
             let prev = {
                 let map = positions.lock().unwrap();
-                map.get(&h.pos.market).and_then(|hp| hp.prev.clone())
+                map.get(&h.slug).and_then(|sp| sp.prev.clone())
             };
-            if let Some(p) = detect_postponement(prev.as_ref(), &cur, &h.date, &h.pos.market) {
+            if let Some(p) = detect_postponement(prev.as_ref(), &cur, &h.date, &h.slug) {
                 if crate::unwind::should_unwind(&p, kalshi_void_window_days) {
-                    println!("[postpone] UNWIND {} (reschedule_in_days={:?})", h.pos.market, p.reschedule_in_days);
-                    let _ = unwind_tx.send(UnwindRequest { slug: h.pos.market.clone() });
+                    // the loop's spawn_unwind flattens EVERY held leg on the slug (one-at-a-time via the
+                    // poll's per-cycle re-emit — design §1.5), so ONE UnwindRequest per slug suffices.
+                    println!("[postpone] UNWIND {} (reschedule_in_days={:?})", h.slug, p.reschedule_in_days);
+                    let _ = unwind_tx.send(UnwindRequest { slug: h.slug.clone() });
                 }
             }
-            // store cur as prev for the next cycle (only if the position is still held).
-            if let Some(hp) = positions.lock().unwrap().get_mut(&h.pos.market) {
-                hp.prev = Some(cur);
+            // store cur as prev for the next cycle (only if the slug is still held).
+            if let Some(sp) = positions.lock().unwrap().get_mut(&h.slug) {
+                sp.prev = Some(cur);
             }
         }
     }

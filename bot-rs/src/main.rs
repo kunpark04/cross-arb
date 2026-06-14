@@ -118,6 +118,14 @@ fn banner(cfg: &Config) {
         // C8: the settlement-identity gate (the catastrophic axis) is OFF — make it impossible to miss.
         println!("*** SETTLE-CLEAN GATE DISABLED *** (REQUIRE_SETTLE_CLEAN=false) — every category trades UNVERIFIED");
     }
+    // SCALE-IN/RE-ENTRY arming — loud when ANY knob departs from the safe default (both off, cap 1), so an
+    // armed add-to-held config is impossible to miss (mirrors the settle-clean banner). Silent at defaults.
+    if cfg.enable_scale_in || cfg.enable_reentry || cfg.max_positions_per_slug != 1 {
+        println!(
+            "*** ADD-TO-HELD ARMED *** scale_in={} reentry={} max_positions/slug={} add_tau_gain={:.1}c — a held slug can be ADDED to",
+            cfg.enable_scale_in, cfg.enable_reentry, cfg.max_positions_per_slug, cfg.add_tau_gain * 100.0
+        );
+    }
     if cfg.kill_switch {
         println!("KILL SWITCH       : ENGAGED (CROSSARB_KILL) - no trading");
     }
@@ -213,6 +221,10 @@ struct SubmitOutcome {
     pair: Option<LivePair>,
     /// Entry only: the per-contract cost the exposure reservation used (so a release decrements the exact amount).
     cost_per: f64,
+    /// Entry only: the gated edge's net + direction, STORED on the appended `HeldLeg` so a later add can gate
+    /// on `max(entry_net)+tau` and same-direction (design §1/§2). Ignored for unwind/recovery (0.0 / a dummy).
+    entry_net: f64,
+    entry_dir: Dir,
 }
 
 /// STAGE-2 live loop: discover the co-listed universe, connect both venue WS streams, maintain a book
@@ -274,16 +286,23 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
     let mut prior_mid: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new(); // slug -> (pm_mid, k_mid) for led_by
     let mut exposure = Exposure::new();
 
-    // HELD positions keyed by pmus slug — the postponement poll reads these (MLB sports), and the entry
-    // path inserts into them on a both-filled fill so exposure caps bind across the session and a void can
-    // be flattened. Shared with the spawned poll task.
-    let positions: Arc<Mutex<HashMap<String, postpone::HeldPosition>>> = Arc::new(Mutex::new(HashMap::new()));
+    // HELD positions keyed by pmus slug -> `SlugPositions` (a Vec of stacked `HeldLeg`s + slug-level game
+    // metadata/prev). The postponement poll reads these (MLB sports); the entry path APPENDS a leg on a
+    // both-filled fill so exposure caps bind across the session and a void can flatten every leg. With the
+    // default cap=1 there is at most one leg per slug (the one-position-per-slug bot). Shared with the poll.
+    let positions: Arc<Mutex<HashMap<String, postpone::SlugPositions>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // IN-FLIGHT de-dup (C5): a slug with a SPAWNED-but-unacked entry is in `pending_entries`; a slug with a
     // spawned-but-unacked unwind is in `flattening`. The loop refuses a second entry/unwind for a slug
     // already in-flight, so a burst of frames (or the poll's per-cycle re-emit) can't double-fire.
     let mut pending_entries: HashSet<String> = HashSet::new();
     let mut flattening: HashSet<String> = HashSet::new();
+
+    // SCALE-IN vs RE-ENTRY proxy (design §3): a slug is in `edge_live` while a same-direction qualifying arb
+    // is currently present on it (inserted/removed each frame, below). At ADD time `edge_live.contains(slug)`
+    // => SCALE-IN (base episode still OPEN), else RE-ENTRY (base held, its edge already closed). Conservative
+    // + cheap; only ever consulted when a held slug yields a fresh approvable edge (the add path).
+    let mut edge_live: HashSet<String> = HashSet::new();
 
     // RUNTIME halt (W14/C1): set TRUE by a naked-leg-on-live fail-close or a dead supervised task. Distinct
     // from the config kill-switch — this is tripped at runtime and blocks every NEW entry from here on.
@@ -494,18 +513,47 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
             days_to_event: pair.days_to_event,
         };
 
-        // RUNTIME-HALT + IN-FLIGHT de-dup, BEFORE the gate: don't even price a slug that is halted, already
-        // has an entry/unwind in flight (C5 — a second concurrent entry would double-reserve), OR already
-        // has an OPEN position. The last clause enforces ONE position per slug: re-entry while held would
-        // stack two exposure reservations against a single tracked position, desyncing the remove-on-unwind
-        // (the reviewer's re-entry WARN). Per-pair notional is already capped; this makes the bound exact.
+        // SCALE-IN/RE-ENTRY proxy bookkeeping (design §3): is a same-direction positive edge present on this
+        // slug THIS frame? `was_live` reads the PRIOR-frame state (read-before-write) so a continuously-live
+        // edge classifies an add as SCALE-IN, while a closed-then-reopened edge classifies as RE-ENTRY. We
+        // snapshot the held legs once (their dirs/entry_nets gate the add) and recompute membership below.
+        let held_legs: Vec<postpone::HeldLeg> = lock(&positions).get(&slug).map(|sp| sp.legs.clone()).unwrap_or_default();
+        let same_dir_live = !held_legs.is_empty()
+            && edge.net > 0.0
+            && held_legs.iter().all(|l| l.entry_dir == edge.dir);
+        let was_live = edge_live.contains(&slug);
+        if same_dir_live {
+            edge_live.insert(slug.clone());
+        } else {
+            edge_live.remove(&slug);
+        }
+
+        // RUNTIME-HALT + IN-FLIGHT de-dup, BEFORE the gate: don't even price a slug that is halted or already
+        // has an entry/unwind in flight (C5 — a second concurrent entry would double-reserve). These three
+        // clauses are UNCHANGED. The old 4th clause (`positions.contains_key` => block ALL re-entry) is
+        // replaced by `qualifying_add` below: held slugs are no longer blanket-blocked, but an ADD must pass
+        // the same-direction + tau-gain + flag + count-cap gate (and with the SAFE defaults — both flags off,
+        // cap=1 — `qualifying_add` ALWAYS returns None for a held slug => `continue`, i.e. today's behavior).
         if halt.load(Ordering::Relaxed)
             || pending_entries.contains(&slug)
             || flattening.contains(&slug)
-            || lock(&positions).contains_key(&slug)
         {
             continue;
         }
+
+        // HELD-SLUG ADD GATE: if the slug already has legs, this would be an add — gate it. `None` => block
+        // (exactly the old `contains_key` continue). `Some(tag)` => a qualifying add; fall through to
+        // `evaluate` so the notional/count caps then bound it (the held legs' contribution is already in the
+        // exposure buckets, so per-pair/cluster/total room is what's LEFT). An UNHELD slug skips this (fresh
+        // entry, zero change to the common case).
+        let add_tag: Option<&'static str> = if held_legs.is_empty() {
+            None
+        } else {
+            match qualifying_add(cfg, &held_legs, &edge, was_live) {
+                Some(tag) => Some(tag),
+                None => continue, // held but not a qualifying add -> block (== old one-position guard)
+            }
+        };
 
         if let Ok(a) = evaluate(cfg, &quote, &edge, &exposure, affordable(cfg, &edge, &exposure)) {
             // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
@@ -519,17 +567,27 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
                 continue;
             }
             // Record the velocity metric on the live order path (the owner calibrates MIN_EDGE_RATE_CPD
-            // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day).
-            println!(
-                "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}",
-                a.size, edge.net * 100.0, a.edge_rate, edge.dir
-            );
+            // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day). An
+            // ADD additionally logs its scale-in|re-entry tag + the base vs add net so an armed add is
+            // auditable (design §2). `add_tag` is None for a fresh entry (the common case).
+            if let Some(tag) = add_tag {
+                let base_net = held_legs.iter().map(|l| l.entry_net).fold(0.0_f64, f64::max);
+                println!(
+                    "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}",
+                    base_net * 100.0, edge.net * 100.0, a.size, a.edge_rate, edge.dir
+                );
+            } else {
+                println!(
+                    "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}",
+                    a.size, edge.net * 100.0, a.edge_rate, edge.dir
+                );
+            }
             // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
-            // outcome arm keeps the reservation on a both-filled fill (records the position) or releases it.
+            // outcome arm keeps the reservation on a both-filled fill (appends the leg) or releases it.
             let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
             reserve_exposure(&mut exposure, &pos, a.cost_per);
             pending_entries.insert(slug.clone());
-            spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some(pair.clone()), a.cost_per);
+            spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some(pair.clone()), a.cost_per, edge.net, edge.dir);
         }
     }
     if halt.load(Ordering::Relaxed) {
@@ -581,6 +639,8 @@ fn spawn_submit(
     position: Option<Position>,
     pair: Option<LivePair>,
     cost_per: f64,
+    entry_net: f64,
+    entry_dir: Dir,
 ) {
     let backend = backend.clone();
     let outcome_tx = outcome_tx.clone();
@@ -600,7 +660,7 @@ fn spawn_submit(
                 b: Err(exec::ExecError::Rejected("submit panicked".into())),
             }
         });
-        let _ = outcome_tx.send(SubmitOutcome { slug, kind, ack, position, pair, cost_per });
+        let _ = outcome_tx.send(SubmitOutcome { slug, kind, ack, position, pair, cost_per, entry_net, entry_dir });
     });
 }
 
@@ -615,12 +675,14 @@ fn reserve_exposure(exposure: &mut Exposure, pos: &Position, cost_per: f64) {
     exposure.open_positions += 1;
 }
 
-/// RELEASE the EXACT reservation `reserve_exposure` made (the precise inverse), for an entry that did not
-/// fully fill. Subtracts `cost_per * size` from each bucket rather than removing the whole per-pair bucket
-/// (`decrement_exposure`), so a release while another position for the same slug is still open does not wipe
-/// that other position's reservation too — the spawn-reserve path can stack on a slug a held position
-/// already contributes to (re-entry), and only THIS attempt's reservation must come back.
-fn release_exposure(exposure: &mut Exposure, pos: &Position, cost_per: f64) {
+/// SUBTRACT the EXACT reservation `reserve_exposure` made for ONE position (`cost_per * size`, saturating at
+/// 0), decrement `open_positions` by 1. This is the SINGLE inverse of `reserve_exposure` — design §1.3 / R1:
+/// it UNIFIES the old `release_exposure` (an entry that didn't fully fill) and `decrement_exposure` (a tracked
+/// position closing on unwind) so the two paths CANNOT drift. Both pass the SAME (pos, cost_per) the
+/// reservation used, so the subtraction is exact whether the slug has one stacked position or several — it
+/// removes only THIS position's contribution, never the whole per-pair bucket. The per-pair bucket reaches
+/// ~0 only when the LAST position on the slug is subtracted (the caller drops the slug key then).
+fn subtract_exposure(exposure: &mut Exposure, pos: &Position, cost_per: f64) {
     let notional = cost_per * pos.size as f64;
     if let Some(p) = exposure.per_pair.get_mut(&pos.market) {
         *p = (*p - notional).max(0.0);
@@ -632,46 +694,82 @@ fn release_exposure(exposure: &mut Exposure, pos: &Position, cost_per: f64) {
     exposure.open_positions = exposure.open_positions.saturating_sub(1);
 }
 
-/// Record a freshly-filled position into the shared `positions` map so the postponement poll can see it and
-/// a void can be flattened. The exposure was already RESERVED at spawn (`reserve_exposure`), so this does
-/// NOT touch exposure — it only inserts the held position. C6: if a `HeldPosition` already exists for the
-/// slug (a re-entry, or a same-slug re-fill), PRESERVE its `prev` snapshot (the poll's accumulated status)
-/// and only update the position/size — a blind `insert` would clobber `prev` to `None` and silently defeat
-/// the officialDate-slide detection for a cycle. For a SPORTS pair the poll needs league/date/abbrevs.
+/// APPEND a freshly-filled position as a new `HeldLeg` on its slug (design §1). The exposure was already
+/// RESERVED at spawn (`reserve_exposure`), so this does NOT touch exposure — it only records the leg +
+/// stores its `cost_per`/`entry_net`/`entry_dir` (so a later per-leg unwind subtracts EXACTLY this leg — R1 —
+/// and a later add gates on `max(entry_net)+tau` / same-direction). Metadata is set on the FIRST insert
+/// (Vacant) only; an APPEND (Occupied) pushes the leg and leaves the slug-level metadata AND `prev` UNTOUCHED
+/// — so the C6 "preserve the poll's accumulated `prev`" concern is now STRUCTURAL (prev is a slug property,
+/// never re-derived per leg). For a SPORTS pair the poll needs league/date/abbrevs.
 fn track_position(
-    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
     pair: &LivePair,
     pos: Position,
+    cost_per: f64,
+    entry_net: f64,
+    entry_dir: Dir,
 ) {
-    // poll metadata is for the MLB postponement poll ONLY. A WORLD-CUP pair is `Cat::Sports` but has no
-    // statsapi source (`soccer`), so it enrolls with EMPTY metadata (like weather/econ) -> the poll skips it.
-    // Its tiny void/postpone tail is the noted follow-on, not handled by the MLB poll.
-    let (league, date, team_a, team_b) = if pair.cat == Cat::Sports && !pair.soccer {
-        let last_seg = |t: &str| t.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
-        (
-            discovery::pm_league(&pair.slug).unwrap_or_default(),
-            discovery::iso_date(&pair.slug).unwrap_or_default(),
-            last_seg(&pair.kalshi),
-            pair.kalshi_b.as_deref().map(last_seg).unwrap_or_default(),
-        )
-    } else {
-        (String::new(), String::new(), String::new(), String::new())
-    };
-    let slug = pos.market.clone();
+    let leg = postpone::HeldLeg { pos, cost_per, entry_net, entry_dir };
+    let slug = leg.pos.market.clone();
     use std::collections::hash_map::Entry;
     match lock(positions).entry(slug) {
-        // C6: preserve the poll's `prev`; never blindly overwrite a live-tracked position's status history.
+        // APPEND: prev + metadata are slug-level (one game) and shared by every add -> never touched here.
         Entry::Occupied(mut e) => {
-            let hp = e.get_mut();
-            hp.pos = pos;
-            hp.league = league;
-            hp.date = date;
-            hp.team_a = team_a;
-            hp.team_b = team_b;
+            e.get_mut().legs.push(leg);
         }
         Entry::Vacant(e) => {
-            e.insert(postpone::HeldPosition { pos, league, date, team_a, team_b, prev: None });
+            // poll metadata is for the MLB postponement poll ONLY. A WORLD-CUP pair is `Cat::Sports` but has
+            // no statsapi source (`soccer`), so it enrolls with EMPTY metadata (like weather/econ) -> the poll
+            // skips it. Its tiny void/postpone tail is the noted follow-on, not handled by the MLB poll.
+            let (league, date, team_a, team_b) = if pair.cat == Cat::Sports && !pair.soccer {
+                let last_seg = |t: &str| t.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
+                (
+                    discovery::pm_league(&pair.slug).unwrap_or_default(),
+                    discovery::iso_date(&pair.slug).unwrap_or_default(),
+                    last_seg(&pair.kalshi),
+                    pair.kalshi_b.as_deref().map(last_seg).unwrap_or_default(),
+                )
+            } else {
+                (String::new(), String::new(), String::new(), String::new())
+            };
+            e.insert(postpone::SlugPositions { league, date, team_a, team_b, prev: None, legs: vec![leg] });
         }
+    }
+}
+
+/// HELD-SLUG ADD GATE (design §2/§3) — decide whether an approvable same-frame edge on an ALREADY-HELD slug
+/// qualifies as an add, and if so which kind. Returns `Some("scale-in"|"re-entry")` to ALLOW (the caller then
+/// runs `evaluate`, whose notional/count caps bound it) or `None` to BLOCK (== the old one-position guard's
+/// `continue`). Gate — ALL must hold: (1) SAME-direction as every held leg (an opposite-direction bigger arb
+/// is NOT an add — R6/Test 4); (2) `edge.net >= max(held entry_net) + add_tau_gain` (parity with the backtest
+/// `add_events` trigger); (3) `held.len() < max_positions_per_slug` (the explicit count cap — cap=1 blocks the
+/// first add); (4) the matching feature FLAG is ON (`was_live` => SCALE-IN needs `enable_scale_in`; else
+/// RE-ENTRY needs `enable_reentry`).
+///
+/// SAFE BY DEFAULT: with both flags false AND cap=1, clause (3) (cap) and clause (4) (flag) BOTH fail, so this
+/// ALWAYS returns `None` for a held slug — byte-identical to the one-position-per-slug bot.
+fn qualifying_add(cfg: &Config, held: &[postpone::HeldLeg], edge: &Edge, was_live: bool) -> Option<&'static str> {
+    if held.is_empty() {
+        return None; // not held -> not an add (caller handles the fresh-entry path)
+    }
+    // 1. same direction as ALL held legs (the gate forbids opening an opposite-direction position on a slug).
+    if !held.iter().all(|l| l.entry_dir == edge.dir) {
+        return None;
+    }
+    // 2. strictly bigger than the best held entry by the tau-gain margin.
+    let base_net = held.iter().map(|l| l.entry_net).fold(f64::NEG_INFINITY, f64::max);
+    if edge.net < base_net + cfg.add_tau_gain {
+        return None;
+    }
+    // 3. count cap (cap=1 => any held slug already at the cap => block).
+    if (held.len() as u32) >= cfg.max_positions_per_slug {
+        return None;
+    }
+    // 4. classify via the cross-frame proxy + require the matching flag.
+    if was_live {
+        cfg.enable_scale_in.then_some("scale-in")
+    } else {
+        cfg.enable_reentry.then_some("re-entry")
     }
 }
 
@@ -684,7 +782,7 @@ fn track_position(
 #[allow(clippy::too_many_arguments)]
 fn apply_outcome(
     backend: &std::sync::Arc<dyn ExecutionBackend>,
-    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
     kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
     pmus_books: &std::collections::HashMap<String, book::PmusBook>,
     exposure: &mut Exposure,
@@ -707,12 +805,16 @@ fn apply_outcome(
                             leg.venue_order_id = a.venue_order_id.clone();
                         }
                     }
-                    track_position(positions, &pair, pos); // exposure stays RESERVED (keep it)
+                    // APPEND the new leg (exposure stays RESERVED — keep it). cost_per/entry_net/entry_dir are
+                    // STORED on the HeldLeg so a later per-leg unwind subtracts EXACTLY this leg (R1) and a
+                    // later add gates on max(entry_net)+tau / same-direction.
+                    track_position(positions, &pair, pos, out.cost_per, out.entry_net, out.entry_dir);
                 }
             } else {
-                // release the EXACT reservation made at spawn (the entry did not fully fill)
+                // subtract the EXACT reservation made at spawn (the entry did not fully fill) — the unified
+                // inverse of reserve_exposure (R1), never the whole-bucket remove.
                 if let Some(pos) = &out.position {
-                    release_exposure(exposure, pos, out.cost_per);
+                    subtract_exposure(exposure, pos, out.cost_per);
                 }
                 // FIX A: a real one-leg-filled outcome is a NAKED directional leg. Try to AUTO-RECOVER
                 // (cancel the resting leg + flatten the filled leg at a marketable book price). The halt
@@ -726,10 +828,25 @@ fn apply_outcome(
         SubmitKind::Unwind => {
             flattening.remove(&out.slug); // a non-flat outcome lets the poll re-emit to retry
             if both {
-                if let Some(removed) = lock(positions).remove(&out.slug) {
-                    decrement_exposure(exposure, &removed.pos);
+                // POP the FRONT leg that was just flattened (spawn_unwind always targets legs[0], and
+                // `flattening` serialized this slug so the Vec is unchanged since the spawn — the front is
+                // exactly that leg). Subtract its OWN stored cost_per (the exact inverse, R1) — NEVER the
+                // whole bucket. Drop the slug key only when its `legs` empties (R5 — else prune/W16 can't
+                // fire). A still-non-empty slug keeps the poll re-emitting to flatten the next leg (§1.5).
+                let mut drop_slug = false;
+                if let Some(sp) = lock(positions).get_mut(&out.slug) {
+                    if !sp.legs.is_empty() {
+                        let removed = sp.legs.remove(0);
+                        subtract_exposure(exposure, &removed.pos, removed.cost_per);
+                    }
+                    drop_slug = sp.legs.is_empty();
                 }
-                println!("[UNWIND] flattened {}", out.slug);
+                if drop_slug {
+                    lock(positions).remove(&out.slug);
+                    println!("[UNWIND] flattened {} (slug fully closed)", out.slug);
+                } else {
+                    println!("[UNWIND] flattened one leg of {} ({} leg(s) remain; poll re-emits)", out.slug, lock(positions).get(&out.slug).map(|sp| sp.legs.len()).unwrap_or(0));
+                }
             } else {
                 // a postpone unwind that HALF-filled (one leg sold, the other unfilled) is a NEW naked leg ->
                 // halt; a both-failed unwind sold nothing (the pair is still hedged) so the poll re-emits.
@@ -882,7 +999,7 @@ fn spawn_flatten(
             // filled sentinel, so no path can mistake it for a fill.
             b: Err(exec::ExecError::Rejected("recovery has no second leg".into())),
         };
-        let _ = outcome_tx.send(SubmitOutcome { slug, kind: SubmitKind::Recovery, ack, position: None, pair: None, cost_per: 0.0 });
+        let _ = outcome_tx.send(SubmitOutcome { slug, kind: SubmitKind::Recovery, ack, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK });
     });
 }
 
@@ -917,17 +1034,18 @@ fn naked_leg_failclose(slug: &str, kind: SubmitKind, ack: &exec::PairAck, halt: 
     }
 }
 
-/// Prepare + SPAWN a postponement unwind: dedupe against an in-flight flatten (`flattening`), look up the
-/// held position, price each leg's marketable EXIT from the live books (SELL YES -> best yes_bid; SELL NO
-/// -> 1 - yes_ask), then SPAWN the two SELLs (the bookkeeping — remove position + decrement exposure —
-/// happens on the outcome arm). A one-sided book (a leg can't be priced) logs a WARN and clears the
-/// in-flight marker so the poll's next re-emit can retry. REDUCE-ONLY: fires even under the kill-switch
-/// (flattening a void REDUCES risk) and the dry-run backend only LOGS, so it is safe by default.
+/// Prepare + SPAWN a postponement unwind for ONE held leg on the slug (design §1.5 — v1 flattens
+/// one-at-a-time, FRONT leg first; the poll's per-cycle re-emit picks up the next leg over later cycles). A
+/// postponement voids the whole GAME, so EVERY leg on the slug must eventually flatten. This fires the FRONT
+/// `HeldLeg`'s two SELLs (priced from the live books); the Unwind outcome arm pops that front leg + subtracts
+/// its EXACT `cost_per` (never the whole bucket). Dedupes against an in-flight flatten (`flattening`). A
+/// one-sided book (a leg can't be priced) logs a WARN and clears nothing so the next re-emit retries.
+/// REDUCE-ONLY: fires even under the kill-switch (flattening a void REDUCES risk); dry-run only LOGS.
 #[allow(clippy::too_many_arguments)]
 fn spawn_unwind(
     cfg: &Config,
     backend: &std::sync::Arc<dyn ExecutionBackend>,
-    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
     kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
     pmus_books: &std::collections::HashMap<String, book::PmusBook>,
     flattening: &mut std::collections::HashSet<String>,
@@ -937,12 +1055,14 @@ fn spawn_unwind(
     if flattening.contains(slug) {
         return; // a flatten for this slug is already in flight -> don't double-fire (C5)
     }
-    let Some(hp) = lock(positions).get(slug).cloned() else { return }; // already flattened / gone
+    // the FRONT held leg on this slug (one-at-a-time, §1.5). `None`/empty -> already flattened / gone.
+    let front = lock(positions).get(slug).and_then(|sp| sp.legs.first().cloned());
+    let Some(front) = front else { return };
     if cfg.kill_switch {
         println!("[UNWIND] kill-switch engaged but flattening (reduce-only) {slug}");
     }
     // price each leg's exit from the venue book it sits on (a SELL never blocks on a fresh entry edge).
-    let exits = unwind_exit_cents(&hp.pos, |leg| match leg.venue {
+    let exits = unwind_exit_cents(&front.pos, |leg| match leg.venue {
         Venue::Kalshi => lock(kalshi_books).get(&leg.market).map(|b| b.touch()),
         Venue::Pmus => pmus_books.get(&leg.market).map(|b| b.touch()),
     });
@@ -950,23 +1070,11 @@ fn spawn_unwind(
         println!("[UNWIND] WARN one-sided book — cannot price both legs of {slug}; holding (poll re-emits)");
         return; // not marked flattening -> the poll's re-emit retries once a book is two-sided
     };
-    let orders = unwind::unwind_orders(&hp.pos, exits);
+    let orders = unwind::unwind_orders(&front.pos, exits);
     flattening.insert(slug.to_string());
-    spawn_submit(backend, outcome_tx, SubmitKind::Unwind, slug.to_string(), orders, None, None, 0.0);
-}
-
-/// Decrement exposure when a tracked position is closed (mirror of the bump in `track_position`), so caps
-/// re-open for new entries. Reconstructs the notional from cost_per×size is not available post-fill, so we
-/// remove the recorded per-pair notional directly (the per-pair bucket holds exactly this position's
-/// contribution — one position per pmus slug).
-fn decrement_exposure(exposure: &mut Exposure, pos: &Position) {
-    if let Some(n) = exposure.per_pair.remove(&pos.market) {
-        exposure.total = (exposure.total - n).max(0.0);
-        if let Some(c) = exposure.per_cluster.get_mut(&pos.cluster) {
-            *c = (*c - n).max(0.0);
-        }
-    }
-    exposure.open_positions = exposure.open_positions.saturating_sub(1);
+    // carry the front leg's pos + cost_per so the outcome arm subtracts EXACTLY this leg (defensive; the arm
+    // pops the front and uses the popped leg's OWN stored cost_per — the exact-release guarantee).
+    spawn_submit(backend, outcome_tx, SubmitKind::Unwind, slug.to_string(), orders, Some(front.pos), None, front.cost_per, 0.0, Dir::PK);
 }
 
 /// Log the discovery coverage report LOUDLY (L7): an unmapped category / misaligned bucket / truncated
@@ -1048,7 +1156,7 @@ async fn refresh_loop(
     k_tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pm_tracked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     kalshi_books: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
-    positions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+    positions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
     k_subs: tokio::sync::mpsc::UnboundedSender<venue::SubUpdate>,
     pm_subs: tokio::sync::mpsc::UnboundedSender<venue::SubUpdate>,
 ) {
@@ -1087,12 +1195,13 @@ async fn refresh_loop(
         };
         let pre_tickers: HashSet<String> = slug_to_tickers.values().flatten().cloned().collect();
 
-        // PRUNE debounce (keyed on the pmus slug = the pair identity). W16: never prune a slug with an open
-        // HeldPosition — it must stay subscribed/flattenable until closed (else its Kalshi book is freed and
-        // the unwind can never price the exit -> an un-flattenable held position). A genuinely-settled held
-        // slug still accrues misses in `absent` (the debounce runs), so once its position closes the next
-        // cycle prunes it immediately. C9: on a TRUNCATED catalog, skip the debounce entirely (an off-page
-        // slug must not count as a miss) — still apply the adds below.
+        // PRUNE debounce (keyed on the pmus slug = the pair identity). W16: never prune a slug with any open
+        // held leg — it must stay subscribed/flattenable until closed (else its Kalshi book is freed and the
+        // unwind can never price the exit -> an un-flattenable held position). A slug is "held" iff it has a
+        // map entry (R5: the key is dropped only when its last `HeldLeg` is flattened), so `keys()` is exactly
+        // the held set. A genuinely-settled held slug still accrues misses in `absent` (the debounce runs), so
+        // once its last leg closes the next cycle prunes it immediately. C9: on a TRUNCATED catalog, skip the
+        // debounce entirely (an off-page slug must not count as a miss) — still apply the adds below.
         let held: HashSet<String> = lock(&positions).keys().cloned().collect();
         let prune_slugs: HashSet<String> = if prune_ok {
             prune_step(&pre_slugs, &fresh_slugs, &mut absent, 2)
@@ -1756,11 +1865,12 @@ mod tests {
             OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 55, qty: 1, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
-        track_position(&positions, &pair, pos);
-        let hp = positions.lock().unwrap().get(&pair.slug).cloned().expect("WC position still recorded (exposure/dedup)");
+        track_position(&positions, &pair, pos, 0.97, 0.03, Dir::PK);
+        let sp = positions.lock().unwrap().get(&pair.slug).cloned().expect("WC position still recorded (exposure/dedup)");
         // EMPTY poll metadata -> the MLB poll's `league=="mlb"` filter skips it (no wrong unwind / no warning).
-        assert_eq!((hp.league.as_str(), hp.date.as_str(), hp.team_a.as_str(), hp.team_b.as_str()), ("", "", "", ""),
+        assert_eq!((sp.league.as_str(), sp.date.as_str(), sp.team_a.as_str(), sp.team_b.as_str()), ("", "", "", ""),
             "a WC pair enrolls with EMPTY MLB-poll metadata (it has no statsapi source)");
+        assert_eq!(sp.legs.len(), 1, "one leg recorded");
     }
 
     /// SPORTS leg construction: PK = "YES@pmus(slug) and YES@Kalshi-B(ticker_b)"; KP = "YES@Kalshi-A
@@ -1982,9 +2092,9 @@ mod tests {
         assert!(unwind_exit_cents(&pos, |leg| if leg.venue == Venue::Pmus { Some(Book { yes_bid: None, yes_ask: Some(0.99), age_s: 0.0 }) } else { Some(k) }).is_none());
     }
 
-    /// `track_position` then `decrement_exposure` round-trips exposure to zero (caps bind on entry, re-open
-    /// on flatten), and a SPORTS pair derives league/date/abbrevs for the poll while non-sports leaves them
-    /// empty.
+    /// `track_position` then `subtract_exposure` (the unified inverse, R1) round-trips exposure to zero (caps
+    /// bind on entry, re-open on flatten), and a SPORTS pair derives league/date/abbrevs for the poll while
+    /// non-sports leaves them empty.
     #[test]
     fn reserve_track_and_decrement_exposure_round_trips() {
         use std::sync::{Arc, Mutex};
@@ -2002,21 +2112,26 @@ mod tests {
             OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
-        // RESERVE at spawn (exposure bumps) then RECORD on both-filled (exposure stays reserved).
+        // RESERVE at spawn (exposure bumps) then APPEND the leg on both-filled (exposure stays reserved).
         reserve_exposure(&mut exp, &pos, 0.97);
-        track_position(&positions, &pair, pos);
+        track_position(&positions, &pair, pos, 0.97, 0.03, Dir::PK);
         // exposure reserved by cost_per×size = 0.97×4 = 3.88 across pair/cluster/total; one open position.
         assert!((exp.total - 3.88).abs() < 1e-9);
         assert!((exp.per_pair["aec-mlb-lad-pit-2026-06-16"] - 3.88).abs() < 1e-9);
         assert!((exp.per_cluster["mlb-2026-06-16"] - 3.88).abs() < 1e-9);
         assert_eq!(exp.open_positions, 1);
-        // the held position carries the poll's match fields (league/date/abbrevs from the slug + tickers).
-        let hp = positions.lock().unwrap().get(&pair.slug).cloned().unwrap();
-        assert_eq!((hp.league.as_str(), hp.date.as_str(), hp.team_a.as_str(), hp.team_b.as_str()), ("mlb", "2026-06-16", "lad", "pit"));
-        // flatten -> exposure back to zero, position gone.
-        decrement_exposure(&mut exp, &hp.pos);
+        // the held slug carries the poll's match fields (league/date/abbrevs from the slug + tickers).
+        let sp = positions.lock().unwrap().get(&pair.slug).cloned().unwrap();
+        assert_eq!((sp.league.as_str(), sp.date.as_str(), sp.team_a.as_str(), sp.team_b.as_str()), ("mlb", "2026-06-16", "lad", "pit"));
+        assert_eq!(sp.legs.len(), 1);
+        // flatten the (only) leg with its STORED cost_per (the exact inverse, R1) -> exposure back to zero.
+        // Post-R1, per_pair is value-subtracted to ~0 (NOT key-removed; the bucket key is dropped lazily with
+        // the slug). The asserted SEMANTICS (round-trips to zero) are unchanged; the shape of the last check
+        // is the per-pair VALUE, not key-absence.
+        let leg0 = sp.legs[0].clone();
+        subtract_exposure(&mut exp, &leg0.pos, leg0.cost_per);
         assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0);
-        assert!(!exp.per_pair.contains_key("aec-mlb-lad-pit-2026-06-16"));
+        assert!(exp.per_pair.get("aec-mlb-lad-pit-2026-06-16").copied().unwrap_or(0.0).abs() < 1e-9);
     }
 
     /// C6: re-tracking a slug that already has a HeldPosition PRESERVES the poll's accumulated `prev`
@@ -2037,13 +2152,17 @@ mod tests {
             OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
-        track_position(&positions, &pair, pos.clone());
+        track_position(&positions, &pair, pos.clone(), 0.97, 0.03, Dir::PK);
         // the poll has since accumulated a status snapshot on this slug.
         let snapshot = postpone::GameStatus { detailed_state: "Scheduled".into(), official_date: Some("2026-06-16".into()), ..Default::default() };
         positions.lock().unwrap().get_mut(&pair.slug).unwrap().prev = Some(snapshot.clone());
-        // a re-entry/re-fill re-tracks the SAME slug — `prev` must survive (was clobbered to None pre-C6).
-        track_position(&positions, &pair, pos);
-        assert_eq!(positions.lock().unwrap().get(&pair.slug).unwrap().prev, Some(snapshot));
+        // an ADD (scale-in/re-entry) APPENDS a second leg on the SAME slug — `prev` is slug-level so it must
+        // survive (it was clobbered to None pre-C6; now the preservation is STRUCTURAL — append never touches
+        // prev). The append also stacks a 2nd leg (the multi-position shape).
+        track_position(&positions, &pair, pos, 0.96, 0.05, Dir::PK);
+        let sp = positions.lock().unwrap().get(&pair.slug).cloned().unwrap();
+        assert_eq!(sp.prev, Some(snapshot), "prev survives an append (slug-level, never re-derived per leg)");
+        assert_eq!(sp.legs.len(), 2, "the add stacked a second leg");
     }
 
     /// W6: when rounding each leg to a whole cent pushes the realized net under the floor, the fire is
@@ -2117,7 +2236,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn run_apply(
         backend: &std::sync::Arc<dyn ExecutionBackend>,
-        positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::HeldPosition>>>,
+        positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
         kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
         pmus_books: &std::collections::HashMap<String, book::PmusBook>,
         exp: &mut Exposure,
@@ -2154,7 +2273,7 @@ mod tests {
         reserve_exposure(&mut exp, &pos, cp);
         pending.insert(slug.clone());
         let reserved_total = exp.total;
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!((exp.total - reserved_total).abs() < 1e-9, "both-filled keeps the reservation");
         assert!(positions.lock().unwrap().contains_key(&slug), "position recorded");
@@ -2178,7 +2297,7 @@ mod tests {
         reserve_exposure(&mut exp, &pos, cp);
         pending.insert(slug.clone());
         // both legs errored (e.g. KeysUnavailable) -> not both_filled, no live fill -> release, no halt.
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: Err(exec::ExecError::KeysUnavailable), b: Err(exec::ExecError::KeysUnavailable) }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: Err(exec::ExecError::KeysUnavailable), b: Err(exec::ExecError::KeysUnavailable) }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "reservation released exactly");
         assert!(!positions.lock().unwrap().contains_key(&slug), "no position recorded on a failed entry");
@@ -2203,7 +2322,7 @@ mod tests {
         pending.insert(slug.clone());
         // leg A filled LIVE, leg B rate-limited -> NAKED. No book is available -> recovery can't price the
         // flatten -> the halt backstop runs (this is the FAIL-SAFE: never leave the leg silently naked).
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::RateLimited) }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::RateLimited) }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(halt.load(Ordering::Relaxed), "an unpriceable naked LIVE leg must engage the kill-switch backstop");
         assert!(exp.total.abs() < 1e-9, "the entry reservation is still released");
@@ -2229,9 +2348,9 @@ mod tests {
         let slug = pos.market.clone();
         // an open, recorded position with its reservation, now mid-flatten.
         reserve_exposure(&mut exp, &pos, cp);
-        track_position(&positions, &pair, pos);
+        track_position(&positions, &pair, pos, cp, 0.03, Dir::PK);
         flat.insert(slug.clone());
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("u0"), b: sim_ack("u1") }, position: None, pair: None, cost_per: 0.0 };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("u0"), b: sim_ack("u1") }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(!positions.lock().unwrap().contains_key(&slug), "position removed on flatten");
         assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "exposure decremented on flatten");
@@ -2256,12 +2375,14 @@ mod tests {
         // both legs filled live with DISTINCT venue order ids.
         let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-ORD-1".into(), filled: true, simulated: false });
         let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-ORD-2".into(), filled: true, simulated: false });
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
-        let hp = positions.lock().unwrap().get(&slug).cloned().expect("position recorded");
-        // leg 0 = pmus (PM-ORD-1), leg 1 = Kalshi (K-ORD-2) — ids persisted onto the held legs.
-        assert_eq!(hp.pos.legs[0].venue_order_id, "PM-ORD-1");
-        assert_eq!(hp.pos.legs[1].venue_order_id, "K-ORD-2");
+        let sp = positions.lock().unwrap().get(&slug).cloned().expect("position recorded");
+        // the single appended leg's two PositionLegs: leg 0 = pmus (PM-ORD-1), leg 1 = Kalshi (K-ORD-2) —
+        // ids persisted onto the held legs (FIX 3).
+        let held = &sp.legs[0].pos;
+        assert_eq!(held.legs[0].venue_order_id, "PM-ORD-1");
+        assert_eq!(held.legs[1].venue_order_id, "K-ORD-2");
         assert!(!halt.load(Ordering::Relaxed), "a clean both-filled live entry does not halt");
     }
 
@@ -2284,7 +2405,7 @@ mod tests {
         // leg A filled live; leg B ACCEPTED but resting (Ok, filled:false) -> not both-filled -> naked.
         let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "K-1".into(), filled: true, simulated: false });
         let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "PM-2".into(), filled: false, simulated: false });
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(!positions.lock().unwrap().contains_key(&slug), "a one-resting-leg entry is NOT recorded as a hedge");
         assert!(exp.total.abs() < 1e-9 && exp.open_positions == 0, "reservation released");
@@ -2317,7 +2438,7 @@ mod tests {
         // leg A (pmus) filled LIVE; leg B (Kalshi) resting with a venue order id (so it gets cancelled).
         let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, simulated: false });
         let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // RECOVERY launched: no held hedge recorded, reservation released, NOT a bare halt, slug marked flattening.
         assert!(!positions.lock().unwrap().contains_key(&slug), "recovery records NO hedge");
@@ -2390,7 +2511,7 @@ mod tests {
         pmus_books.insert(slug.clone(), pb);
         let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, simulated: false });
         let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: 0.97 };
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: 0.97, entry_net: 0.03, entry_dir: Dir::PK };
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // RECOVERY launched (not the halt backstop): the coarse-tick SELL was priceable.
         assert!(!halt.load(Ordering::Relaxed), "a coarse-tick pmus leg recovers -> does NOT halt");
@@ -2405,7 +2526,7 @@ mod tests {
     #[test]
     fn recovery_flatten_that_does_not_fill_engages_halt() {
         use std::sync::{Arc, Mutex};
-        let positions: Arc<Mutex<std::collections::HashMap<String, postpone::HeldPosition>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let positions: Arc<Mutex<std::collections::HashMap<String, postpone::SlugPositions>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut exp = Exposure::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2413,7 +2534,7 @@ mod tests {
         flat.insert("s".to_string()); // a recovery flatten is in flight for this slug
         // the recovery SELL came back rate-limited (did NOT fill); leg b is the unused Err placeholder.
         let ack = exec::PairAck { a: Err(exec::ExecError::RateLimited), b: Err(exec::ExecError::Rejected("recovery has no second leg".into())) };
-        let out = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack, position: None, pair: None, cost_per: 0.0 };
+        let out = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(halt.load(Ordering::Relaxed), "a recovery SELL that did not fill leaves a naked leg -> halt");
         assert!(!flat.contains("s"), "the flattening marker is cleared either way");
@@ -2422,7 +2543,7 @@ mod tests {
         let mut flat2: std::collections::HashSet<String> = std::collections::HashSet::new();
         flat2.insert("s".to_string());
         let ok = exec::PairAck { a: Ok(exec::Ack { client_order_id: "r".into(), venue_order_id: "v".into(), filled: true, simulated: false }), b: Err(exec::ExecError::Rejected("recovery has no second leg".into())) };
-        let out2 = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack: ok, position: None, pair: None, cost_per: 0.0 };
+        let out2 = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack: ok, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat2, &halt2, out2);
         assert!(!halt2.load(Ordering::Relaxed), "a filled recovery SELL clears without halting");
     }
@@ -2440,5 +2561,311 @@ mod tests {
         assert_eq!(naked_filled_idx(&exec::PairAck { a: live_ack("a"), b: live_ack("b") }), None);
         assert_eq!(naked_filled_idx(&exec::PairAck { a: Err(exec::ExecError::RateLimited), b: Err(exec::ExecError::RateLimited) }), None);
         assert_eq!(naked_filled_idx(&exec::PairAck { a: sim_ack("a"), b: Err(exec::ExecError::RateLimited) }), None);
+    }
+
+    // ====================================================================================================
+    // SCALE-IN + RE-ENTRY (multi-position-per-slug) — design tasks/scale-in-reentry-design.md §6 (10 tests)
+    // ====================================================================================================
+
+    /// Build a `SlugPositions` with `n` held legs on one slug, each leg reserving `cost_per*size`, recording
+    /// `entry_net`/`entry_dir` — and bump `exp` by the SAME reservation each leg (mirrors the spawn-time
+    /// reserve so the map and the exposure buckets agree, the real invariant). Returns the slug.
+    fn seed_legs(positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>, exp: &mut Exposure, pair: &LivePair, costs_nets: &[(f64, f64)], dir: Dir) -> String {
+        let mut slug = String::new();
+        for (i, &(cost_per, entry_net)) in costs_nets.iter().enumerate() {
+            let legs = [
+                OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: format!("a{i}") },
+                OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: format!("b{i}") },
+            ];
+            let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
+            reserve_exposure(exp, &pos, cost_per);
+            track_position(positions, pair, pos, cost_per, entry_net, dir);
+            slug = pair.slug.clone();
+        }
+        slug
+    }
+
+    /// A both-filled Unwind outcome for `slug` (the bookkeeping the poll's re-emit drives one-at-a-time).
+    fn unwind_both_filled(slug: &str) -> SubmitOutcome {
+        SubmitOutcome { slug: slug.into(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("u0"), b: sim_ack("u1") }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK }
+    }
+
+    /// TEST 1 (THE DESYNC REGRESSION — design §6.1 / R1): two positions A+B stacked on ONE slug. Decrement A
+    /// (the FRONT leg, via the real Unwind outcome path) -> the per-pair/cluster/total buckets equal exactly
+    /// B's contribution (NOT zero — the old whole-bucket `remove` wiped BOTH), open=1, the slug is KEPT.
+    /// Decrement B -> buckets ~0, open=0, the slug KEY is gone (R5). This is the exact desync the
+    /// one-position guard used to prevent; it MUST be airtight.
+    #[test]
+    fn test1_multi_position_exact_reserve_and_release_no_desync() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let pair = wx_pair();
+        // A: cost_per 0.90, B: cost_per 0.95 (DISTINCT so a desync — subtracting the wrong amount — is
+        // detectable). size = 3 each (from seed_legs). A is the FRONT leg (appended first).
+        let (ca, cb, size) = (0.90_f64, 0.95_f64, 3.0_f64);
+        let slug = seed_legs(&positions, &mut exp, &pair, &[(ca, 0.03), (cb, 0.05)], Dir::PK);
+        // reserved = A + B on every bucket; two open positions.
+        let want_a = ca * size;
+        let want_b = cb * size;
+        assert!((exp.per_pair[&slug] - (want_a + want_b)).abs() < 1e-9, "per_pair = A + B reserved");
+        assert!((exp.per_cluster[&pair.cluster] - (want_a + want_b)).abs() < 1e-9);
+        assert!((exp.total - (want_a + want_b)).abs() < 1e-9);
+        assert_eq!(exp.open_positions, 2);
+        assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 2);
+
+        // DECREMENT A (front leg) via the real both-filled Unwind outcome arm.
+        flat.insert(slug.clone());
+        run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind_both_filled(&slug));
+        // buckets now equal EXACTLY B's contribution (the desync would have wiped the whole bucket to 0).
+        assert!((exp.per_pair[&slug] - want_b).abs() < 1e-9, "after A: per_pair == B exactly (NOT 0 — the old desync)");
+        assert!((exp.per_cluster[&pair.cluster] - want_b).abs() < 1e-9, "after A: per_cluster == B");
+        assert!((exp.total - want_b).abs() < 1e-9, "after A: total == B");
+        assert_eq!(exp.open_positions, 1, "one position still open");
+        assert!(positions.lock().unwrap().contains_key(&slug), "slug KEPT while B remains (R5)");
+        assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 1, "B is the remaining leg");
+
+        // DECREMENT B (now the front leg) -> everything to ~0, slug key gone.
+        flat.insert(slug.clone());
+        run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind_both_filled(&slug));
+        assert!(exp.per_pair.get(&slug).copied().unwrap_or(0.0).abs() < 1e-9, "after B: per_pair ~0");
+        assert!(exp.per_cluster.get(&pair.cluster).copied().unwrap_or(0.0).abs() < 1e-9, "after B: per_cluster ~0");
+        assert!(exp.total.abs() < 1e-9, "after B: total ~0");
+        assert_eq!(exp.open_positions, 0, "no positions open");
+        assert!(!positions.lock().unwrap().contains_key(&slug), "slug KEY gone once legs empty (R5)");
+    }
+
+    /// TEST 2 (design §6.2): `track_position` APPENDS a leg + PRESERVES the shared `prev`. (The C6
+    /// preservation is now structural; this pins it for the append path explicitly.)
+    #[test]
+    fn test2_track_position_appends_and_preserves_prev() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let pair = wx_pair();
+        seed_legs(&positions, &mut exp, &pair, &[(0.90, 0.03)], Dir::PK);
+        // the poll accumulates a prev snapshot on the slug.
+        let snap = postpone::GameStatus { detailed_state: "Scheduled".into(), official_date: Some("2026-06-11".into()), ..Default::default() };
+        positions.lock().unwrap().get_mut(&pair.slug).unwrap().prev = Some(snap.clone());
+        // a second add APPENDS (now 2 legs) and leaves prev untouched.
+        seed_legs(&positions, &mut exp, &pair, &[(0.95, 0.05)], Dir::PK);
+        let sp = positions.lock().unwrap().get(&pair.slug).cloned().unwrap();
+        assert_eq!(sp.legs.len(), 2, "the second add appended a leg");
+        assert_eq!(sp.prev, Some(snap), "prev (slug-level) survived the append");
+    }
+
+    /// A config with the add knobs set (else everything stays at the safe defaults).
+    fn add_cfg(scale_in: bool, reentry: bool, cap: u32) -> Config {
+        let mut c = crate::config::Config::test_default();
+        c.enable_scale_in = scale_in;
+        c.enable_reentry = reentry;
+        c.max_positions_per_slug = cap;
+        c.add_tau_gain = 0.01;
+        c
+    }
+    fn held_leg(entry_net: f64, dir: Dir) -> postpone::HeldLeg {
+        let leg = OrderIntent { venue: Venue::Pmus, market: "s".into(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "x".into() };
+        let pos = position_from_intents("s", Cat::Weather, "c", None, &[leg.clone(), OrderIntent { venue: Venue::Kalshi, market: "K".into(), side: Side::No, ..leg }]);
+        postpone::HeldLeg { pos, cost_per: 0.9, entry_net, entry_dir: dir }
+    }
+
+    /// TEST 3 (design §6.3): SCALE-IN vs RE-ENTRY classification, each flag independently admits/blocks.
+    /// `was_live` (the §3 proxy) selects which flag gates the add.
+    #[test]
+    fn test3_scalein_vs_reentry_each_flag_gates_independently() {
+        let held = [held_leg(0.03, Dir::PK)];
+        let bigger = Edge { net: 0.06, dir: Dir::PK }; // > 0.03 + 0.01 tau -> qualifies on the net gate
+        // edge LIVE (was_live=true) -> SCALE-IN: needs enable_scale_in.
+        assert_eq!(qualifying_add(&add_cfg(true, false, 2), &held, &bigger, true), Some("scale-in"));
+        assert_eq!(qualifying_add(&add_cfg(false, true, 2), &held, &bigger, true), None, "scale-in blocked when only re-entry is armed");
+        // edge CLOSED (was_live=false) -> RE-ENTRY: needs enable_reentry.
+        assert_eq!(qualifying_add(&add_cfg(false, true, 2), &held, &bigger, false), Some("re-entry"));
+        assert_eq!(qualifying_add(&add_cfg(true, false, 2), &held, &bigger, false), None, "re-entry blocked when only scale-in is armed");
+        // both armed -> the proxy picks the kind.
+        assert_eq!(qualifying_add(&add_cfg(true, true, 2), &held, &bigger, true), Some("scale-in"));
+        assert_eq!(qualifying_add(&add_cfg(true, true, 2), &held, &bigger, false), Some("re-entry"));
+    }
+
+    /// TEST 4 (design §6.4 / R6): the add_tau_gain gate + the same-direction requirement. An opposite-dir
+    /// bigger arb is NOT an add (the gate forbids opening an opposite-direction position on a held slug).
+    #[test]
+    fn test4_tau_gain_and_same_direction_required() {
+        let c = add_cfg(true, true, 2); // both armed + cap 2 so only the net/dir gates can block
+        let held = [held_leg(0.03, Dir::PK)];
+        // below tau: net 0.035 < 0.03 + 0.01 -> BLOCK (not enough gain over the base).
+        assert_eq!(qualifying_add(&c, &held, &Edge { net: 0.035, dir: Dir::PK }, true), None, "add must beat base by >= tau");
+        // exactly at tau boundary: 0.04 == 0.03 + 0.01 -> ADMIT (>= is inclusive).
+        assert_eq!(qualifying_add(&c, &held, &Edge { net: 0.04, dir: Dir::PK }, true), Some("scale-in"), "net == base + tau passes (>=)");
+        // OPPOSITE direction, even much bigger -> BLOCK (R6: never open an opposite-direction position).
+        assert_eq!(qualifying_add(&c, &held, &Edge { net: 0.20, dir: Dir::KP }, true), None, "opposite-direction bigger arb is NOT an add");
+        // gate must compare against the MAX held entry_net: two held legs (0.03, 0.06) -> base 0.06.
+        let two = [held_leg(0.03, Dir::PK), held_leg(0.06, Dir::PK)];
+        assert_eq!(qualifying_add(&add_cfg(true, true, 3), &two, &Edge { net: 0.065, dir: Dir::PK }, true), None, "must beat MAX(entry_net)=0.06 by tau, 0.065 < 0.07");
+        assert_eq!(qualifying_add(&add_cfg(true, true, 3), &two, &Edge { net: 0.07, dir: Dir::PK }, true), Some("scale-in"));
+    }
+
+    /// TEST 5 (design §6.5): max_positions_per_slug binds. cap=1 => the FIRST add is blocked (default
+    /// behavior); cap=2 => a 3rd add (when 2 are held) is blocked.
+    #[test]
+    fn test5_max_positions_per_slug_cap_binds() {
+        let bigger = Edge { net: 0.10, dir: Dir::PK };
+        let one = [held_leg(0.03, Dir::PK)];
+        // cap=1, one held -> at the cap -> BLOCK (this is exactly the one-position-per-slug default).
+        assert_eq!(qualifying_add(&add_cfg(true, true, 1), &one, &bigger, true), None, "cap=1 blocks the first add");
+        // cap=2, one held -> room -> ADMIT.
+        assert_eq!(qualifying_add(&add_cfg(true, true, 2), &one, &bigger, true), Some("scale-in"));
+        // cap=2, TWO held -> at the cap -> BLOCK the 3rd.
+        let two = [held_leg(0.03, Dir::PK), held_leg(0.05, Dir::PK)];
+        assert_eq!(qualifying_add(&add_cfg(true, true, 2), &two, &bigger, true), None, "cap=2 blocks the 3rd add");
+    }
+
+    /// TEST 6 (design §6.6): notional caps bind ACROSS positions — pos#1 using the full per-pair room makes
+    /// an otherwise-qualifying add `Reject::PairCap` in `evaluate` (the held leg's contribution is already in
+    /// the per_pair bucket, so `pair_room` is what's LEFT). The cap is the real concentration bound the guard
+    /// never enforced. (Cluster/total bind the same way — same `evaluate` arithmetic.)
+    #[test]
+    fn test6_notional_caps_bind_across_positions() {
+        use crate::risk::{evaluate, Exposure, Reject};
+        let mut c = add_cfg(true, true, 5);
+        c.max_notional_per_pair = 1.0; // tiny per-pair cap
+        c.max_contracts_per_pair = 100;
+        let q = q_pk(); // a clean weather arb, dir PK, settle_clean
+        let edge = Edge { net: 0.06, dir: Dir::PK };
+        // pos#1 already consumed the whole per-pair cap (1.0) -> the qualifying add has zero pair_room.
+        let mut exp = Exposure::new();
+        exp.per_pair.insert(q.market.clone(), 1.0); // full per-pair notional in use
+        exp.open_positions = 1;
+        assert_eq!(evaluate(&c, &q, &edge, &exp, 1000), Err(Reject::PairCap), "per-pair cap binds the SUM across stacked positions");
+        // and the cluster cap binds identically (fresh exp, cluster full).
+        let mut exp2 = Exposure::new();
+        exp2.per_cluster.insert(q.cluster.clone(), c.max_notional_per_cluster);
+        exp2.open_positions = 1;
+        assert_eq!(evaluate(&c, &q, &edge, &exp2, 1000), Err(Reject::ClusterCap), "per-cluster cap binds across positions");
+    }
+
+    /// TEST 7 (design §6.7 / §1.4): a half-filled ADD is recovered from its OWN outcome, and the
+    /// already-held base position's exposure is left INTACT. The add's spawn-reservation is released exactly
+    /// (subtract this attempt's `cost_per*size`), the add's own naked leg is recovered/halted — the base
+    /// leg's contribution and the base leg itself are untouched.
+    #[test]
+    fn test7_recovery_picks_own_leg_base_position_intact() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let pair = wx_pair();
+        // a base position is HELD (reserved 0.90*3) and recorded as one leg.
+        let slug = seed_legs(&positions, &mut exp, &pair, &[(0.90, 0.03)], Dir::PK);
+        let base_total = exp.total;
+        let base_pair = exp.per_pair[&slug];
+        assert_eq!(exp.open_positions, 1);
+        // the ADD is spawn-reserved (0.95*3) on top, then comes back HALF-FILLED (leg A live, leg B errored)
+        // -> NOT both_filled -> release the ADD's exact reservation; the add's naked leg can't be priced (no
+        // book) -> halt backstop. Crucially this touches ONLY the add's reservation, not the base's.
+        let add_legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "a2".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "b2".into() },
+        ];
+        let add_pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs);
+        reserve_exposure(&mut exp, &add_pos, 0.95);
+        pending.insert(slug.clone());
+        assert_eq!(exp.open_positions, 2, "base + the in-flight add reserved");
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("a2"), b: Err(exec::ExecError::RateLimited) }, position: Some(add_pos), pair: Some(pair.clone()), cost_per: 0.95, entry_net: 0.06, entry_dir: Dir::PK };
+        run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
+        // the ADD's reservation is released EXACTLY -> exposure is back to the BASE-only amount (intact).
+        assert!((exp.total - base_total).abs() < 1e-9, "base exposure intact: only the add's reservation released");
+        assert!((exp.per_pair[&slug] - base_pair).abs() < 1e-9, "base per-pair contribution untouched");
+        assert_eq!(exp.open_positions, 1, "back to one open position (the base)");
+        // the base leg itself is STILL HELD (the failed add never recorded a leg; recovery touched its own leg).
+        assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 1, "the held BASE leg is intact");
+        assert!(halt.load(Ordering::Relaxed), "the add's unpriceable naked leg engaged the halt backstop");
+    }
+
+    /// TEST 8 (design §6.8): a postpone unwinds ALL positions over re-emit cycles, each removed + decremented
+    /// individually, and the slug key drops only after the LAST leg flattens. (Models the poll's per-cycle
+    /// re-emit: spawn the front, the outcome pops it, repeat.) Three stacked legs here.
+    #[test]
+    fn test8_postpone_unwinds_all_positions_over_re_emit_cycles() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let pair = wx_pair();
+        let slug = seed_legs(&positions, &mut exp, &pair, &[(0.90, 0.03), (0.92, 0.05), (0.95, 0.08)], Dir::PK);
+        assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len(), 3);
+        assert_eq!(exp.open_positions, 3);
+        // three re-emit cycles, each flattens ONE front leg.
+        for remaining in (0..3).rev() {
+            flat.insert(slug.clone());
+            run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind_both_filled(&slug));
+            assert_eq!(exp.open_positions, remaining, "one position closed per cycle");
+            let still_held = positions.lock().unwrap().contains_key(&slug);
+            if remaining > 0 {
+                assert!(still_held, "slug kept while {remaining} leg(s) remain");
+                assert_eq!(positions.lock().unwrap().get(&slug).unwrap().legs.len() as u32, remaining);
+            } else {
+                assert!(!still_held, "slug key gone after the last leg flattens (R5)");
+            }
+        }
+        assert!(exp.total.abs() < 1e-9, "all exposure decremented exactly to zero");
+        assert!(!halt.load(Ordering::Relaxed), "a clean serial flatten never halts");
+    }
+
+    /// TEST 9 (design §6.9): dry-run is honored for an armed-flags add — `apply_outcome` of a both-filled
+    /// dry-run entry while a position is already held APPENDS the leg (no network: the DryRunBackend only
+    /// simulates), exposure stays reserved, no halt. The arming changes WHICH adds the loop admits; it never
+    /// changes the execution backend.
+    #[test]
+    fn test9_dry_run_honored_for_armed_add() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let halt = AtomicBool::new(false);
+        let pair = wx_pair();
+        // one held leg already.
+        seed_legs(&positions, &mut exp, &pair, &[(0.90, 0.03)], Dir::PK);
+        let reserved_after_one = exp.total;
+        // the ADD's both-filled entry outcome (dry-run simulated fills) -> APPEND, keep the reservation.
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "a2".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "b2".into() },
+        ];
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
+        reserve_exposure(&mut exp, &pos, 0.95); // spawn-reserve the add
+        pending.insert(pair.slug.clone());
+        let reserved_after_two = exp.total;
+        let out = SubmitOutcome { slug: pair.slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a2"), b: sim_ack("b2") }, position: Some(pos), pair: Some(pair.clone()), cost_per: 0.95, entry_net: 0.06, entry_dir: Dir::PK };
+        run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
+        assert_eq!(positions.lock().unwrap().get(&pair.slug).unwrap().legs.len(), 2, "the dry-run add appended a 2nd leg");
+        assert!((exp.total - reserved_after_two).abs() < 1e-9, "both-filled keeps the add reservation (no release)");
+        assert!(reserved_after_two > reserved_after_one, "the add added exposure");
+        assert!(!halt.load(Ordering::Relaxed), "a clean simulated add never halts (dry-run safe)");
+    }
+
+    /// TEST 10 (design §6.10 + §5.4): SINGLE-POSITION / SAFE-DEFAULT regression. With the SHIPPED defaults
+    /// (both flags FALSE, cap 1), `qualifying_add` ALWAYS returns None for a held slug — so the loop's add
+    /// path always `continue`s and behavior is byte-identical to the one-position-per-slug bot. (The full
+    /// ~136-test baseline staying green is the rest of this regression.)
+    #[test]
+    fn test10_safe_defaults_admit_zero_adds() {
+        let def = crate::config::Config::test_default(); // enable_scale_in=false, enable_reentry=false, cap=1
+        assert!(!def.enable_scale_in && !def.enable_reentry && def.max_positions_per_slug == 1, "shipped defaults are safe");
+        let held = [held_leg(0.03, Dir::PK)];
+        // a hugely-bigger same-direction arb, edge live OR closed -> STILL blocked at the defaults.
+        let huge = Edge { net: 0.50, dir: Dir::PK };
+        assert_eq!(qualifying_add(&def, &held, &huge, true), None, "defaults: SCALE-IN candidate blocked (flag off + cap 1)");
+        assert_eq!(qualifying_add(&def, &held, &huge, false), None, "defaults: RE-ENTRY candidate blocked (flag off + cap 1)");
+        // the from_env defaults match (the real shipped config, not just test_default).
+        // (env is process-global; we assert the constants the from_env literals use instead of mutating env.)
+        assert_eq!(qualifying_add(&add_cfg(false, false, 1), &held, &huge, true), None);
     }
 }
