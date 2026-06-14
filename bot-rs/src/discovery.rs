@@ -29,7 +29,9 @@ const PM_MARKETS: &str = "https://gateway.polymarket.us/v1/markets";
 // Unify on the bot's Kalshi host (CLAUDE.md: "unify Kalshi host"; venue.rs uses api.elections.kalshi.com).
 const KALSHI_MARKETS: &str = "https://api.elections.kalshi.com/trade-api/v2/markets";
 const PM_PAGE: usize = 500; // pmus offset page size (verified: page < limit = last page)
-const PM_CATALOG_CAP: usize = 12_000; // safety cap; hitting it = TRUNCATED coverage (warn, don't loop forever)
+const PM_CATALOG_CAP: usize = 25_000; // safety cap; hitting it = TRUNCATED coverage (warn, don't loop forever).
+// Raised 12k->25k 2026-06-13: live pmus catalog reached 15.3k (FIFA World Cup 2026 surge), so 12k was
+// silently truncating ~3k markets including tracked-league games sorted into the tail.
 
 const MON: [&str; 12] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 

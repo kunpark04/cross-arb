@@ -38,7 +38,9 @@ LEAGUES = {"mlb": ("KXMLBGAME", "abbrev"), "wnba": ("KXWNBAGAME", "abbrev"), "nb
 
 UA = {"User-Agent": "cross-arb/1.0", "Accept": "application/json"}
 MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-PM_CATALOG_CAP = 12000   # safety cap on catalog pagination; hitting it = TRUNCATED coverage (warn loudly)
+PM_CATALOG_CAP = 25000   # safety cap on catalog pagination; hitting it = TRUNCATED coverage (warn loudly).
+# Raised 12000->25000 on 2026-06-13: the live pmus catalog reached 15.3k (FIFA World Cup 2026 surge) so the
+# old 12k cap was SILENTLY truncating ~3k markets — including tracked-league games sorted into the tail.
 
 def get(url, tries=4, errs=None):
     """GET -> parsed JSON. Retries 429 + transient errors (5xx, timeouts) with backoff. On final failure
