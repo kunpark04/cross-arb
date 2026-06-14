@@ -452,6 +452,31 @@ def _selftest():
         pass
     print("OK - update_sub_cmd: probe-verified wire shape (sids list + market_tickers + action)")
 
+    # --- SOCCER3 (WC) registration: each per-outcome record is a BINARY 1:1 MarketTracker (NOT GameTracker),
+    # its single Kalshi ticker is collide-guarded, it is NOT in the weather-only wx registry, and the 3 outcomes
+    # of one game share the `game` cluster. Mirrors register()'s weather/econ 1:1 loop on a fake discovery map.
+    soc = [{"cat": "soccer3", "slug": f"atc-fwc-ger-cuw-2026-06-14-{o}", "kalshi": f"KXWCGAME-26JUN14GERCUW-{k}",
+            "outcome": ("draw" if o == "draw" else "team"), "team": (None if o == "draw" else o),
+            "game": "ger-cuw-2026-06-14", "void_clean": False, "settle_basis": "regulation"}
+           for o, k in (("ger", "GER"), ("cuw", "CUW"), ("draw", "TIE"))]
+    fake = {"weather": [], "sports": [], "econ": [], "soccer3": soc}
+    pmt, kt, sk, wxr, seen_k = {}, {}, {}, {}, set()
+    wx_n = len(fake["weather"])
+    for i, e in enumerate(fake["weather"] + fake.get("econ", []) + fake.get("soccer3", [])):
+        assert "kalshi_b" not in e, "soccer3 must be BINARY (one Kalshi ticker) — never routed via GameTracker"
+        assert e["kalshi"] not in seen_k, f"collide: WC ticker {e['kalshi']} bound twice"   # _collide(e['kalshi'])
+        seen_k.add(e["kalshi"])
+        trk = MarketTracker(e["slug"])                       # the SAME 1:1 tracker weather/econ use (NOT GameTracker)
+        assert isinstance(trk, MarketTracker) and not isinstance(trk, GameTracker)
+        pmt[e["slug"]] = trk; kt[e["kalshi"]] = trk; sk[e["slug"]] = [e["kalshi"]]
+        if i < wx_n: wxr[e["slug"]] = trk                    # weather-only ladder/trade scope — WC excluded
+    assert len(pmt) == 3 and len(kt) == 3, (pmt, kt)         # 3 outcomes -> 3 binary 1:1 trackers
+    assert all(len(sk[s]) == 1 for s in sk), "each WC outcome binds exactly ONE Kalshi ticker (binary)"
+    assert wxr == {}, "WC is NOT weather — must stay out of the wave-2 ladder/trade registry"
+    assert {e["game"] for e in soc} == {"ger-cuw-2026-06-14"}, "all 3 outcomes share the game cluster"
+    assert "KXWCGAME-26JUN14GERCUW-TIE" in kt, "draw outcome binds the Kalshi TIE ticker"
+    print("OK - soccer3(WC): per-outcome BINARY 1:1 MarketTracker (not GameTracker), collide-guarded, game-clustered")
+
     # --- TransitionLogger: event-date partitioning (a lifecycle stays in ONE file) + sessions.jsonl ---
     import tempfile, glob, shutil
     td = tempfile.mkdtemp()
@@ -854,9 +879,9 @@ def _build_id():
 
 async def run_live(logger, refresh_sec=300, debounce=1.0):
     """Open both venue WS streams, route each book delta to the right tracker, log transitions. Self-
-    discovers the co-listed universe (bot/colisted_map.py): WEATHER via the 1:1 MarketTracker, SPORTS via
-    the 2-outcome GameTracker (pm game market + two Kalshi team tickers). Re-audits coverage + churn on the
-    heartbeat. Read-only (no orders); droplet DEPLOY is gated (decision 0006)."""
+    discovers the co-listed universe (bot/colisted_map.py): WEATHER + ECON + SOCCER3(WC per-outcome) via the
+    1:1 MarketTracker, SPORTS via the 2-outcome GameTracker (pm game market + two Kalshi team tickers). Re-
+    audits coverage + churn on the heartbeat. Read-only (no orders); droplet DEPLOY is gated (decision 0006)."""
     import asyncio, websockets
     from colisted_map import build_colisted_map
     shard_size = 100
@@ -892,10 +917,13 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
             hit = [tk for tk in tks if tk in k_targets]   # overwrite cross-wires two markets' books (L1)
             if hit: print(f"[coverage] WARNING duplicate Kalshi ticker(s) {hit} — pair SKIPPED (no-false-positive guard)")
             return bool(hit)
-        # WEATHER + ECON = 1:1 binary same-outcome MarketTracker (pm /book is YES-oriented; econ pmus '>=T'
-        # matches the IDENTICAL Kalshi 'Above T-step' twin — decision 0013, scripts/verify_econ_settlement.py).
+        # WEATHER + ECON + SOCCER3(WC) = 1:1 binary same-outcome MarketTracker (pm /book is YES-oriented; econ
+        # pmus '>=T' matches the IDENTICAL Kalshi 'Above T-step' twin — decision 0013; soccer3 is ONE WC outcome
+        # (teamA/draw/teamB) <-> ONE Kalshi outcome ticker, NOT the 2-team GameTracker, committed 17ab0ea). The
+        # correlated-exposure cluster (all 3 outcomes of a game) is the shared `game` field, carried in each pm
+        # slug's `<a>-<b>-<date>` substring just as weather's city-date lives in its slug.
         wx_n = len(colisted["weather"])
-        for i, e in enumerate(colisted["weather"] + colisted.get("econ", [])):
+        for i, e in enumerate(colisted["weather"] + colisted.get("econ", []) + colisted.get("soccer3", [])):
             if e["slug"] in pm_targets or _collide(e["kalshi"]): continue
             trk = MarketTracker(e["slug"])
             def pm_fn(b, o, trk=trk, key=e["slug"]): trk.set_book("P", b, o); emit(*trk.evaluate(), key)
@@ -925,9 +953,11 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
               f"(NOT paired - settlement-identity guard): {rep['weather_bucket_MISALIGNED'][:3]}")
     register(colisted)
     print(f"[discovery] tracking {len(colisted['weather'])} weather + {len(colisted['sports'])} sports + "
-          f"{len(colisted.get('econ', []))} econ ({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
+          f"{len(colisted.get('econ', []))} econ + {len(colisted.get('soccer3', []))} soccer3 "
+          f"({len(pm_targets)} pmus slugs, {len(k_targets)} Kalshi tickers)")
     _counts = {"weather": len(colisted["weather"]), "sports": len(colisted["sports"]),
-               "econ": len(colisted.get("econ", [])), "pmus": len(pm_targets), "kalshi": len(k_targets),
+               "econ": len(colisted.get("econ", [])), "soccer3": len(colisted.get("soccer3", [])),
+               "pmus": len(pm_targets), "kalshi": len(k_targets),
                "build": _build_id(), "argv": " ".join(sys.argv[1:])}   # deploy-vs-crash forensics: 23
     logger.session_start(_counts)   # restart marker                   # indistinguishable restarts in 21h
     logger.health(_counts)          # liveness beacon (startup)
@@ -1067,7 +1097,8 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                     print(f"[coverage] discovery DEGRADED ({len(r2['fetch_errors'])} fetch errors) — prune skipped")
                 else:
                     current = ({e["slug"] for e in fresh["weather"]} | {e["slug"] for e in fresh["sports"]}
-                               | {e["slug"] for e in fresh.get("econ", [])})   # incl. econ or it'd be pruned each heartbeat
+                               | {e["slug"] for e in fresh.get("econ", [])}
+                               | {e["slug"] for e in fresh.get("soccer3", [])})   # incl. econ + WC or they'd be pruned each heartbeat
                     stale = prune_decision(set(pm_targets), current, absent)
                     dead_k = [tk for slug in stale for tk in slug_k.get(slug, [])]   # before teardown pops slug_k
                     for slug in stale:
@@ -1085,7 +1116,7 @@ async def run_live(logger, refresh_sec=300, debounce=1.0):
                         print(f"[prune] unsubscribed {len(dead_k)} settled Kalshi tickers (delete_markets, no-gap)")
                 now = time.time()                                                   # per-venue stream-liveness in the beacon:
                 logger.health({"weather": len(fresh["weather"]), "sports": len(fresh["sports"]),
-                               "econ": len(fresh.get("econ", [])),
+                               "econ": len(fresh.get("econ", [])), "soccer3": len(fresh.get("soccer3", [])),
                                "pmus": len(pm_targets), "kalshi": len(k_targets),
                                "fee_changes": fee_state.get("n"),   # tripwire count (None until first poll)
                                "rx_age": {"pm": round(now - last_rx["pm"], 1) if last_rx["pm"] else None,
