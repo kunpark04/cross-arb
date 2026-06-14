@@ -424,3 +424,19 @@ orientation, outcome-count mismatch; un-priceable → never trade) from a TAIL d
 difference whose expected cost is QUANTIFIABLE → tradeable iff edge > cost). Price the tail ([0010] philosophy),
 don't binary-exclude it. And different *reporters* of one deterministic outcome (ESPN vs FIFA) are not a
 divergence at all — settlement identity is of the OUTCOME, not the source string ([0018]).
+
+## L30 — A locked cross-venue arb is OUTCOME-neutral but NOT BASIS-neutral; check the mark before calling a strategy "inapplicable"
+
+I told the owner flipping "doesn't map onto this strategy — a locked YES+NO pair is market-neutral, there's
+nothing to flip." Wrong: the pair is neutral to the *outcome* (which way the bucket settles) but its
+*mark-to-market* tracks the cross-venue BASIS (the gap between the venues' implied prices). When the basis
+overshoots/crosses, closing the pair banks the overshoot AND you can re-enter the reversed (now bigger) arb to
+settlement — ~+8¢ vs the +2¢ of holding in a worked example. "Scaling-in" (a bigger same-direction arb later) is
+just a second locked pair up to the per-pair cap; the backtest's "one entry per market" was a funnel
+SIMPLIFICATION, not a strategy rule.
+
+**Rule:** before judging a strategy idea inapplicable, reason about the **mark-to-market**, not just the
+settlement payoff. The honest caveats for flipping are specific and real — it needs a genuine cross-over (not a
+same-direction widening), it's 4 fills of execution/naked risk vs 0 for holding, it converts lock-and-forget into
+basis-TIMING, and the flip IS the fat-fast ~66%-toxic regime — so state THOSE rather than dismissing the idea.
+It's directly backtestable on the monitor's logged FLIP transitions (OPEN/CLOSE/FLIP/WIDEN/NARROW).
