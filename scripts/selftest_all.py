@@ -17,6 +17,7 @@ TARGETS = [
     ("bot/colisted_map.py", []),
     ("scripts/test_monitor_nogap.py", []),   # localhost fake-WS integration: no-gap add/delete + fallback
     ("scripts/test_monitor_trades_ladders.py", []),   # wave-2: trade poll dedupe/seed + tr/hb ladders + fee tripwire
+    ("scripts/settlement_identity.py", ["--selftest"]),   # invariant #1 gate: per-pair IDENTICAL/DIVERGENT/NEEDS_MANUAL
     ("scripts/analyze_persistence.py", ["--selftest"]),
     ("scripts/capital_sim.py", ["--selftest"]),
     ("scripts/account_sim.py", ["--selftest"]),
