@@ -19,6 +19,14 @@ WHAT IT REPORTS (per category weather/sports/econ/soccer3=WC + overall):
   (3) ADD PnL         — markets that later offered a bigger same-direction arb while held; the incremental
       net edge of the add (sized by crossable depth c2, per-market cap), vs single-entry, PLUS the
       correlated-settlement concentration it creates (N pairs on one bucket all lose if grading diverges).
+      Three audit-required disclosures (stats-ml-logic-reviewer 20260614-flip-add) so the figure is never
+      quoted bare: (3a) a HOLD-WINDOW SWEEP — the add count/PnL across assumed first-pair settlement holds
+      {4,8,12,24,28,48}h (an add only counts if the bigger arb lands before the first pair settles, so a
+      longer hold inflates it); (3b) the [L20] flat-ladder PHANTOM LENS on the driving WIDEN (the base
+      cohort gets it via capturable(); the WIDEN record bypasses that chokepoint) — PnL before/after + the
+      dropped count; (3c) the TRUE-ADD vs RE-ENTRY split against the REAL episode OPEN/CLOSE intervals — a
+      genuine scale-in (base edge still open) vs a separate later arb on a still-held bucket (re-entry, which
+      the live one-position-per-slug guard blocks and which concentrates correlated settlement risk).
 
 METHODOLOGY (this project has been bitten — tasks/lessons.md L19/L20/L21/L28/L30):
   • REUSES the proven harness — load/build_episodes/category + capturable/one_per_market/settle_t/
@@ -182,13 +190,43 @@ def flip_events(records, episodes, edge_min, window_min, tau_gain, settle_offset
 # past the original net by >= tau_gain). The add is a SECOND locked pair sized by the widen's crossable
 # depth, capped at add_cap_frac of the per-market clip. Reports incremental edge vs single-entry + the
 # correlated concentration (how many pairs end up on one settlement bucket).
+#
+# Three audit-required disclosures are computed PER add (stats-ml-logic-reviewer 20260614-flip-add):
+#   • drop_flat_widen — the [L20] phantom lens applied to the WIDEN that drives each add. A flat-ladder
+#     widen (c2==c1==c0>0) is the book-init phantom fingerprint; capturable() gates the BASE episode on it
+#     but never sees the WIDEN record, so 27% of the unfiltered add PnL rode on flat-ladder widens. The
+#     CAUSAL lens drops the add when its FIRST qualifying widen is a phantom (NOT falling through to a
+#     later clean widen — that later widen is a separate future event; picking it would be [L19] oracle
+#     look-ahead). This matches capturable(drop_flat)'s "drop the opportunity, don't substitute" discipline.
+#   • true_add vs re_entry — classified against the REAL episode OPEN/CLOSE intervals (build_episodes), NOT
+#     a proxy: a TRUE scale-in piles onto a still-OPEN base edge episode; a RE-ENTRY is a separate later arb
+#     on a bucket merely still HELD to settlement (the one-position-per-slug guard, bot-rs main.rs:497, blocks
+#     these and they concentrate correlated settlement risk). 256/348 are re-entry at the 28h hold.
+#   • a flat_widen flag and is_true_add flag travel on each add dict for per-class / before-after reporting.
 # ============================================================================================
-def add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain, settle_offset_h=28.0):
-    """Per capturable filled arb, find the BEST same-direction WIDEN DURING THE HELD POSITION'S LIFETIME
-    ([open_t, settlement], same window rationale as flip_events) whose net exceeds the original by >=
-    tau_gain. Returns {market, cat, dir, net0, c2_0, net_add, c2_add, size0, size_add, inc_pnl, void} —
-    size_add capped at add_cap_frac*size0; inc_pnl = size_add*(book-avg add edge - void)."""
+def _widen_is_flat(depth):
+    """A WIDEN's depth ladder is the [L20] book-init phantom fingerprint when c2==c1==c0 with depth>0 (one
+    resting level mirrored down the book). depth may be None (one-sided/unmeasured) -> not flat."""
+    d = depth or {}
+    return bool(d) and d.get("c2", 0) == d.get("c1", -1) == d.get("c0", -2) and d.get("c2", 0) > 0
+
+
+def add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain,
+               settle_offset_h=28.0, drop_flat_widen=False):
+    """Per capturable filled arb, find the FIRST (causal) same-direction WIDEN DURING THE HELD POSITION'S
+    LIFETIME ([open_t, settlement], same window rationale as flip_events) whose net exceeds the original by
+    >= tau_gain. Returns {market, cat, dir, net0, c2_0, net_add, c2_add, size0, size_add, inc_pnl, void,
+    flat_widen, is_true_add} — size_add capped at add_cap_frac*size0; inc_pnl = size_add*(book-avg add edge
+    - void). drop_flat_widen=True skips an add whose first qualifying widen is a flat-ladder phantom ([L20]
+    lens on the add leg). is_true_add = the base edge episode was still OPEN at the widen time (real scale-in)
+    vs a re-entry (separate later arb on a still-held bucket)."""
     filled = {e["market"]: e for e in one_per_market(capturable(episodes, edge_min, window_min))}
+    # REAL episode intervals per market (from build_episodes) — the base episode whose open_t matches the
+    # filled rep's open_t defines [open, close] for the true-add/re-entry classification (not the settlement
+    # proxy: a logged CLOSE means the EDGE left the book = the scale-in window ended, even if held longer).
+    ep_intervals = {}
+    for e in episodes:
+        ep_intervals.setdefault(e["market"], []).append((e["open_t"], e["close_t"]))
     # ORIGINAL entry dir per market from the OPEN record (ep["dir"] is mutated post-flip by build_episodes).
     open_dir, widens = {}, {}
     for r in records:
@@ -196,36 +234,51 @@ def add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, 
             open_dir.setdefault(r["market"], r.get("dir"))     # first OPEN's dir = the entry direction
         elif r["transition"] == "WIDEN":
             widens.setdefault(r["market"], []).append(
-                (r["t"], r.get("net_edge"), (r.get("depth") or {}).get("c2", 0), r.get("dir")))
-    out = []
+                (r["t"], r.get("net_edge"), (r.get("depth") or {}).get("c2", 0), r.get("dir"), r.get("depth")))
+    out, dropped_flat = [], 0
     for m, ep in filled.items():
         d0 = open_dir.get(m, ep["dir"])
         st = settle_t(m, ep["open_t"], settle_offset_h)        # held to settlement, not to edge-close
+        # key the sort EXPLICITLY on t (w[0]): the tuples carry a depth dict in the last slot, so a bare
+        # sorted() raises TypeError the instant two widens share a timestamp (audit INFO-3 — hit live).
         cand = sorted([w for w in widens.get(m, [])
                        if ep["open_t"] <= w[0] <= st and w[3] == d0                   # SAME direction only
-                       and w[1] is not None and w[1] - ep["open_net"] >= tau_gain])
+                       and w[1] is not None and w[1] - ep["open_net"] >= tau_gain],
+                      key=lambda w: w[0])
         if not cand:
             continue
         # the FIRST qualifying widen (causal — what you'd actually act on), NOT the max over the day
-        # (picking the peak is an oracle, [L19]). sorted() above orders by t regardless of input order.
-        bt, bnet, bc2, _ = cand[0]
+        # (picking the peak is an oracle, [L19]).
+        bt, bnet, bc2, _, bdepth = cand[0]
+        flat = _widen_is_flat(bdepth)
         size0 = min(ep["open_c2"], max_clip)
         size_add = min(bc2, max_clip, int(round(add_cap_frac * size0)))             # per-pair add cap
         if size_add <= 0:
             continue
+        if drop_flat_widen and flat:           # [L20] phantom lens: drop the add (don't substitute a later clean widen)
+            dropped_flat += 1
+            continue
+        # TRUE-ADD vs RE-ENTRY: is the BASE edge episode (the one that started at ep["open_t"]) still OPEN
+        # at the widen time? Classify against the real interval, not the settlement proxy.
+        base = next(((ot, ct) for ot, ct in ep_intervals.get(m, []) if abs(ot - ep["open_t"]) < 1e-6), None)
+        is_true_add = bool(base) and base[0] <= bt <= base[1]
         avg_edge = max(DEPTH_BOUNDARY_NET, (bnet + DEPTH_BOUNDARY_NET) / 2.0)        # walk-the-book decay (same as capital_sim)
         vh = void_haircut(m)
         inc = size_add * max(0.0, avg_edge - vh)
         out.append({"market": m, "cat": ep["cat"], "dir": d0, "net0": ep["open_net"],
                     "c2_0": ep["open_c2"], "net_add": bnet, "c2_add": bc2,
-                    "size0": size0, "size_add": size_add, "inc_pnl": inc, "void": vh})
-    return out
+                    "size0": size0, "size_add": size_add, "inc_pnl": inc, "void": vh,
+                    "flat_widen": flat, "is_true_add": is_true_add})
+    return out, dropped_flat
 
 
 # ============================================================================================
 # REPORT
 # ============================================================================================
 CATS = ("weather", "sports", "econ", "soccer3", "other")
+ADD_DEFAULT_OFFSET_H = 28.0                          # the prior single-value hold (kept as the headline row)
+ADD_SWEEP_OFFSETS_H = (4, 8, 12, 24, 28, 48)         # hold-window sweep (audit WARN-1): an add only counts if
+                                                     # the bigger arb appears before the FIRST pair settles
 
 def report(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain):
     out = []; P = out.append
@@ -240,7 +293,7 @@ def report(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_
         by_cat_filled.setdefault(e["cat"], []).append(e)
 
     flips = flip_events(records, episodes, edge_min, window_min, tau_gain)
-    adds = add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain)
+    adds, _ = add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain)
     flips_by_cat = {}
     for f in flips:
         flips_by_cat.setdefault(f["cat"], []).append(f)
@@ -321,9 +374,10 @@ def report(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_
                   f"reverse-arb net avg {sum(rev)/len(rev)*100:+.2f}c   "
                   f"reverse-minus-hold {(sum(rev)-sum(hold))/len(fs)*100:+.2f}c/arb  (+ unknown close gain)")
 
-    # ---- (3) ADD PnL ----
+    # ---- (3) ADD PnL — with the THREE audit-required disclosures so the figure is never quoted bare ----
     P("")
     P("(3) ADD PnL  — markets that later offered a BIGGER SAME-DIRECTION arb while held (a scale-in)")
+    P(f"    (settle proxy +{ADD_DEFAULT_OFFSET_H:.0f}h headline; phantom-lensed; the hold-window sweep + true-add/re-entry split disclose its sensitivity)")
     if not adds:
         P("  (no qualifying same-direction widen beyond tau_gain — no add opportunities)")
     else:
@@ -337,11 +391,85 @@ def report(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_
               f"incremental ${inc:,.2f} PAPER-GROSS")
         inc = sum(a["inc_pnl"] for a in adds); sz = sum(a["size_add"] for a in adds)
         P(f"  {'ALL':8} n={len(adds):<3}  add size {sz:>6.0f}   incremental ${inc:,.2f} PAPER-GROSS over single-entry")
+
+        # ---- (3a) HOLD-WINDOW SWEEP — an add only counts if the bigger arb appears BEFORE the first pair
+        #      settles, so a longer assumed hold inflates the count. Sweep the settlement proxy; quote a
+        #      RANGE, never the single 28h point (audit WARN-1). ----
+        P("")
+        P("  (3a) HOLD-WINDOW SWEEP  — add count + PnL per assumed hold (the FIRST-position settlement proxy).")
+        P("       The TRUE-ADD column is the genuine scale-in count (base edge still open); RE-ENTRY is the rest.")
+        P(f"       {'hold':>6}  {'adds':>5}  {'PnL$':>9}  {'trueadd':>8}  {'reentry':>8}   "
+          + "  ".join(f"{c[:4]:>8}" for c in CATS if c != "other"))
+        for off in ADD_SWEEP_OFFSETS_H:
+            sw, _ = add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain, settle_offset_h=off)
+            n = len(sw); pnl = sum(a["inc_pnl"] for a in sw)
+            n_true = sum(1 for a in sw if a["is_true_add"])
+            cat_pnl = {c: sum(a["inc_pnl"] for a in sw if a["cat"] == c) for c in CATS}
+            tag = "  <- headline" if abs(off - ADD_DEFAULT_OFFSET_H) < 1e-9 else ""
+            P(f"       {off:>4.0f}h  {n:>5}  {pnl:>9,.2f}  {n_true:>8}  {n-n_true:>8}   "
+              + "  ".join(f"{cat_pnl[c]:>8,.2f}" for c in CATS if c != "other") + tag)
+        P("       NOTE: TRUE-ADD is ~INVARIANT to the hold (a real scale-in needs the base edge still OPEN, which")
+        P("       the settlement proxy doesn't touch); the whole hold-window LEVER moves only the RE-ENTRY count.")
+        P("       REALISTIC per-category settle (which sweep row each maps to):")
+        P("         weather ~1.2d after the daily high locks (~6PM ET) -> between the 24h and 48h rows")
+        P("         sports  at game-end (hours after open)             -> the 4h-12h rows")
+        P("         econ    at the release print (the far endDate)     -> the 48h row (or beyond)")
+        P("       -> the add PnL is hold-conditional; quote the RANGE across plausible holds, not one value.")
+
+        # ---- (3b) PHANTOM LENS on the add path — the [L20] flat-ladder drop applied to the WIDEN leg
+        #      (the base cohort gets it via capturable(); the WIDEN record bypasses that chokepoint). ----
+        P("")
+        P("  (3b) PHANTOM LENS  — [L20] flat-ladder (c2==c1==c0) drop on the add's driving WIDEN, per the audit")
+        lensed, dropped = add_events(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_gain,
+                                     drop_flat_widen=True)
+        pnl_before = sum(a["inc_pnl"] for a in adds)
+        pnl_after = sum(a["inc_pnl"] for a in lensed)
+        n_flat = sum(1 for a in adds if a["flat_widen"])           # adds whose chosen widen IS a flat phantom
+        pnl_flat = sum(a["inc_pnl"] for a in adds if a["flat_widen"])
+        P(f"       BEFORE lens : n={len(adds):<3}  ${pnl_before:,.2f}")
+        P(f"       AFTER  lens : n={len(lensed):<3}  ${pnl_after:,.2f}   "
+          f"(dropped {len(adds)-len(lensed)} adds = ${pnl_before-pnl_after:,.2f}; "
+          f"{100*(pnl_before-pnl_after)/pnl_before if pnl_before else 0:.1f}% of the headline rode on flat-ladder widens)")
+        P(f"       proof the lens fired: {n_flat} of {len(adds)} counted adds had a FLAT-LADDER driving widen "
+          f"(${pnl_flat:,.2f}).")
+        for c in CATS:
+            bz = [a for a in adds if a["cat"] == c]
+            az = [a for a in lensed if a["cat"] == c]
+            if not bz:
+                continue
+            P(f"         {c:8} before ${sum(a['inc_pnl'] for a in bz):>8,.2f} (n={len(bz)})  ->  "
+              f"after ${sum(a['inc_pnl'] for a in az):>8,.2f} (n={len(az)})")
+        P("       -> the quotable add figure is the LENSED one (same phantom discipline the base cohort gets).")
+
+        # ---- (3c) TRUE-ADD vs RE-ENTRY split (the decision-useful one) — classified against the REAL
+        #      episode OPEN/CLOSE, not a proxy (audit). TRUE scale-in piles onto a still-OPEN edge; re-entry
+        #      is a separate later arb on a still-held bucket (blocked by the one-position-per-slug guard,
+        #      bot-rs main.rs:497, and it concentrates correlated settlement risk). ----
+        P("")
+        P("  (3c) TRUE-ADD vs RE-ENTRY  — base edge episode still OPEN at the widen (TRUE scale-in) vs already")
+        P("       CLOSED (RE-ENTRY: a separate later arb on a still-held bucket; the per-slug guard blocks it).")
+        true_a = [a for a in adds if a["is_true_add"]]
+        reentry = [a for a in adds if not a["is_true_add"]]
+        P(f"       {'class':<10} {'n':>4} {'PnL$':>9}   " + "  ".join(f"{c[:4]:>8}" for c in CATS if c != "other"))
+        for label, grp in (("TRUE-ADD", true_a), ("RE-ENTRY", reentry)):
+            cat_pnl = {c: sum(a["inc_pnl"] for a in grp if a["cat"] == c) for c in CATS}
+            P(f"       {label:<10} {len(grp):>4} {sum(a['inc_pnl'] for a in grp):>9,.2f}   "
+              + "  ".join(f"{cat_pnl[c]:>8,.2f}" for c in CATS if c != "other"))
+        P(f"       -> only {len(true_a)}/{len(adds)} counted adds are GENUINE scale-in (the owner's feature); "
+          f"{len(reentry)}/{len(adds)} are re-entry that the live one-position-per-slug guard already blocks.")
+        # the cleanest single number for the FEATURE: a genuine scale-in that ALSO survives the [L20] phantom
+        # lens (its driving widen is not a flat-ladder book-init artifact). Both disciplines applied at once.
+        true_clean = [a for a in true_a if not a["flat_widen"]]
+        P(f"       BOTH lenses (genuine scale-in AND a non-phantom driving widen): {len(true_clean)}/{len(adds)} adds, "
+          f"${sum(a['inc_pnl'] for a in true_clean):,.2f} paper-gross — the honest size of the actual feature "
+          f"({len(true_a)-len(true_clean)} of the {len(true_a)} scale-ins ride a flat-ladder phantom widen).")
+
         # correlated-settlement concentration: how many markets share one settlement bucket-date-cat cluster
         clusters = {}
         for a in adds:
             clusters.setdefault((a["cat"]), 0)
             clusters[(a["cat"])] += 1
+        P("")
         P(f"  CONCENTRATION: the add stacks a 2nd pair on the SAME bucket -> N pairs lose together if that "
           f"bucket's grading diverges.")
         P(f"    add markets per category: " + "  ".join(f"{c}={n}" for c, n in sorted(clusters.items())))
@@ -354,11 +482,18 @@ def report(records, episodes, edge_min, window_min, max_clip, add_cap_frac, tau_
     P("  • SPORTS close mark is UNPRICEABLE from the logged fields: the transition `px` carries only the two")
     P("    Kalshi team YES *asks* (ka/kb), never the Kalshi YES *bid* needed to sell a Kalshi-backed leg. So a")
     P("    sports FLIP's close P&L is omitted (NOT fabricated) — only the reverse-arb leg is quantified there.")
+    P("  • the FLIP reverse-leg benefit is a SELECTION-BIASED LOWER bound: net1 is a max-order-statistic over a")
+    P("    noisy basis (we only observe crossings that GREW past tau_gain), so even the 'reverse leg only' figure")
+    P("    is optimistic — the same best-order-statistic family as the project's seed-city lesson ([L19]).")
     P("  • WEATHER + ECON NEVER FLIP in this data (a 1:1 bucket's basis doesn't cross) -> the FLIP idea has no")
-    P("    population outside sports; the sports flips that exist are mostly sub-cent ITF-tennis noise.")
-    P(f"  • effective-n is TINY per category. tau_gain={tau_gain*100:.1f}c is a fixed trigger, NOT oracle-tuned on")
-    P("    these results. At this span this is a METHOD DEMO; a 'flips are too rare to matter' read is a valid")
-    P("    outcome ([L19] discipline).")
+    P("    population outside sports. Of the sports flips, the ORIGINAL legs are sub-cent (it's the entry that's")
+    P("    tiny); the REVERSE arbs that follow are larger (mostly >2c) but their close-mark is unpriceable.")
+    P("  • the ADD figure is a HOLD-CONDITIONAL RANGE, not a point: it moves ~$99(lensed)..$135 across the hold")
+    P("    sweep (3a) and the phantom-lens (3b), and only ~1/4 of counted adds are genuine scale-in (3c). Quote")
+    P("    the LENSED figure as a range with the hold + true-add caveats; never the bare 28h number.")
+    P(f"  • effective-n is TINY per category (~5 independent event-dates carry essentially all the add PnL).")
+    P(f"    tau_gain={tau_gain*100:.1f}c is a fixed trigger, NOT oracle-tuned on these results. At this span this is a")
+    P("    METHOD DEMO; a 'flips/adds are too rare or too hold-sensitive to matter' read is a valid outcome ([L19]).")
     P("=" * 92)
     return "\n".join(out)
 
@@ -439,23 +574,58 @@ def _selftest():
     assert flip_events(recs_sd, eps_sd, 0.0, 0, tau_gain=0.01) == []           # same-dir reverse -> NOT a flip
 
     # --- add_events: W's same-direction widen to 8c IS an add; M (which flipped) has no same-dir widen ---
-    ae = add_events(recs, eps, edge_min=0.0, window_min=0, max_clip=1000, add_cap_frac=0.20, tau_gain=0.01)
+    ae, n_dropped = add_events(recs, eps, edge_min=0.0, window_min=0, max_clip=1000, add_cap_frac=0.20, tau_gain=0.01)
     assert len(ae) == 1 and ae[0]["market"] == W, [a["market"] for a in ae]
     assert ae[0]["dir"] == "P" and ae[0]["net_add"] == 0.08
     assert ae[0]["size_add"] == round(0.20 * min(50, 1000)) == 10              # 20% of size0=50 -> 10
-    assert ae[0]["inc_pnl"] > 0
+    assert ae[0]["inc_pnl"] > 0 and n_dropped == 0
 
     # a widen in the OPPOSITE direction must NOT be an add (it's the flip path)
     recs_opp = [tr(0, W, "OPEN", "P", 0.02, entry), tr(4, W, "WIDEN", "K", 0.08, flip),
                 tr(6, W, "CLOSE", "P", -0.01, entry)]
     eps_o = build_episodes(recs_opp, [], close_lag=0)
-    assert add_events(recs_opp, eps_o, 0.0, 0, 1000, 0.20, 0.01) == []         # opposite-dir widen excluded
+    assert add_events(recs_opp, eps_o, 0.0, 0, 1000, 0.20, 0.01)[0] == []      # opposite-dir widen excluded
 
-    # report renders end-to-end on the synthetic set
+    # --- TRUE-ADD vs RE-ENTRY classification against the REAL episode interval (the decision-useful split) ---
+    # W's widen at t=4 fires WHILE W's base episode (OPEN t0 .. CLOSE t6) is OPEN -> TRUE scale-in.
+    assert ae[0]["is_true_add"] is True, ae[0]                                 # base episode still open at the widen
+    # RE-ENTRY: the same-direction bigger arb appears AFTER the base edge episode CLOSED but the bucket is
+    # still HELD to settlement. Base episode OPEN t0 .. CLOSE t5; a NEW edge episode (re-OPEN t100) carries a
+    # bigger same-dir arb at t101 — counted as an add only under hold-to-settlement, but it is NOT a scale-in.
+    RM = "tc-temp-laxhigh-2026-06-10-gte73"      # date 06-10 -> settle proxy +28h >> t101, so still "held"
+    bigger = {"p_yb": 0.54, "p_ya": 0.56, "k_yb": 0.70, "k_ya": 0.72}         # dir P, net ~8c (bigger than 2c)
+    recs_re = [tr(0, RM, "OPEN", "P", 0.02, entry), tr(5, RM, "CLOSE", "P", -0.01, entry),   # base edge closes at t5
+               tr(100, RM, "OPEN", "P", 0.02, entry), tr(101, RM, "WIDEN", "P", 0.08, bigger),  # later separate arb
+               tr(105, RM, "CLOSE", "P", -0.01, entry)]
+    eps_re = build_episodes(recs_re, [], close_lag=0)
+    re_add, _ = add_events(recs_re, eps_re, 0.0, 0, 1000, 0.20, 0.01)
+    assert len(re_add) == 1 and re_add[0]["market"] == RM, re_add              # the widen IS counted as an add
+    assert re_add[0]["is_true_add"] is False, re_add[0]                        # but it's RE-ENTRY (base episode closed at t5 < t101)
+
+    # --- PHANTOM LENS: a FLAT-LADDER (c2==c1==c0) driving widen is dropped when drop_flat_widen=True ---
+    # tr() writes depth c2==c1==c0 (a flat ladder) -> W's widen IS a flat phantom. Lens off: counted; lens on: dropped.
+    assert _widen_is_flat({"c2": 50, "c1": 50, "c0": 50}) and not _widen_is_flat({"c2": 50, "c1": 40, "c0": 30})
+    assert not _widen_is_flat(None) and not _widen_is_flat({"c2": 0, "c1": 0, "c0": 0})   # None / zero-depth not flat
+    assert ae[0]["flat_widen"] is True, ae[0]                                  # the synthetic widen is flat-laddered
+    lensed, dropped = add_events(recs, eps, 0.0, 0, 1000, 0.20, 0.01, drop_flat_widen=True)
+    assert lensed == [] and dropped == 1, (lensed, dropped)                    # the only add was flat -> dropped, none remain
+    # a NON-flat driving widen survives the lens (depth ladder not all-equal)
+    recs_nf = [tr(0, W, "OPEN", "P", 0.02, entry, c2=50),
+               {"t": 4, "market": W, "transition": "WIDEN", "dir": "P", "net_edge": 0.08,
+                "depth": {"c2": 80, "c1": 60, "c0": 40}, "px": entry},                      # sloped ladder = real book
+               tr(6, W, "CLOSE", "P", -0.01, entry)]
+    eps_nf = build_episodes(recs_nf, [], close_lag=0)
+    nf_add, nf_dropped = add_events(recs_nf, eps_nf, 0.0, 0, 1000, 0.20, 0.01, drop_flat_widen=True)
+    assert len(nf_add) == 1 and nf_dropped == 0 and nf_add[0]["flat_widen"] is False, (nf_add, nf_dropped)
+
+    # report renders end-to-end on the synthetic set, INCLUDING the three audit disclosures
     txt = report(sorted(recs, key=lambda r: r["t"]), eps, 0.0, 0, 1000, 0.20, 0.01)
     assert "FLIP BASE RATE" in txt and "ADD PnL" in txt and "CAVEATS" in txt
+    assert "HOLD-WINDOW SWEEP" in txt and "PHANTOM LENS" in txt and "TRUE-ADD vs RE-ENTRY" in txt
     print("  OK — close-mark == Ledger cash; flip detected & same-dir widen excluded; add detected & "
-          "opposite-dir widen excluded; tau_gain gate; sports close = None (not fabricated); report renders")
+          "opposite-dir widen excluded; tau_gain gate; sports close = None (not fabricated)")
+    print("  OK — TRUE-ADD vs RE-ENTRY classified on the real episode interval; flat-ladder phantom lens drops "
+          "a flat-driving widen; all three disclosures render")
     print("self-test passed.")
 
 

@@ -1,118 +1,94 @@
 ---
 from: coding-agent (self-review pass)
 run_id: 20260614-flip-add
-timestamp: 2026-06-14T07:46:00Z
-scope_reviewed: [scripts/flip_add_backtest.py:1-440]
-critical_count: 2
-warn_count: 3
-info_count: 3
+timestamp: 2026-06-14T08:24:12Z
+scope_reviewed: [scripts/flip_add_backtest.py — ADD path refinements per stats-ml-logic-reviewer audit (hold sweep, phantom lens, true-add/re-entry split, INFO fixes)]
+critical_count: 0
+warn_count: 0
+info_count: 1
 launch_recommendation: PROCEED
 self_review: true
-cross_references: []
+cross_references: [tasks/_agent_bus/20260614-flip-add/stats-ml-logic-reviewer.md, tasks/_agent_bus/20260614-flip-add/coding-agent.md (prior-run), tasks/lessons.md (L19/L20/L28)]
 ---
 
 ## Goal Understanding
-A READ-ONLY backtest answering a BUILD decision: would the FLIP (close+reverse) and ADD (scale-in)
-extensions add profit on historical persistence data, given the live bot takes one position/market and
-holds to settlement. Not tuning a live system. The honest gating output is the per-category flip base
-rate; a "too rare to matter" answer is a valid (good) outcome, not a failure.
+Refine the already-committed read-only ADD/FLIP backtest so the $135 ADD figure is no longer quotable
+bare. The audit (WARN-1/2/3 + INFO-1/2/3) wanted three disclosures wired into the report: a hold-window
+sweep, the [L20] flat-ladder phantom lens applied to the add's driving WIDEN, and a TRUE-ADD-vs-RE-ENTRY
+split classified against the REAL episode open/close (not a proxy). Reuse the proven harness; no fresh
+cohort. This feeds a BUILD decision, not a live launch or signed prereg.
 
 ## Scope Reviewed
-- scripts/flip_add_backtest.py — the only created file; reuses the proven harness, no upstream edits.
+- scripts/flip_add_backtest.py:186-243 — `add_events` refactor (now returns `(out, dropped_flat)`; adds
+  `drop_flat_widen` param + `_widen_is_flat` helper; explicit sort key; per-add `flat_widen`/`is_true_add`).
+- scripts/flip_add_backtest.py:330-420 — report sections (3a) hold sweep, (3b) phantom lens, (3c)
+  true-add/re-entry + both-lenses line; caveats reworded (INFO-1/INFO-2 + hold-conditional-range note).
+- scripts/flip_add_backtest.py:440-470 — selftest: true-add vs re-entry on a synthetic case + phantom-lens
+  drop on a flat-driving widen + non-flat survives.
 
 ## Findings
 
-### CRITICAL (must fix before launch) — both caught and self-resolved within this run
-- Flip window scoped to the first edge episode, not the held position's lifetime
-  - Location: flip_events / add_events (the `<= ep["close_t"]` bound, pre-fix)
-  - Issue: under hold-to-settlement, the pair is held from the first capturable open to SETTLEMENT; a
-    logged CLOSE only means the EDGE STATE left the book, not that the locked pair was sold. Scoping flips
-    to `[open_t, episode close_t]` dropped 65 of 68 logged flips — they land in LATER edge episodes of the
-    same still-held market. The pre-fix run reported a FALSE 0.0% flip rate across all categories.
-  - Why it matters: a 0% gating number would have wrongly killed the FLIP idea outright; the corrected
-    number is small but non-zero (sports 1.7%) and qualitatively different.
-  - Fix: window = `[open_t, settle_t(market, open_t, 28h)]`, the same settlement proxy capital_sim uses.
-  - Status: self-resolved within run.
-- No opposite-direction guard on the flip trigger
-  - Location: flip_events trigger condition
-  - Issue: a logged FLIP record is a reversal vs the THEN-CURRENT edge state, but over a multi-flip held
-    position the book can swing back to the ENTRY direction. Without `rdir != dir0`, 4 of 14 detected
-    "flips" were same-direction bigger arbs (entry KP, recomputed reverse KP) — that is the ADD path, not
-    a close-and-reverse cross-over. It inflated the flip count and would have double-counted those events'
-    benefit as a flip.
-  - Why it matters: goal misalignment — a flip's economics (close the held leg, re-enter reversed) only
-    apply when the bigger arb is OPPOSITE the held direction.
-  - Fix: require `rdir != dir0` in the trigger; selftest now asserts a same-dir reverse is excluded.
-    Flip count corrected 14 → 10.
-  - Status: self-resolved within run.
+### CRITICAL — none.
 
-### WARN (fix or justify)
-- Sports FLIP close mark is structurally unpriceable from the logged fields — DISCLOSED, not worked around
-  - Location: close_pnl_game (returns None by construction)
-  - Issue: the transition `px` for sports logs only the two Kalshi team YES *asks* (ka/kb), never the
-    Kalshi YES *bid* needed to sell a Kalshi-backed leg. Since every cross-venue arb has exactly one Kalshi
-    leg, the sports close P&L cannot be computed without fabricating a Kalshi bid ([L18]/[L28] forbid the
-    convenient proxy). All 10 real flips are sports, so the "FLIP vs HOLD" headline the task asked for has
-    ZERO fully-priced rows.
-  - Justification/mitigation: I report the computable PARTIAL — the reverse-arb leg vs HOLD (+5.36c/arb),
-    explicitly labeled a LOWER bound (the close gain is an unknown positive term, since you only close into
-    a favourable basis). The caveat block states this prominently. Closing this fully needs a new logged
-    field (Kalshi YES bid) on sports transitions — a monitor change, out of scope for a read-only backtest.
-- n=1 ceil-fee asymmetry between HOLD and the close mark
-  - Location: close_pnl_weather (Ledger.enter/unwind_all use the per-ORDER ceil fee at size 1)
-  - Issue: HOLD's `net0`/`net1` come from the marginal-fee `signal()`/`game_edge`, while the close mark
-    pays the n=1 ceil fee (~2c per Kalshi leg, [L10]). At unit size the close is therefore a CONSERVATIVE
-    floor, not a like-for-like fee basis. Documented in the selftest comment and the report is per-contract
-    at unit size. Moot for the real data (0 priceable flips), but if weather ever flips this would slightly
-    understate the flip's PnL. Acceptable as a conservative floor; flagged so a future reader re-prices at
-    real clip size if it ever matters.
-- Effective-n is tiny and the span is < 4 days
-  - Location: whole report
-  - Issue: sports 10 flips / econ 4 filled / weather 0 flips over 5.08 d. Any PnL magnitude is a method
-    demo, not validation. The report prints the `< 4 days` PRELIMINARY banner, the per-category effective-n,
-    and the `effective-n TINY` note for n<20. Honest, but the reader must not over-read the $135 add figure.
+### WARN — none. (All three audit WARNs are now disclosed in-report; the audit had 0 CRITICAL.)
 
-### INFO (optional improvements / simplifications)
-- The 4 same-direction events excluded from the flip count are genuine "bigger same-direction arb while
-  held" opportunities, but they are logged as FLIP transitions (not WIDEN), so the ADD path (which keys on
-  WIDEN) does not pick them up. Minor undercount of adds; left as-is to keep the ADD path cleanly keyed on
-  the WIDEN kind per the task's definition.
-- close_pnl_game's three params are unused (it always returns None). Kept for call-signature symmetry with
-  close_pnl_weather and so the docstring documents WHY at the call site. Could be simplified to a constant,
-  but the symmetry aids the reader.
-- `--tau-gain` defaults to 1.0c, a fixed (non-oracle) trigger. A sweep would be informative but must be
-  reported as straight/OOS application, not in-sample best ([L19]) — deliberately not swept here.
+### INFO (optional)
+- The (3c) true-add/re-entry split is computed on the UNLENSED 348-add cohort (matching the audit's
+  301/408 reference frame), while (3b) reports the lensed total. To avoid a reader cross-wiring the two,
+  I added a "BOTH lenses" line (61 adds / $22.69) — the genuine scale-in that ALSO survives the phantom
+  lens. This is the single most-honest number for the actual feature; kept the per-cohort views too so
+  each audit point maps 1:1 to its section. No further action needed.
+
+## Adversarial checks I actually ran (independent recompute, not trusting my own code)
+- **Phantom lens fired correctly:** dropped markets == flat-driving markets EXACTLY (93 == 93); 0 clean
+  adds wrongly dropped; 0 flat adds wrongly kept in the lensed cohort. BEFORE $135.31 → AFTER $98.69,
+  delta $36.62 (27.1%) — reproduces the audit's $36.62/27.1% to the cent.
+- **True-add classification correct against the REAL interval:** re-derived true/re-entry straight from
+  raw OPEN/WIDEN records + `build_episodes` intervals (not via `add_events`) → 92 true / 256 re-entry,
+  MATCHES the code. The base-episode match keys on `abs(open_t − ep.open_t) < 1e-6` against the actual
+  episode close_t, not the settlement proxy.
+- **TRUE-ADD is invariant across the hold sweep (92 at every offset 4h..48h)** while RE-ENTRY grows
+  134→259. This is a stronger statement than the audit had: the hold-window LEVER the audit flagged moves
+  ONLY re-entry; a genuine scale-in never depends on the settlement assumption. Surfaced as a sweep column.
+- **Effective-n honestly tiny:** lensed add PnL spans 7 event-dates, ~4 (06-10/11/12/13) carry ~99%;
+  top-1 market 9.0%, top-5 24.3% — not single-bet-dominated (consistent with the audit's not-an-oracle
+  finding), but ~5 independent date-units, stated in the caveats.
+- **INFO-3 (latent sort TypeError) is real:** reproducing `add_events` with a 5-tuple raised
+  `TypeError: '<' not supported between instances of 'dict' and 'dict'` immediately when two widens shared
+  a `t`. Fixed with explicit `key=lambda w: w[0]`.
+- **[L28] field shapes re-verified against real records BEFORE coding:** WIDEN dir = sports KP/PK,
+  weather/econ single-letter K/P; 33/39594 WIDENs have `depth=None` → `(r.get("depth") or {})` handles it;
+  8848 WIDENs carry a flat `c2==c1==c0>0` ladder (the phantom population the lens targets).
 
 ## Checks Passed
-- Phantom filters APPLY at the shared chokepoint: 0 restart-censored episodes leaked into `filled`,
-  0 episodes with c2<1, the [L21] econ off-by-one quarantine fired (36 records dropped by `load()`). The
-  default-on filters removed 121 markets (830 unfiltered → 709 filled). A fresh harness re-admitting these
-  inflated the last backtest 57% ([L28]) — not repeated here (reused `capturable()`).
-- Close mark comes from REAL flip-time bids, not assumed: `close_pnl_weather` == a fresh `Ledger`'s cash
-  after enter+unwind_all on the same px (asserted to 1e-12); returns None if a sell-leg touch is missing.
-- Same-direction WIDEN is correctly EXCLUDED from the flip count and INCLUDED in adds (selftest);
-  opposite-direction WIDEN is excluded from adds (selftest).
-- Single-letter dir trap ([L28]) handled: weather/econ `P`/`K` routed via `signal`; sports `PK`/`KP` via
-  `game_edge`; px-shape dispatch (`px_is_game`) verified on both real shapes.
-- None-touch handling: `k_yb:null` and other missing touches return None (close unpriceable) rather than
-  crashing or fabricating.
-- Entry direction taken from the OPEN record, not the post-flip-mutated `ep["dir"]` (would mark the close
-  on the wrong leg).
-- Upstream selftests (analyze_persistence / capital_sim / ledger) still pass — import-only, no edits.
-- READ-ONLY: no order code, no network, no writes outside the new script + the bus artifacts.
+- No oracle ([L19]): the lens uses the FIRST causal widen and DROPS it if it's a phantom — it does NOT
+  substitute a later clean widen (that would be look-ahead picking the favourable event). The sweep is
+  straight application across a fixed offset list, not in-sample parameter tuning.
+- Phantom discipline matches the base cohort: `_widen_is_flat` uses the identical `c2==c1==c0 & c2>0`
+  predicate that `build_episodes` sets `open_flat` from and `capturable(drop_flat)` gates on.
+- 2026-07-02 econ event-date is NOT a leak: econ slugs carry the future RELEASE date (the U-3 twin settles
+  07-02 per CLAUDE.md); its widens fall inside the held window legitimately and it contributes $0.59.
+- Reused harness only — no re-derived cohort, no re-implemented economics ([L28]); the econ [L21]
+  quarantine still fires (36 records), 0 restart-censored leak into `filled`.
+- Selftest covers the new logic: true-add (base open at widen) AND re-entry (base closed at t5 < widen
+  t101 on a re-opened bucket still "held"); flat-driving widen dropped by the lens, non-flat survives;
+  `_widen_is_flat(None)`/zero-depth = not flat; all three report sections render.
+- All four selftests pass (flip_add + analyze_persistence + capital_sim + ledger run) — import-only, no
+  upstream edits.
+- Headline FLIP numbers unchanged (the refinement touched only the ADD path): weather 0/101, sports 10/604,
+  econ 0/4; FLIP PnL still 0/10 priceable.
 
 ## Launch Recommendation
-PROCEED. The two CRITICAL logic bugs were caught by the self-review's own diagnostics and fixed before
-delivery; the result is now internally consistent and conservative. The headline is a HONEST NEGATIVE-ish
-finding (flips are rare — sports-only at ~1.7%, and their close mark isn't even priceable from current
-logs), which is a valid build-decision input, not a failure.
+PROCEED. The three audit disclosures are wired in and reproduce the audit's numbers to the cent
+($104→$135 sweep; $36.62/27.1% flat-WIDEN; 92 true / 256 re-entry). The decision-quotable figures are now
+a hold-conditional, phantom-lensed RANGE ($99 lensed @28h .. $135 unlensed) with the genuine-scale-in
+feature honestly sized at 61 adds / $22.69 (both lenses). No CRITICAL/WARN remain.
 
 ## Self-review caveat
-This is a self-review of code I just authored — authorship bias applies. The result feeds a BUILD decision,
-not a signed preregistration or a live launch, so the bar is "is the measurement honest and the cohort
-clean," which it is. The single biggest reservation an independent reviewer should probe: the FLIP idea's
-actual profitability is UNMEASURED (sports close mark unpriceable from logged fields), so the only honest
-read is "flips are too rare AND too unmeasurable on current data to justify building yet" — if the owner
-wants a real flip PnL, the prerequisite is logging the Kalshi YES bid on sports transitions, not this
-backtest. An independent `stats-ml-logic-reviewer` pass on the tiny-n add figure would also be warranted
-before any prose quotes the $135.
+Authorship bias applies — I wrote this code. I countered it by re-deriving the two load-bearing claims
+(lens drop, true-add split) from raw records independently of `add_events` and confirming the match. This
+still feeds a BUILD decision, not a signed prereg or live launch, so the bar is "is the measurement honest
+and the cohort clean," which it is. An independent reviewer should probe the ONE remaining judgment call:
+the true-add/re-entry split is reported on the unlensed cohort (audit's frame) with a both-lenses summary
+line — if the project wants the canonical feature number to be the both-lenses one (61/$22.69), that is a
+framing choice for the owner, not a correctness issue.
