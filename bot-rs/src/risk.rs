@@ -19,6 +19,7 @@ pub enum Reject {
     MidDivergence(f64),   // L1 — identical-settlement pair's mids disagree wildly (bad join/stale)
     NonPositiveEdge,      // L11 — never book net<=0
     BelowEdgeFloor,       // opt-in 0014 floor (skip thin arbs); always reported, never silent (L15)
+    BelowEdgeRateFloor(f64), // opt-in 0014-H2 edge-RATE floor (¢/$-day); carries the rate (never silent, L15)
     ToxicDirection,       // H1 — dear-led WEATHER edge (~79% toxic); weather-only, tested signal
     NoFillableSize,       // size collapsed to 0 after depth/clip/affordability/caps
     PairCap,
@@ -49,6 +50,37 @@ pub struct Approved {
     pub size: u32,
     pub cost_per: f64,
     pub edge: Edge,
+    pub edge_rate: f64, // booked edge ÷ lock-days (¢ per $-day) — the 0014-H2 velocity metric, always logged
+}
+
+// --- Edge-RATE (0014-H2) lock-day model -------------------------------------------------------------
+// Corrected lock-day priors. The 2026-06-11 owner correction showed pmus credits cash AT GRADE (not at
+// the +14d endDate), so capital is locked entry->grade ≈ `days_to_event`, NOT capital_velocity.py's
+// passive 15/21d "hold to endDate". These are floors/fallbacks; SPORTS uses the live `days_to_event`
+// directly (a game today ranks far above one 7 days out — the whole point of edge-rate). These are NOT
+// the frozen 0014-H2 *backtest* priors (weather 1.2 / sports 15 / econ days-to-release) — those stay
+// frozen for the confirmatory test (decision 0017); this is the LIVE bot's best-current model.
+const LOCK_DAYS_WEATHER: f64 = 1.2; // settles ~same evening; days_to_event is 0/None for weather anyway
+const LOCK_DAYS_SPORTS_FLOOR: f64 = 0.4; // a same-day game still locks ~to tonight's grade
+const LOCK_DAYS_ECON_FALLBACK: f64 = 21.0; // days_to_event is None for econ (no release calendar in the
+                                           // bot) -> ranks econ last, correctly (0017 follow-up: real cal)
+
+/// Effective capital-lock horizon in days (entry -> grade) for the edge-RATE metric. ALWAYS finite and
+/// `>=` a positive floor: `None` OR a corrupt non-finite `days_to_event` (NaN or ±inf) falls back to the
+/// category prior, and a present finite value is clamped up to the floor. So `edge_rate = edge / lock_days`
+/// can never divide by zero or go non-finite — even if the upstream proximity gate (which fail-closes NaN)
+/// is disabled. (`f64::max` alone collapses NaN but would LEAK +inf through, hence the explicit `is_finite`.)
+fn lock_days(cat: Cat, days_to_event: Option<f64>) -> f64 {
+    let floored = |d: Option<f64>, floor: f64| match d {
+        Some(x) if x.is_finite() => x.max(floor),
+        _ => floor, // None or a corrupt non-finite time -> the category prior (keeps lock_days finite)
+    };
+    match cat {
+        Cat::Weather => LOCK_DAYS_WEATHER,
+        Cat::Sports => floored(days_to_event, LOCK_DAYS_SPORTS_FLOOR),
+        Cat::Econ => floored(days_to_event, LOCK_DAYS_ECON_FALLBACK),
+        Cat::Other => floored(days_to_event, LOCK_DAYS_ECON_FALLBACK),
+    }
 }
 
 /// Run the full pre-trade gate. `affordable` = contracts the bankroll can fund at this price.
@@ -160,6 +192,18 @@ pub fn evaluate(
         return Err(Reject::BelowEdgeFloor);
     }
 
+    // 4a. EDGE-RATE reservation floor (0014-H2): reserve scarce capital for high-VELOCITY arbs. A flat
+    //     edge floor gets categories backwards — a 13¢ econ arb @ ~21d = 0.6¢/$-day is WORSE than a 3¢
+    //     weather arb @ 1.2d = 2.5¢/$-day, yet the flat floor prefers the econ one. `edge_rate` is ALWAYS
+    //     computed (returned in Approved so the live path can log it + the owner can calibrate the
+    //     threshold against the real opportunity distribution); it only GATES when min_edge_rate_cpd > 0
+    //     (opt-in, default 0 = OFF -> zero behavior change). Lock-days = the corrected days-to-grade model
+    //     (decision 0017), NOT the frozen 0014-H2 backtest priors. Reservation-only: sizing is untouched.
+    let edge_rate = edge.net * 100.0 / lock_days(q.cat, q.days_to_event); // ¢ per dollar-day
+    if cfg.min_edge_rate_cpd > 0.0 && edge_rate < cfg.min_edge_rate_cpd {
+        return Err(Reject::BelowEdgeRateFloor(edge_rate));
+    }
+
     // 4b. TOXICITY-DIRECTION gate (H1 — the one tested idea that produced a signal; WEATHER-ONLY).
     //     A weather edge where the DEAR venue led the move is ~79% toxic vs ~17% for cheap-led; the
     //     cheap quote was right and you'd be adversely-selected onto the wrong leg. Skipping dear-led
@@ -221,6 +265,7 @@ pub fn evaluate(
         size,
         cost_per,
         edge: *edge,
+        edge_rate,
     })
 }
 
@@ -236,6 +281,7 @@ mod tests {
             kalshi_key_path: String::new(),
             pmus_env_path: String::new(),
             edge_floor_cents: 2.0,
+            min_edge_rate_cpd: 0.0,
             max_contracts_per_pair: 100,
             max_notional_per_pair: 1000.0,
             max_notional_per_cluster: 1000.0,
@@ -505,5 +551,66 @@ mod tests {
         c.fat_edge_size_factor = 1.0;
         let chase = evaluate(&c, &quote(), &Edge { net: 0.10, dir: Dir::PK }, &Exposure::new(), 1000).unwrap();
         assert_eq!(chase.size, thin.size);
+    }
+
+    #[test]
+    fn lock_days_uses_corrected_days_to_grade_priors() {
+        // WEATHER: always the ~same-evening floor, whether days_to_event is None or a stale 0.0.
+        assert_eq!(lock_days(Cat::Weather, None), LOCK_DAYS_WEATHER);
+        assert_eq!(lock_days(Cat::Weather, Some(0.0)), LOCK_DAYS_WEATHER);
+        // SPORTS: DYNAMIC from the live game date — the 2026-06-11 correction (was a flat passive 15d).
+        assert_eq!(lock_days(Cat::Sports, Some(7.0)), 7.0);
+        // ...floored, so a same-day game still locks ~to tonight's grade (never 0 -> never div-by-zero).
+        assert_eq!(lock_days(Cat::Sports, Some(0.0)), LOCK_DAYS_SPORTS_FLOOR);
+        // ECON: days_to_event is None today -> the fallback (correctly ranks econ last)...
+        assert_eq!(lock_days(Cat::Econ, None), LOCK_DAYS_ECON_FALLBACK);
+        // ...and a real release horizon would flow straight through (forward-compatible w/ a future calendar).
+        assert_eq!(lock_days(Cat::Econ, Some(25.0)), 25.0);
+        // NaN / negative collapse to the floor -> lock_days is ALWAYS finite & positive.
+        for d in [Some(f64::NAN), Some(-3.0), Some(f64::INFINITY)] {
+            let ld = lock_days(Cat::Sports, d);
+            assert!(ld.is_finite() && ld > 0.0, "lock_days(Sports, {:?}) = {} must be finite & >0", d, ld);
+        }
+    }
+
+    #[test]
+    fn edge_rate_is_booked_edge_over_lock_days() {
+        // a 3c weather arb @ 1.2d -> 2.5 c/$-day (computed + returned even with the gate OFF).
+        let w = evaluate(&cfg(), &quote(), &Edge { net: 0.03, dir: Dir::PK }, &Exposure::new(), 1000).unwrap();
+        assert!((w.edge_rate - 2.5).abs() < 1e-9, "weather edge_rate = {}", w.edge_rate);
+        // a 13c econ arb @ the 21d fallback -> ~0.62 c/$-day: a FATTER edge that is a WORSE use of capital
+        // than the 3c weather arb — exactly the inversion a flat edge floor gets backwards.
+        let mut econ = quote();
+        econ.cat = Cat::Econ;
+        econ.settle_clean = true; // isolate from the settlement gate
+        econ.days_to_event = None; // econ has no live release date -> fallback
+        let e = evaluate(&cfg(), &econ, &Edge { net: 0.13, dir: Dir::PK }, &Exposure::new(), 1000).unwrap();
+        assert!((e.edge_rate - 13.0 / 21.0).abs() < 1e-9, "econ edge_rate = {}", e.edge_rate);
+        assert!(e.edge_rate < w.edge_rate, "13c econ must rank BELOW 3c weather on velocity");
+    }
+
+    #[test]
+    fn edge_rate_floor_reserves_for_velocity_and_is_off_when_zero() {
+        // the motivating pair: a fat-but-slow econ arb (0.62 c/$-day) vs a thin-but-fast weather arb (2.5).
+        let mut econ = quote();
+        econ.cat = Cat::Econ;
+        econ.settle_clean = true;
+        econ.days_to_event = None;
+        let econ_edge = Edge { net: 0.13, dir: Dir::PK };
+
+        // gate ON at 1.0 c/$-day: the fat-but-slow econ arb is RESERVED OUT (reported, never silent)...
+        let mut c = cfg();
+        c.min_edge_rate_cpd = 1.0;
+        match evaluate(&c, &econ, &econ_edge, &Exposure::new(), 1000) {
+            Err(Reject::BelowEdgeRateFloor(r)) => assert!((r - 13.0 / 21.0).abs() < 1e-9, "rate {}", r),
+            other => panic!("expected BelowEdgeRateFloor, got {:?}", other),
+        }
+        // ...while the thin-but-FAST weather arb (2.5 > 1.0) still passes.
+        assert!(evaluate(&c, &quote(), &Edge { net: 0.03, dir: Dir::PK }, &Exposure::new(), 1000).is_ok());
+
+        // GATE OFF (min_edge_rate_cpd = 0.0): the SAME slow econ arb is approved -> the floor is a pure
+        // opt-in skip (0 disables it). (The SHIPPED from_env default is 1.0 — enabled live 2026-06-13 —
+        // but test configs keep it 0.0 to isolate the OTHER gates; see settlement/proximity tests.)
+        assert!(evaluate(&cfg(), &econ, &econ_edge, &Exposure::new(), 1000).is_ok());
     }
 }

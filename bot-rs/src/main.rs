@@ -98,6 +98,11 @@ fn banner(cfg: &Config) {
     println!("venue env         : {:?}{}", cfg.venue_env, venue_note);
     println!("edge floor        : {:.1}c", cfg.edge_floor_cents);
     println!(
+        "edge-rate floor   : {:.2}c/$-day{}",
+        cfg.min_edge_rate_cpd,
+        if cfg.min_edge_rate_cpd > 0.0 { "  (velocity gate ON)" } else { "  (off)" }
+    );
+    println!(
         "caps              : {} ctr/pair, ${:.0}/pair, ${:.0}/cluster, ${:.0} total, {} concurrent",
         cfg.max_contracts_per_pair,
         cfg.max_notional_per_pair,
@@ -509,6 +514,12 @@ async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn ExecutionBackend>, c
             if !realized_edge_clears_floor(cfg, &legs) {
                 continue;
             }
+            // Record the velocity metric on the live order path (the owner calibrates MIN_EDGE_RATE_CPD
+            // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day).
+            println!(
+                "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}",
+                a.size, edge.net * 100.0, a.edge_rate, edge.dir
+            );
             // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
             // outcome arm keeps the reservation on a both-filled fill (records the position) or releases it.
             let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
@@ -1560,7 +1571,7 @@ fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
 fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &dyn ExecutionBackend) {
     match evaluate(cfg, q, &edge, &Exposure::new(), 1000) {
         Ok(a) => {
-            println!("  APPROVED size={}  (edge {:.1}c, dir {:?})", a.size, edge.net * 100.0, edge.dir);
+            println!("  APPROVED size={}  (edge {:.1}c @ {:.2}c/$-day, dir {:?})", a.size, edge.net * 100.0, a.edge_rate, edge.dir);
             // build both legs from the BOOKS (same unified path the live loop uses) and fire.
             match build_legs(pair, q, edge.dir, a.size) {
                 Some(legs) => fire_legs(backend, &legs),

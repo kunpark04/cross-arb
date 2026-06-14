@@ -23,6 +23,7 @@ of least resistance, because the readiness audit + backtest concluded the edge i
 | Contracts/pair | `MAX_CONTRACTS_PER_PAIR` | **1** | the 1-contract staged-rollout brake |
 | Notional caps | `MAX_NOTIONAL_PER_{PAIR,CLUSTER}`, `MAX_TOTAL_NOTIONAL` | $1 / $5 / $20 | tiny |
 | Edge floor | `EDGE_FLOOR_CENTS` | 2.0 | 0014 pre-registered floor |
+| Edge-RATE floor | `MIN_EDGE_RATE_CPD` | **1.0** (on) | **0014-H2** reservation floor — skip arbs whose `booked_edge ÷ lock-days` (¢/$-day) is below this; reserves scarce capital for high-**velocity** arbs (a 13c econ @ ~21d = 0.6 ¢/$-day is a *worse* use of capital than a 3c weather @ 1.2d = 2.5). **ENABLED live 2026-06-13** (owner) at a conservative **1.0** — below the fast-category rates (weather ≥1.7, sports ≥4), so it only cuts genuinely-slow arbs (econ / far-dated sports); **inert on current data**, uncalibrated, recalibrate once slow arbs accrue. `edge_rate` is logged on every live ENTRY; **`0` disables**. Lock-days = corrected days-to-grade — sports is **dynamic** (`days_to_event`); decision 0017 |
 | Fat-edge haircut | `FAT_EDGE_SIZE_FACTOR` / `FAT_EDGE_KNEE_CENTS` | 0.5 / 6c | size **down** above the knee — fat edges are ~66% toxic & die ~0.5s (readiness audit + rust review); **set factor=1.0 to test** whether a sub-0.5s concurrent fill can capture them |
 | Econ twin divergence | `ECON_TWIN_MAX_DIVERGENCE_CENTS` | 15c | tighter divergence bound for settlement-identical econ twins (vs the 40c cross-category guard) — the 18c U-3 phantom must not sail through |
 | Toxicity-direction gate | `SKIP_DEAR_LED_WEATHER` | true | **H1** (the one tested strategy idea with a signal) — skip **dear-led weather** edges (~79% toxic vs ~17% cheap-led, Fisher p=2.7e-6); **weather-only** (sports null); dormant until stage-2 supplies `led_by` |
@@ -44,7 +45,10 @@ Kill-switch · WS-reconnect/seq-gap pause (never trade a rebuilding book) · **s
 exempt) · **postponement unwind** (flatten a held sports pair before Kalshi voids — `unwind.rs`) ·
 crossed/locked book (L12) · staleness (L13)
 · cross-venue **mid-divergence** (L1 bad-join/stale guard; **tighter category bound for econ twins**) ·
-non-positive edge (L11) · opt-in edge floor (L15) · **fat-edge toxicity haircut** (size down above the
+non-positive edge (L11) · opt-in edge floor (L15) · **edge-RATE reservation floor** (0014-H2 — skip
+low-velocity arbs by `edge ÷ lock-days`; reserve capital for fast turns; **live at 1.0¢/$-day** since
+2026-06-13, conservative — only cuts slow arbs) ·
+**fat-edge toxicity haircut** (size down above the
 ~6c knee — fat edges are adversely-selected; knob to test speed-capture) · **toxicity-DIRECTION gate**
 (H1 — skip dear-led *weather* edges, ~79% toxic; weather-only, dormant until stage-2 supplies `led_by`) ·
 per-pair / per-cluster (city-date, game) / total notional caps · concurrency cap · depth- and

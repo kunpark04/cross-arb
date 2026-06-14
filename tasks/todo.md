@@ -159,8 +159,9 @@ doable in Claude's sandbox — the rest is inherently the owner's environment:
       (the parity-review WARN) so the C2 wrong-game join can't reach the order path.
 - [ ] **Edge validation gates the money, not the code:** even green, do NOT arm beyond demo until the
       0014 confirmatory run passes on multi-week data + the naked-unwind cost is measured (README ⚠️).
-- [ ] **Deferred to next session:** edge-RATE allocation (0014-H2, `edge ÷ lock-days`) + maker-side
-      execution mode (rest cheap leg on Kalshi + taker-hedge pmus — the maker study's +EV config).
+- [x] **edge-RATE allocation (0014-H2, `edge ÷ lock-days`) — DONE 2026-06-13 ([0017](../decisions/0017-live-edge-rate-lock-days.md)).**
+      Still deferred: **maker-side execution mode** (rest cheap leg on Kalshi + taker-hedge pmus — the maker
+      study's +EV config; needs the now-logging trade-print/ladder data to model fill rates).
 
 > **Project docs:** [CLAUDE.md](../CLAUDE.md) (index) · [decisions/](../decisions/README.md) · [lessons.md](lessons.md) · [sessions](../docs/sessions.md)
 
@@ -305,11 +306,14 @@ backtest pipeline re-run on the corrected pipeline.**
 Two strategy features designed + reviewed this session but explicitly deferred to next session for
 implementation in `bot-rs` (the rest of the rust-review/strategy-test findings are already built):
 
-- [ ] **Edge-RATE allocation layer** — `bot-rs` evaluates each arb in isolation; add a cross-arb
-      prioritization that ranks/sizes by `booked_edge ÷ expected_lock_days` (the frozen 0014-H2 arm).
-      The lock-day priors changed this session (the "14-day pmus lock" was corrected — sports/econ
-      settle ~at grade), so re-derive the per-category lock-days first. Pairs with the new
-      event-proximity gate.
+- [x] **Edge-RATE allocation layer (DONE 2026-06-13, [0017](../decisions/0017-live-edge-rate-lock-days.md)):**
+      `risk::lock_days` re-derives per-category lock-days to **corrected days-to-grade** (weather 1.2 floor /
+      **sports = dynamic `days_to_event`**, was a flat 15 / econ 21 fallback — no release calendar in the bot);
+      `edge_rate = booked_edge ÷ lock_days` is always computed + returned in `Approved` (logged); a **reservation
+      floor** `MIN_EDGE_RATE_CPD` (new `Reject::BelowEdgeRateFloor`, **default 0 = OFF**) skips low-velocity arbs.
+      Reservation-only (sizing untouched); batch-ranking deliberately out of scope (latency). **0014-H2's frozen
+      backtest priors NOT touched** (live ≠ confirmatory; reconciliation is a labelled sensitivity arm at
+      data-arrival). 128 tests (+3), clippy clean, smoke shows a 1-day sports arb @ 3.0¢/$-day > weather @ 2.5.
 - [ ] **Maker-side execution mode** — `bot-rs` is taker-only; add a maker/conditional-hedge mode that
       rests the cheap leg on Kalshi (weather maker fee $0) + taker-hedges pmus — the maker study's only
       +EV config ([research/probe-program-2026-06-11.md](../research/probe-program-2026-06-11.md) §1).
