@@ -998,6 +998,8 @@ pub async fn discover(http: &reqwest::Client) -> Result<Discovery, String> {
     let needed: Vec<&str> = WX.iter().map(|(_, k)| *k)
         .chain(ECON.iter().map(|(_, k, ..)| *k))
         .chain(LEAGUES_ABBREV.iter().map(|(_, k)| *k))
+        .chain(SOCCER3.iter().map(|(_, k)| *k)) // WC: KXWCGAME — was MISSING, so the soccer branch saw an
+                                                 // empty cache and bound 0 (live: Kalshi lists 186 WC markets)
         .collect();
     for (i, kser) in needed.iter().enumerate() {
         let markets = pull_kalshi_series(http, kser).await?;
