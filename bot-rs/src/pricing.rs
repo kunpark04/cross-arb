@@ -227,18 +227,20 @@ fn realized_surplus_cents(cfg: &Config, legs: &[OrderIntent; 2]) -> u8 {
 /// falls back to the cheap recovery; a fat arb spends its surplus to GUARANTEE the lock. The order still
 /// FILLS at the live price (≤ the raised limit), so we pay only the ACTUAL move, bounded by the surplus.
 /// Re-checks the floor after the bump (fees shift at the new price) and REVERTS if it would not clear.
-pub(crate) fn apply_second_leg_markup(cfg: &Config, legs: &mut [OrderIntent; 2]) {
+/// Returns the markup (cents) actually applied to the Kalshi leg — 0 if none (thin arb / no Kalshi leg /
+/// reverted) — so the live path can LOG the pay-up per fire (instrumentation: is the pay-up helping?).
+pub(crate) fn apply_second_leg_markup(cfg: &Config, legs: &mut [OrderIntent; 2]) -> u8 {
     // the SECOND-fired leg is the Kalshi one (pmus-first fires pmus, then Kalshi). Mark up that BUY only.
     let Some(i) = legs.iter().position(|l| l.venue == Venue::Kalshi) else {
-        return; // no Kalshi leg (never for a cross-venue arb) -> nothing to do
+        return 0; // no Kalshi leg (never for a cross-venue arb) -> nothing to do
     };
     let markup = realized_surplus_cents(cfg, legs);
     if markup == 0 {
-        return; // thin arb: no surplus -> stay passive, rely on the cheap recovery
+        return 0; // thin arb: no surplus -> stay passive, rely on the cheap recovery
     }
     let bumped = legs[i].price_cents.saturating_add(markup);
     if bumped >= 100 {
-        return; // never post a >= 100c leg
+        return 0; // never post a >= 100c leg
     }
     let prev = legs[i].price_cents;
     legs[i].price_cents = bumped;
@@ -246,7 +248,9 @@ pub(crate) fn apply_second_leg_markup(cfg: &Config, legs: &mut [OrderIntent; 2])
         // DEFENSIVE: the surplus is derived to keep the floor, but a fee shift at the bumped price could
         // nudge the realized net under it -> revert. The pay-up never drops realized edge below the floor.
         legs[i].price_cents = prev;
+        return 0;
     }
+    markup
 }
 
 /// 4dp round, matching `signal::round4` / ledger.py — keeps the realized-edge re-check bit-consistent with
@@ -567,7 +571,7 @@ mod tests {
 
         // FAT arb (30 + 30 = 60c, ~40c gross) -> surplus far exceeds the 5c cap -> Kalshi pays up by 5c.
         let mut fat = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
-        apply_second_leg_markup(&cfg, &mut fat);
+        assert_eq!(apply_second_leg_markup(&cfg, &mut fat), 5, "returns the 5c markup actually applied");
         assert_eq!(fat[0].price_cents, 30, "the pmus (first) leg is NEVER marked up");
         assert_eq!(fat[1].price_cents, 35, "the Kalshi (second) leg pays up by the 5c cap");
         assert!(realized_edge_clears_floor(&cfg, &fat), "the bumped pair still clears the floor");
@@ -575,7 +579,7 @@ mod tests {
         // NO surplus above the floor (raise it so the same arb has no room) -> NO pay-up.
         cfg.edge_floor_cents = 50.0;
         let mut none = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
-        apply_second_leg_markup(&cfg, &mut none);
+        assert_eq!(apply_second_leg_markup(&cfg, &mut none), 0, "no surplus -> returns 0 markup");
         assert_eq!(none[1].price_cents, 30, "no surplus above the floor -> no pay-up (cheap recovery instead)");
     }
 

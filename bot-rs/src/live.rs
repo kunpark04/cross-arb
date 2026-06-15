@@ -215,8 +215,8 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 let pn = lock(&pairs).by_slug.len();
                 // LATENCY: p50/p99/max (µs) of the per-frame in-loop compute over this 20s window, then clear.
                 let (p50, p99, mx, n) = pct_summary(&mut frame_lat_us);
-                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
-                         k_fresh.len(), exposure.stream_paused);
+                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={}, deployed=${:.2}, open={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
+                         k_fresh.len(), exposure.stream_paused, exposure.total, exposure.open_positions);
                 // GATE OUTCOMES this window — which gate is binding (is the 0020 recovery-cost gate too strict?).
                 if !gate_outcomes.is_empty() {
                     let mut go: Vec<(&&'static str, &u64)> = gate_outcomes.iter().collect();
@@ -360,10 +360,12 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
         if halt.load(Ordering::Relaxed)
             || pending_entries.contains(&slug)
             || flattening.contains_key(&slug)
-            || max_entries.is_some_and(|m| entries_fired >= m) // CROSSARB_MAX_ENTRIES: stop opening new entries
         {
             continue;
         }
+        // NB: CROSSARB_MAX_ENTRIES is checked AFTER `evaluate` (in the Ok arm) — not here — so the per-gate
+        // rejection counter keeps tallying the FULL run, not just until the fire cap is hit. Firing still
+        // stops at the cap; only the measurement continues.
 
         // HELD-SLUG ADD GATE: if the slug already has legs, this would be an add — gate it. `None` => block
         // (exactly the old `contains_key` continue). `Some(tag)` => a qualifying add; fall through to
@@ -387,6 +389,12 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             }
             Ok(a) => {
                 *gate_outcomes.entry("approved").or_insert(0) += 1;
+                // CROSSARB_MAX_ENTRIES gates the FIRE (not the count): once the cap is hit, keep measuring
+                // ("approved_capped" = the opportunity rate = arbs we left on the table) but open no more.
+                if max_entries.is_some_and(|m| entries_fired >= m) {
+                    *gate_outcomes.entry("approved_capped").or_insert(0) += 1;
+                    continue;
+                }
                 // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
                 // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
                 // one-sided book) yields no legs -> skip rather than fire a naked leg.
@@ -400,9 +408,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 // 0020 follow-up: under pmus-first the Kalshi leg fires SECOND (after the pmus block) and a
                 // passive limit MISSES when the price ticked during the wait (most edges are sub-second). Pay
                 // up to the edge SURPLUS (capped, never below the floor) so it still locks; it re-checks the floor.
-                if cfg.aggressive_second_leg {
-                    apply_second_leg_markup(cfg, &mut legs);
-                }
+                let markup_c = if cfg.aggressive_second_leg { apply_second_leg_markup(cfg, &mut legs) } else { 0 };
                 // Record the velocity metric on the live order path (the owner calibrates MIN_EDGE_RATE_CPD
                 // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day). An
                 // ADD additionally logs its scale-in|re-entry tag + the base vs add net so an armed add is
@@ -413,12 +419,12 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 if let Some(tag) = add_tag {
                     let base_net = held_legs.iter().map(|l| l.entry_net).fold(0.0_f64, f64::max);
                     println!(
-                        "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
+                        "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us  markup={markup_c}c",
                         base_net * 100.0, edge.net * 100.0, a.size, a.edge_rate, edge.dir
                     );
                 } else {
                     println!(
-                        "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
+                        "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us  markup={markup_c}c",
                         a.size, edge.net * 100.0, a.edge_rate, edge.dir
                     );
                 }

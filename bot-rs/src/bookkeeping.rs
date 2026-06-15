@@ -151,6 +151,7 @@ pub(crate) fn apply_outcome(
                     // STORED on the HeldLeg so a later per-leg unwind subtracts EXACTLY this leg (R1) and a
                     // later add gates on max(entry_net)+tau / same-direction.
                     track_position(positions, &pair, pos, out.cost_per, out.entry_net, out.entry_dir);
+                    crate::exec_log::fire_outcome(&out.slug, "lock", "both legs filled");
                 }
             } else {
                 // subtract the EXACT reservation made at spawn (the entry did not fully fill) — the unified
@@ -169,6 +170,7 @@ pub(crate) fn apply_outcome(
                     // abort cooldown is a clean production follow-up — not needed for the gated 1-contract test.)
                     EntryMiss::CleanAbort(rest_idx) => {
                         cancel_resting_hedge(backend, &out.slug, &out.ack, out.position.as_ref(), rest_idx);
+                        crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge did not fill; cancelled, no position");
                     }
                     // hedge ERR'd: its order's fate is UNKNOWN (a transport error may have landed it). Fail
                     // CLOSED — HALT so the owner reconciles before any unhedged pmus order can fill silently.
@@ -179,13 +181,21 @@ pub(crate) fn apply_outcome(
                              order fate UNKNOWN (may have landed) -> KILL-SWITCH engaged; reconcile positions before resuming.",
                             out.slug, out.ack.a, out.ack.b
                         );
+                        crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", "pmus hedge err -> halt");
                     }
                     // FIX A: a real one-leg-filled outcome is a NAKED directional leg. AUTO-RECOVER (cancel the
                     // resting leg + flatten the filled leg at a marketable book price); the fail-close halt is
                     // the BACKSTOP when recovery can't be priced/fired. Never records a hedge.
                     EntryMiss::NakedOrOther => {
+                        // the naked (filled) leg's venue, for the outcome record (which leg went naked).
+                        let naked = naked_filled_idx(&out.ack)
+                            .and_then(|i| out.position.as_ref().map(|p| format!("{:?}", p.legs[i].venue)))
+                            .unwrap_or_default();
                         if !recover_naked_leg(backend, kalshi_books, pmus_books, flattening, outcome_tx, &out.slug, &out.ack, out.position.as_ref()) {
                             naked_leg_failclose(&out.slug, SubmitKind::Entry, &out.ack, halt);
+                            crate::exec_log::fire_outcome(&out.slug, "naked_halt", &naked);
+                        } else {
+                            crate::exec_log::fire_outcome(&out.slug, "recover", &naked);
                         }
                     }
                 }

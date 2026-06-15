@@ -117,3 +117,17 @@ pub fn book_snapshot(phase: &str, market: &str, pm_bid: Option<f64>, pm_ask: Opt
         "depth_c2": depth_c2,
     }));
 }
+
+/// Per-fire OUTCOME (0020 follow-up instrumentation) — one machine-readable record of how an ENTRY resolved:
+/// "lock" (both legs filled), "abort_clean" (pmus hedge didn't fill → cancelled, no position), "abort_ambiguous"
+/// (hedge err → halt), or "recover" (one leg naked → flattened; `detail` = the naked leg's venue). So a run's
+/// fire distribution (lock vs abort vs recover, the second-leg miss rate) is one `jq` away, not a hand-join
+/// across the per-leg submit records. No-op under `cargo test`.
+pub fn fire_outcome(slug: &str, result: &str, detail: &str) {
+    record(serde_json::json!({
+        "event": "fire_outcome",
+        "market": slug,
+        "result": result,
+        "detail": detail,
+    }));
+}
