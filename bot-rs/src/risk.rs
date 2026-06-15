@@ -20,6 +20,7 @@ pub enum Reject {
     NonPositiveEdge,      // L11 — never book net<=0
     BelowEdgeFloor,       // opt-in 0014 floor (skip thin arbs); always reported, never silent (L15)
     BelowEdgeRateFloor(f64), // opt-in 0014-H2 edge-RATE floor (¢/$-day); carries the rate (never silent, L15)
+    RecoveryCostExceedsEdge(f64), // 0020 — pmus spread (residual naked-unwind cost) > ratio×edge; carries the spread¢ (L15)
     ToxicDirection,       // H1 — dear-led WEATHER edge (~79% toxic); weather-only, tested signal
     NoFillableSize,       // size collapsed to 0 after depth/clip/affordability/caps
     PairCap,
@@ -204,6 +205,23 @@ pub fn evaluate(
         return Err(Reject::BelowEdgeRateFloor(edge_rate));
     }
 
+    // 4a-bis. RECOVERY-COST gate (decision 0020). Under pmus-first execution the only residual naked case is
+    //     "pmus filled, Kalshi then failed" -> unwind the pmus leg -> cost ≈ its bid↔ask spread (side-invariant:
+    //     yes_ask − yes_bid). If that spread exceeds the edge, the rare-but-real naked tail dwarfs the win (the
+    //     first live arb's recovery ~9¢ on a thin book was ~2× its 4.8¢ edge). Skip such arbs. Gated only when
+    //     max_recovery_spread_ratio > 0 (prod default 1.0; test default 0 = OFF -> zero behavior change). The
+    //     KALSHI spread is deliberately NOT gated — under pmus-first the Kalshi leg locks and is held to
+    //     settlement, never unwound. A one-sided pmus book never reaches a fire (build_legs returns None), so
+    //     the missing-side case stays dormant here.
+    if cfg.max_recovery_spread_ratio > 0.0 {
+        if let (Some(bid), Some(ask)) = (q.pm.yes_bid, q.pm.yes_ask) {
+            let pmus_spread_cents = (ask - bid) * 100.0;
+            if pmus_spread_cents > cfg.max_recovery_spread_ratio * edge.net * 100.0 {
+                return Err(Reject::RecoveryCostExceedsEdge(pmus_spread_cents));
+            }
+        }
+    }
+
     // 4b. TOXICITY-DIRECTION gate (H1 — the one tested idea that produced a signal; WEATHER-ONLY).
     //     A weather edge where the DEAR venue led the move is ~79% toxic vs ~17% for cheap-led; the
     //     cheap quote was right and you'd be adversely-selected onto the wrong leg. Skipping dear-led
@@ -296,6 +314,7 @@ mod tests {
             assume_sports_settled: false,
             assume_econ_settled: false,
             max_days_to_event: 2.0,
+            max_recovery_spread_ratio: 0.0,
             kalshi_void_window_days: 2.0,
             postpone_poll_s: 60,
             auto_unwind: true,
@@ -331,6 +350,26 @@ mod tests {
     fn approves_a_clean_weather_arb() {
         let r = evaluate(&cfg(), &quote(), &edge(), &Exposure::new(), 1000).unwrap();
         assert!(r.size >= 1 && r.size <= 50);
+    }
+
+    /// 0020 RECOVERY-COST gate: with the gate ON, an arb whose pmus bid↔ask spread (the residual
+    /// naked-unwind cost under pmus-first) exceeds the edge is rejected; a tight spread passes; ratio 0 = off.
+    #[test]
+    fn recovery_cost_gate_skips_a_wide_pmus_spread() {
+        let mut c = cfg();
+        c.max_recovery_spread_ratio = 1.0; // the pmus unwind spread must be <= the edge
+        // tight pmus spread (1c) <= 9c edge -> PASSES even with the gate on
+        assert!(evaluate(&c, &quote(), &edge(), &Exposure::new(), 1000).is_ok(), "1c spread <= 9c edge passes");
+        // a 35c pmus spread > the 9c edge -> REJECT (a failed hedge would unwind for ~4x the win)
+        let mut wide = quote();
+        wide.pm = Book { yes_bid: Some(0.40), yes_ask: Some(0.75), age_s: 0.1 };
+        match evaluate(&c, &wide, &edge(), &Exposure::new(), 1000) {
+            Err(Reject::RecoveryCostExceedsEdge(s)) => assert!((s - 35.0).abs() < 1e-6, "carries the spread¢, got {s}"),
+            other => panic!("expected RecoveryCostExceedsEdge, got {other:?}"),
+        }
+        // gate OFF (ratio 0, the test default) -> the same wide spread passes -> zero behavior change
+        c.max_recovery_spread_ratio = 0.0;
+        assert!(evaluate(&c, &wide, &edge(), &Exposure::new(), 1000).is_ok(), "ratio 0 disables the gate");
     }
 
     #[test]

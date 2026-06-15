@@ -42,6 +42,10 @@ pub enum ExecError {
     KeysUnavailable,   // live POST attempted but signing keys aren't loaded (Claude sandbox / dry-run build)
     Rejected(String),  // venue rejected the order (non-2xx) — carries status + body head
     RateLimited,
+    /// pmus-first abort sentinel (0020): the FAST (Kalshi) leg was DELIBERATELY not opened because the slow
+    /// pmus hedge leg did not fill first. NOT a failure — no order was ever sent for this leg. The outcome
+    /// handler cancels the resting GTC hedge and does NOT halt (a clean skip, not a naked leg). [L33]
+    HedgeNotFilled,
 }
 
 /// What `cancel` needs to reach the right venue endpoint for a resting order: the venue, its
@@ -515,14 +519,34 @@ impl LiveBackend {
         })
     }
 
-    /// Drive the two concurrent signed POSTs to completion, returning when BOTH ack (or error). Runs the
-    /// async join off the ambient tokio runtime (block_in_place when inside one; a tiny current-thread
-    /// runtime otherwise) — keeping `submit_pair` synchronous + the trait dyn-compatible.
+    /// Fire the two signed POSTs **pmus-first and SERIALLY** (decision 0020). The pmus leg is the slow,
+    /// thin, uncertain one — it BLOCKS for a real fill verdict (`synchronousExecution`); only if it actually
+    /// FILLED do we open the fast Kalshi leg. So the fast leg is NEVER left naked while the pmus hedge
+    /// resolves: if pmus does not fill, the Kalshi leg is never sent (the `HedgeNotFilled` sentinel) and the
+    /// outcome handler cancels the resting GTC pmus order — zero naked exposure. The PairAck preserves the
+    /// a/b SLOTS (ack.a ↔ leg a) regardless of fire order, so all positional bookkeeping is unchanged.
+    ///
+    /// This REVERSES the pre-0020 concurrent `tokio::join!` (~86ms p50). Serial is ~1 block-second slower,
+    /// but the first live arb proved concurrent fire leaves the fast leg exposed for the WHOLE pmus block:
+    /// Kalshi filled @86¢, pmus never filled (1.5s block), and flattening the naked Kalshi leg cost ~9¢ on a
+    /// thin book. Latency is network-bound regardless; the forgone fast-evaporating edges were phantom (the
+    /// hedge wasn't executable). [L33]
     fn run_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
+        // identify the pmus (blocking) leg; fire it first, open the OTHER leg only if it FILLED. A real arb
+        // always has exactly one pmus + one Kalshi leg; if neither is pmus (never, defensively), b-first
+        // serial is still naked-leg-free.
+        let a_is_pmus = a.venue == Venue::Pmus;
         let fut = async {
-            // CONCURRENT — never serial: serial legging ~doubles effective latency (161ms vs ~86ms p50).
-            let (ra, rb) = tokio::join!(self.post_leg(a), self.post_leg(b));
-            PairAck { a: ra, b: rb }
+            let leg_filled = |r: &Result<Ack, ExecError>| matches!(r, Ok(ack) if ack.filled);
+            if a_is_pmus {
+                let ra = self.post_leg(a).await;
+                let rb = if leg_filled(&ra) { self.post_leg(b).await } else { Err(ExecError::HedgeNotFilled) };
+                PairAck { a: ra, b: rb }
+            } else {
+                let rb = self.post_leg(b).await;
+                let ra = if leg_filled(&rb) { self.post_leg(a).await } else { Err(ExecError::HedgeNotFilled) };
+                PairAck { a: ra, b: rb }
+            }
         };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
@@ -733,6 +757,7 @@ mod tests {
             assume_sports_settled: false,
             assume_econ_settled: false,
             max_days_to_event: 2.0,
+            max_recovery_spread_ratio: 0.0,
             kalshi_void_window_days: 2.0,
             postpone_poll_s: 60,
             auto_unwind: true,
@@ -789,6 +814,7 @@ mod tests {
             assume_sports_settled: false,
             assume_econ_settled: false,
             max_days_to_event: 2.0,
+            max_recovery_spread_ratio: 0.0,
             kalshi_void_window_days: 2.0,
             postpone_poll_s: 60,
             auto_unwind: true,
@@ -866,6 +892,7 @@ mod tests {
             assume_sports_settled: false,
             assume_econ_settled: false,
             max_days_to_event: 2.0,
+            max_recovery_spread_ratio: 0.0,
             kalshi_void_window_days: 2.0,
             postpone_poll_s: 60,
             auto_unwind: true,

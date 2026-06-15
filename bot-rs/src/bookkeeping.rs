@@ -158,12 +158,36 @@ pub(crate) fn apply_outcome(
                 if let Some(pos) = &out.position {
                     subtract_exposure(exposure, pos, out.cost_per);
                 }
-                // FIX A: a real one-leg-filled outcome is a NAKED directional leg. Try to AUTO-RECOVER
-                // (cancel the resting leg + flatten the filled leg at a marketable book price). The halt
-                // is the BACKSTOP only — used when there's no real naked leg (nothing to do) OR recovery
-                // can't be priced/fired. Never records a hedge; the reservation is already released.
-                if !recover_naked_leg(backend, kalshi_books, pmus_books, flattening, outcome_tx, &out.slug, &out.ack, out.position.as_ref()) {
-                    naked_leg_failclose(&out.slug, SubmitKind::Entry, &out.ack, halt);
+                // pmus-first ABORT (0020): the fast (Kalshi) leg carries the `HedgeNotFilled` sentinel iff we
+                // deliberately never opened it (the slow pmus hedge didn't fill first). That's NOT a naked leg
+                // (nothing filled) — route it explicitly instead of the recover/fail-close path.
+                match classify_entry_miss(&out.ack) {
+                    // hedge RESTED (Ok, not filled): no position, but its GTC order would fill later unhedged
+                    // -> cancel it (best-effort). No halt — this is the EXPECTED skip on a non-fillable hedge.
+                    // (A PERSISTENT phantom hedge could abort-loop place→cancel→re-fire; bounded today by
+                    // pending_entries + the entry caps + a pmus rate-limit→AmbiguousAbort halt. A per-slug
+                    // abort cooldown is a clean production follow-up — not needed for the gated 1-contract test.)
+                    EntryMiss::CleanAbort(rest_idx) => {
+                        cancel_resting_hedge(backend, &out.slug, &out.ack, out.position.as_ref(), rest_idx);
+                    }
+                    // hedge ERR'd: its order's fate is UNKNOWN (a transport error may have landed it). Fail
+                    // CLOSED — HALT so the owner reconciles before any unhedged pmus order can fill silently.
+                    EntryMiss::AmbiguousAbort => {
+                        halt.store(true, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!(
+                            "[live] CRITICAL pmus-first abort on {}: the pmus hedge leg ERR'd (a={:?} b={:?}) — \
+                             order fate UNKNOWN (may have landed) -> KILL-SWITCH engaged; reconcile positions before resuming.",
+                            out.slug, out.ack.a, out.ack.b
+                        );
+                    }
+                    // FIX A: a real one-leg-filled outcome is a NAKED directional leg. AUTO-RECOVER (cancel the
+                    // resting leg + flatten the filled leg at a marketable book price); the fail-close halt is
+                    // the BACKSTOP when recovery can't be priced/fired. Never records a hedge.
+                    EntryMiss::NakedOrOther => {
+                        if !recover_naked_leg(backend, kalshi_books, pmus_books, flattening, outcome_tx, &out.slug, &out.ack, out.position.as_ref()) {
+                            naked_leg_failclose(&out.slug, SubmitKind::Entry, &out.ack, halt);
+                        }
+                    }
                 }
             }
         }
@@ -232,6 +256,62 @@ pub(crate) fn naked_filled_idx(ack: &exec::PairAck) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// pmus-first ABORT classification (decision 0020). A non-both-filled ENTRY whose FAST leg is the
+/// `HedgeNotFilled` sentinel means we deliberately never opened it (the slow pmus hedge didn't fill first).
+pub(crate) enum EntryMiss {
+    /// hedge RESTED (Ok, not filled): cancel its resting GTC order, no halt, NO position. Carries the hedge idx.
+    CleanAbort(usize),
+    /// hedge ERR'd (its order's fate is unknown — a transport error may have landed it): HALT to reconcile.
+    AmbiguousAbort,
+    /// NOT a pmus-first abort: a real one-leg-filled naked position, or any other shape -> recover/fail-close.
+    NakedOrOther,
+}
+
+/// Classify the non-both-filled ENTRY outcome (PURE — unit-testable). The `HedgeNotFilled` sentinel on one
+/// leg marks the fast leg we never opened; the OTHER leg is the pmus hedge that actually resolved (rested,
+/// errored, or — defensively — filled). No sentinel ⇒ a concurrent-era / real-fill outcome ⇒ `NakedOrOther`.
+pub(crate) fn classify_entry_miss(ack: &exec::PairAck) -> EntryMiss {
+    let is_sentinel = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Err(exec::ExecError::HedgeNotFilled));
+    let (hedge, hedge_idx) = if is_sentinel(&ack.a) {
+        (&ack.b, 1)
+    } else if is_sentinel(&ack.b) {
+        (&ack.a, 0)
+    } else {
+        return EntryMiss::NakedOrOther; // no sentinel -> not a pmus-first abort
+    };
+    match hedge {
+        Ok(a) if !a.filled => EntryMiss::CleanAbort(hedge_idx), // rested -> cancel it, no position
+        Ok(_) => EntryMiss::NakedOrOther, // hedge FILLED but the other is the sentinel (shouldn't occur) -> recover it
+        Err(_) => EntryMiss::AmbiguousAbort, // hedge errored -> order fate unknown -> halt
+    }
+}
+
+/// Cancel the resting (GTC) pmus hedge after a CLEAN pmus-first abort (0020): the fast leg was never opened
+/// so there is NO position, but the hedge order rested and would otherwise fill later UNHEDGED. Best-effort +
+/// spawned (a cancel failure is harmless — a resting order that never fills costs nothing). Logs either way.
+pub(crate) fn cancel_resting_hedge(
+    backend: &std::sync::Arc<dyn ExecutionBackend>,
+    slug: &str,
+    ack: &exec::PairAck,
+    position: Option<&Position>,
+    rest_idx: usize,
+) {
+    let rest_ack = if rest_idx == 0 { &ack.a } else { &ack.b };
+    if let (Some(pos), Ok(a)) = (position, rest_ack) {
+        if !a.venue_order_id.is_empty() && rest_idx < pos.legs.len() {
+            let target = exec::CancelTarget {
+                venue: pos.legs[rest_idx].venue,
+                venue_order_id: a.venue_order_id.clone(),
+                market: pos.legs[rest_idx].market.clone(),
+            };
+            eprintln!("[live] pmus-first ABORT on {slug}: pmus hedge did not fill -> Kalshi leg never opened (NO position); cancelling the resting GTC hedge order.");
+            spawn_cancel(backend, slug, target);
+            return;
+        }
+    }
+    println!("[live] pmus-first ABORT on {slug}: pmus hedge did not fill -> NO position (no resting order to cancel).");
 }
 
 /// FIX A — NAKED-LEG AUTO-RECOVERY. On a one-leg-filled entry outcome: (1) if the UNFILLED leg is an
@@ -472,6 +552,29 @@ mod tests {
     use crate::pricing::position_from_intents;
     use crate::test_support::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// pmus-first ABORT classification (0020): the `HedgeNotFilled` sentinel on the fast leg + a resting
+    /// (Ok-not-filled) pmus hedge = a CLEAN abort (cancel the rest, no halt); an ERR'd hedge = AMBIGUOUS
+    /// (halt — order fate unknown); no sentinel = the real naked/recover path (unchanged).
+    #[test]
+    fn classify_entry_miss_routes_the_pmus_first_abort() {
+        let ok = |filled: bool, oid: &str| -> Result<exec::Ack, exec::ExecError> {
+            Ok(exec::Ack { client_order_id: "c".into(), venue_order_id: oid.into(), filled, simulated: false })
+        };
+        let sentinel = || -> Result<exec::Ack, exec::ExecError> { Err(exec::ExecError::HedgeNotFilled) };
+        let errd = || -> Result<exec::Ack, exec::ExecError> { Err(exec::ExecError::Rejected("boom".into())) };
+
+        // pmus hedge (leg a) RESTED + fast leg (b) never opened -> CleanAbort(0): cancel the resting hedge
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: ok(false, "PM1"), b: sentinel() }), EntryMiss::CleanAbort(0)));
+        // mirror (pmus is leg b) -> CleanAbort(1)
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: sentinel(), b: ok(false, "PM1") }), EntryMiss::CleanAbort(1)));
+        // pmus hedge ERR'd (order fate unknown) + sentinel -> AmbiguousAbort -> caller HALTS to reconcile
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: errd(), b: sentinel() }), EntryMiss::AmbiguousAbort));
+        // no sentinel (a real one-filled-one-rested outcome) -> NakedOrOther -> the recover/fail-close path
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: ok(true, "K1"), b: ok(false, "PM1") }), EntryMiss::NakedOrOther));
+        // defensive: hedge FILLED but the OTHER leg is the sentinel (shouldn't occur) -> NakedOrOther (recover it)
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: ok(true, "PM1"), b: sentinel() }), EntryMiss::NakedOrOther));
+    }
 
     /// `track_position` does NOT enroll a WORLD-CUP pair in the MLB postponement poll (no statsapi WC
     /// source): a WC `Cat::Sports` pair gets EMPTY poll metadata (like weather/econ), while a moneyline MLB
