@@ -552,3 +552,39 @@ wrong keys, not that the market is empty; (b) Kalshi **REST** orderbook lives un
 1 − best_no_bid`); (c) a cross-venue "YES-price gap" is NOT the edge — the executable edge nets the price you pay to
 HEDGE (cross the OTHER venue's bid-ask) plus both legs' `coef·P(1−P)` taker fees (max near 50¢); a wide pmus spread
 can collapse a 12¢ apparent gap to ~+1¢ net.
+
+## L36 — A venue's FOK "verified" from the DOCS is not FOK honored LIVE; a non-zero fill that isn't a clean lock must be UNWOUND, not aborted (pmus runs FOK as IOC and partial-fills)
+
+**Pattern:** After the 2026-06-15 incident we made entry orders FILL-OR-KILL ([0021]) and API-doc-verified Kalshi's
+`fill_or_kill` ([0022]). The owner then caught a stray pmus position (`aec-itfm-andchi-timbre`, M'Chich) the bot had
+NO record of. The raw create-response was the smoking gun: the requested `TIME_IN_FORCE_FILL_OR_KILL` came back
+**`TIME_IN_FORCE_IMMEDIATE_OR_CANCEL`** with `ORDER_STATE_PARTIALLY_FILLED`, **`cumQuantity:0.01`** of qty 5 — pmus
+does NOT honor FOK; it runs IOC and PARTIAL-fills. The bot's fill detection returned a bool (`cum >= qty`), so a
+partial read as `filled:false` → pmus-first ABORT → the 0.01-contract partial was left NAKED + untracked. The exact
+incident class FOK was built to prevent, reopened through a hole the doc-verification couldn't see (the docs said
+FOK; the venue ignored it).
+
+**Rule:** A FOK guarantee is only real once OBSERVED live on a MULTI-contract order — API-doc "verification" confirms
+the enum is *accepted*, NOT that the venue fills all-or-nothing (the pmus enum was accepted AND ignored). So assume
+PARTIAL fills are possible: capture the ACTUAL filled qty (`fill_qty` / `cumQuantity`), and treat ANY non-zero fill
+that is not a clean both-FULL lock as a real position → **unwind every leg with `fill_qty>0` at its OWN qty** (atomic:
+price all naked legs first, halt+fire-nothing if any unpriceable; fail-CLOSE on any unwind `Err`) — NEVER abort on a
+partial. Cover BOTH legs: the second (Kalshi) leg can also partial at multi-contract if it likewise ignores FOK
+(unverified — same trap). "We sent the right enum + it's documented" is the same false comfort the pmus FOK gave —
+verify venue BEHAVIOUR live, not just enum acceptance ([L17]). Decision [0024].
+
+## L37 — Cross-venue arb CAPACITY is the THIN venue's depth, not the deep one's; `depth_c2` is a snapshot that overstates fillability on thin/fast books
+
+**Pattern:** At 5–10 contracts the bot fired big-edge ITF/WTA tennis arbs (edges 2–19¢) but nearly all aborted at the
+pmus leg, and the Lena-Iglesias fire that DID fill took exactly 2 of a 5-lot. Live **Kalshi** books for that match
+were enormously deep (10k–20k contracts/level) — yet the arb filled 2, because the binding leg was **pmus**, thin on
+tennis. M'Chich logged `depth_c2=50` but filled 0.01; Lena logged `depth_c2=50` but sized+filled 2. So `depth_c2`
+(the cross-venue fillable-pairs-at-≥2¢ snapshot) badly OVERSTATED the real fillable depth on these thin, fast books —
+a snapshot that evaporates in the 60–260 ms before the order lands.
+
+**Rule:** Cross-venue fillable depth = the MIN of the two venues' depth at the edge; on tennis that's pmus, so
+**raising the per-pair contract cap buys ~nothing where pmus is the bottleneck** — bigger size matters only on books
+deep on BOTH sides (weather, liquid sports). `depth_c2` is the right IDEA but trustworthy only on DEEP, STABLE books;
+on thin/fast books treat it as an upper bound that won't hold, and let the order's ACTUAL fill (now captured as
+`fill_qty`, [L36]) be the truth. The big edges that look attractive live precisely in the thin corners you can't fill
+([L16]) — edge-location ≠ capacity.

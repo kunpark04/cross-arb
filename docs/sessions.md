@@ -6,6 +6,30 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 13) — pmus IGNORES fill-or-kill → partial-fill naked-position fix [0024]; capacity = the thin leg; relaunch 5-contract + scale-in
+
+The owner caught a stray pmus position (M'Chich, `aec-itfm-andchi-timbre`) the bot had no record of. Root cause:
+**pmus does NOT honor FOK.**
+
+- **Diagnosis:** the raw pmus create-response showed the requested `FILL_OR_KILL` came back `IMMEDIATE_OR_CANCEL`,
+  `PARTIALLY_FILLED`, **`cumQuantity:0.01`** of qty 5. The bot's bool fill detection read the partial as `filled:false`
+  → pmus-first abort → naked 0.01. [L36]. A depth probe also established **capacity = the THIN venue**: live Kalshi
+  books were 10k–20k deep but the arb filled 2 (Lena) / 0.01 (M'Chich) because pmus was the bottleneck; `depth_c2`
+  overstates fillability on thin/fast books, and raising the contract cap is moot where pmus is thin (tennis). [L37]
+- **Fix [0024] (`3f2c58a`):** `Ack` carries the actual `fill_qty`; a non-clean-lock entry flattens EVERY leg with
+  `fill_qty>0` at its own qty (atomic — price all naked legs first, halt-and-fire-nothing if any unpriceable; fail-
+  close; BOTH legs). Two coding-agent passes (pmus leg + generalize to both) + one independent adversarial review →
+  **SAFE_TO_ARM, 0 CRITICAL, 169 tests** green. Residual WARN: the Kalshi recovery SELL serializes a float `count`
+  (safe-degrading halt if rejected).
+- **liquid.trade** evaluated as a 3rd venue (owner-asked) → **NOT viable**: offshore crypto-perps aggregator (routes
+  to US-geoblocked Hyperliquid/Ostium/Lighter), not CFTC-regulated, not discrete binaries, and its prediction tab
+  mirrors **offshore** Polymarket.com — fails 0001 on two independent axes. Read-only Hyperliquid price feed is the
+  only salvage; owner: not pursuing.
+- **Relaunched** 5-contract prod, **ADD-TO-HELD ARMED** (`scale_in`+`reentry`, max 3/slug), all events, 2¢, to 8 AM —
+  to verify the partial-recovery + scale-in mechanics live. Watching for the first of each.
+
+---
+
 ## 2026-06-15 (cont. 12) — FIRST live FOK arb FIRED + account-reconciled → FOK enums LIVE-VERIFIED ACCEPTED
 
 The all-events 1-contract run (cont.11) fired its first FOK entry and it locked cleanly — the live verification
