@@ -517,6 +517,7 @@ pub(crate) fn recover_naked_leg(
     ack: &exec::PairAck,
     position: Option<&Position>,
 ) -> bool {
+    let live = backend.label() != "dry-run"; // exec-log recovery snapshots route dry-run to the .dryrun file
     let naked = naked_filled_indices(ack);
     if naked.is_empty() {
         return false; // no real (live) naked leg -> nothing to recover; caller's halt is a no-op anyway
@@ -588,6 +589,17 @@ pub(crate) fn recover_naked_leg(
             Venue::Kalshi => lock(kalshi_books).get(&filled_leg.market).map(|b| b.touch()),
             Venue::Pmus => pmus_books.get(&filled_leg.market).map(|b| b.touch()),
         };
+        // RECOVERY SNAPSHOT (0020 follow-up / backlog #8): the naked leg's bid↔ask at recovery time, so its
+        // unwind cost decomposes into SPREAD (this bid↔ask) vs MOVE (entry mid -> the SELL fill price, already
+        // in the submit record). Single-venue (the naked leg), so the OTHER venue's fields are None; depth is
+        // N/A for a one-leg unwind (0). Logged BEFORE pricing so it lands even if the leg can't be priced.
+        if let Some(b) = &book {
+            let (pm_b, pm_a, k_b, k_a) = match filled_leg.venue {
+                Venue::Pmus => (b.yes_bid, b.yes_ask, None, None),
+                Venue::Kalshi => (None, None, b.yes_bid, b.yes_ask),
+            };
+            crate::exec_log::book_snapshot("recovery", slug, pm_b, pm_a, k_b, k_a, 0, live);
+        }
         let Some(exit) = book.and_then(|b| flatten_exit_cents(filled_leg, &b)) else {
             eprintln!("[live] CRITICAL NAKED LEG on {slug}: filled {:?} leg can't be priced for a flatten (one-sided book) -> halting (no SELL fired)", filled_leg.venue);
             return false;

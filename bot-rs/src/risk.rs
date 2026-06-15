@@ -246,11 +246,17 @@ pub fn evaluate(
             let kbk = if edge.dir == Dir::PK { q.k_b.as_ref().unwrap_or(&q.k) } else { &q.k };
             (kbk.yes_bid, kbk.yes_ask)
         };
-        if let (Some(bid), Some(ask)) = (bid, ask) {
-            let spread_cents = (ask - bid) * 100.0;
-            if spread_cents > cfg.max_recovery_spread_ratio * edge.net * 100.0 {
-                return Err(Reject::RecoveryCostExceedsEdge(spread_cents));
-            }
+        // FAIL-CLOSED on a one-sided first-fired book (backlog #3 — was fail-OPEN): a missing bid (or ask)
+        // means the naked-unwind cost this gate exists to bound is UN-priceable, and a one-sided book is the
+        // WORST naked-unwind case (you can enter but can't cheaply exit) -> REJECT, mirroring the NaN-days
+        // fail-close at step 4a. The prior `if let (Some,Some)` let a one-sided book FALL THROUGH approved —
+        // entering the exact arb the gate should skip. INFINITY marks "spread un-priceable" (reason: recovery_cost).
+        let (Some(bid), Some(ask)) = (bid, ask) else {
+            return Err(Reject::RecoveryCostExceedsEdge(f64::INFINITY));
+        };
+        let spread_cents = (ask - bid) * 100.0;
+        if spread_cents > cfg.max_recovery_spread_ratio * edge.net * 100.0 {
+            return Err(Reject::RecoveryCostExceedsEdge(spread_cents));
         }
     }
 
@@ -425,6 +431,34 @@ mod tests {
         // under pmus-first (fire_pmus_first=true) the gate prices the (tight) pmus leg -> the same wide Kalshi passes.
         q.fire_pmus_first = true;
         assert!(evaluate(&c, &q, &edge(), &Exposure::new(), 1000).is_ok(), "pmus-first prices the tight pmus leg, ignores the wide Kalshi spread");
+    }
+
+    /// FAIL-CLOSED on a one-sided first-fired book (backlog #3): the recovery-cost gate can't price the
+    /// naked-unwind cost when the first-fired leg is missing a bid (or ask) — the WORST naked case — so it
+    /// must REJECT, not fall through APPROVED (the prior fail-OPEN `if let (Some,Some)`).
+    #[test]
+    fn recovery_cost_gate_fails_closed_on_a_one_sided_first_fired_book() {
+        let mut c = cfg();
+        c.max_recovery_spread_ratio = 1.0;
+        // pmus-first prices the pmus leg; a missing bid -> can't price the unwind SELL -> fail-closed.
+        let mut q = quote();
+        q.fire_pmus_first = true;
+        q.pm = Book { yes_bid: None, yes_ask: Some(0.51), age_s: 0.1 };
+        match evaluate(&c, &q, &edge(), &Exposure::new(), 1000) {
+            Err(Reject::RecoveryCostExceedsEdge(s)) => assert!(s.is_infinite(), "un-priceable spread -> INFINITY, got {s}"),
+            other => panic!("expected a fail-closed RecoveryCostExceedsEdge, got {other:?}"),
+        }
+        // the mirror under Kalshi-first: a one-sided Kalshi (first-fired) book also fails closed.
+        q.fire_pmus_first = false;
+        q.pm = Book { yes_bid: Some(0.50), yes_ask: Some(0.51), age_s: 0.1 };
+        q.k = Book { yes_bid: None, yes_ask: Some(0.51), age_s: 0.1 };
+        match evaluate(&c, &q, &edge(), &Exposure::new(), 1000) {
+            Err(Reject::RecoveryCostExceedsEdge(s)) => assert!(s.is_infinite(), "Kalshi-first one-sided -> INFINITY, got {s}"),
+            other => panic!("expected a fail-closed reject on the one-sided Kalshi leg, got {other:?}"),
+        }
+        // gate OFF (ratio 0) -> a one-sided book passes -> zero behavior change when disabled.
+        c.max_recovery_spread_ratio = 0.0;
+        assert!(evaluate(&c, &q, &edge(), &Exposure::new(), 1000).is_ok(), "ratio 0 disables the gate");
     }
 
     #[test]

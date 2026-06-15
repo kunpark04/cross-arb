@@ -120,6 +120,10 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
     // Kalshi ticker it uses is fresh — so a just-cleared book can't be traded against a never-cleared pmus
     // book on the first rebuilt frame. Cleared wholesale on Kalshi Reconnect/SeqGap.
     let mut k_fresh: HashSet<String> = HashSet::new();
+    // pmus-symmetry (backlog #1, 2026-06-15): mirror k_fresh for the pmus leg. A pmus slug becomes tradeable
+    // only after a post-reconnect snapshot; cleared (+ pmus_books cleared) on a pmus reconnect so a
+    // stale-but-<5s pmus book can't fire against a fresh Kalshi book on the first rebuild frame.
+    let mut pm_fresh: HashSet<String> = HashSet::new();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<venue::VenueEvent>();
     let (k_subs_tx, k_subs_rx) = tokio::sync::mpsc::unbounded_channel::<venue::SubUpdate>();
@@ -237,8 +241,8 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 let pn = lock(&pairs).by_slug.len();
                 // LATENCY: p50/p99/max (µs) of the per-frame in-loop compute over this 20s window, then clear.
                 let (p50, p99, mx, n) = pct_summary(&mut frame_lat_us);
-                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={}, deployed=${:.2}, open={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
-                         k_fresh.len(), exposure.stream_paused, exposure.total, exposure.open_positions);
+                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, pm_fresh={}, paused={}, deployed=${:.2}, open={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
+                         k_fresh.len(), pm_fresh.len(), exposure.stream_paused, exposure.total, exposure.open_positions);
                 // PRUNE expired per-slug cooldowns so the map can't grow unbounded (keep entries only while
                 // they could still gate: 2× the cooldown, min 60s, well past `entry_cooldown_s`).
                 cooldown.retain(|_, t| t.elapsed().as_secs() < cfg.entry_cooldown_s.saturating_mul(2).max(60));
@@ -272,6 +276,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 pm_rebuild = false; // a pmus book frame -> its rebuild is flowing again
                 if lock(&pm_tracked).contains(slug) {
                     pmus_books.entry(slug.clone()).or_default().apply_snapshot(bids, asks);
+                    pm_fresh.insert(slug.clone()); // this slug has a post-reconnect snapshot -> tradeable (mirrors k_fresh)
                     Some(slug.clone())
                 } else {
                     pmus_books.remove(slug); // a settled/pruned slug still streaming -> free its book (L20)
@@ -285,7 +290,11 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                         k_rebuild = true;
                         k_fresh.clear(); // C3: the stream `clear()`s every Kalshi book on reconnect -> none fresh
                     }
-                    Venue::Pmus => pm_rebuild = true,
+                    Venue::Pmus => {
+                        pm_rebuild = true;
+                        pm_fresh.clear(); // mirror Kalshi: every pmus slug must re-snapshot before trading
+                        pmus_books.clear(); // drop stale books so a not-yet-refreshed slug reads None -> skip
+                    }
                 }
                 exposure.stream_paused = k_rebuild || pm_rebuild;
                 continue;
@@ -304,14 +313,11 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
         // (the refresh task may be mutating the map concurrently).
         let Some(pair) = lock(&pairs).by_slug.get(&slug).cloned() else { continue };
 
-        // C3 FRESHNESS GATE: require a post-reconnect frame for EVERY Kalshi ticker this pair uses before
-        // building a Quote. This blocks trading a just-cleared Kalshi book (against a never-cleared pmus
-        // book) until its snapshot rebuilds, while a 1:1 pair whose ticker just arrived trades correctly.
-        // Checked field-by-field (team-A always; team-B iff present) so the per-frame path allocates no
-        // `kalshi_tickers()` Vec — equivalent to "all tickers fresh".
-        let all_fresh = k_fresh.contains(&pair.kalshi)
-            && pair.kalshi_b.as_ref().is_none_or(|b| k_fresh.contains(b));
-        if !all_fresh {
+        // FRESHNESS GATE (C3 + pmus-symmetry, backlog #1 2026-06-15): require a post-reconnect frame for EVERY
+        // leg this pair uses — both Kalshi tickers (team-A always, team-B iff present) AND the pmus slug —
+        // before building a Quote. Blocks trading a just-cleared/stale book against a fresh counter-leg until
+        // its snapshot rebuilds. Field-by-field (no per-frame Vec alloc). See `all_legs_fresh`.
+        if !all_legs_fresh(&k_fresh, &pm_fresh, &pair.kalshi, pair.kalshi_b.as_deref(), &slug) {
             continue;
         }
 
@@ -469,6 +475,10 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 // ENTRY book snapshot (0020 follow-up): record the books we fired against so a later naked-leg
                 // recovery can be decomposed into spread-vs-move (the FILL prices are already in exec_log).
                 exec_log::book_snapshot("entry", &slug, quote.pm.yes_bid, quote.pm.yes_ask, quote.k.yes_bid, quote.k.yes_ask, quote.depth.c2, live);
+                // edge_rate into the JSONL (0017 follow-up / backlog #7): the MIN_EDGE_RATE_CPD gate is ENABLED
+                // live but was uncalibrated because the velocity metric never landed in the record. One
+                // `approved` line per fire gives the opportunity distribution to set the threshold from data.
+                exec_log::approved(&slug, edge.net * 100.0, a.edge_rate, &format!("{:?}", edge.dir), a.size, a.cost_per, live);
                 // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
                 // outcome arm keeps the reservation on a both-filled fill (appends the leg) or releases it.
                 let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
@@ -559,9 +569,39 @@ fn led_by_from_prior(
     led
 }
 
+/// FRESHNESS GATE helper (C3 + pmus-symmetry fix, backlog #1 2026-06-15): a pair is tradeable only when a
+/// post-reconnect frame has arrived for EVERY leg it uses — both Kalshi tickers (team-A always, team-B iff
+/// present) AND the pmus slug. Kalshi clears its books + `k_fresh` on reconnect; pmus now mirrors it
+/// (`pm_fresh` + `pmus_books.clear()`), closing the asymmetry where a stale-but-<5s pmus book traded against a
+/// fresh Kalshi book on the first rebuild frame — on the leg the live data shows binds ~9x more often.
+fn all_legs_fresh(k_fresh: &std::collections::HashSet<String>, pm_fresh: &std::collections::HashSet<String>, kalshi: &str, kalshi_b: Option<&str>, slug: &str) -> bool {
+    k_fresh.contains(kalshi)
+        && kalshi_b.is_none_or(|b| k_fresh.contains(b))
+        && pm_fresh.contains(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    /// pmus FRESHNESS GATE (the 2026-06-15 backlog #1 fix): a pmus slug with no post-reconnect frame is NOT
+    /// tradeable even when its Kalshi leg is fresh (the asymmetry bug); the mirror + sports team-B also hold.
+    #[test]
+    fn pmus_freshness_gate_blocks_a_stale_pmus_leg() {
+        let mut k: HashSet<String> = HashSet::new();
+        let mut pm: HashSet<String> = HashSet::new();
+        k.insert("KX-A".to_string());
+        assert!(!all_legs_fresh(&k, &pm, "KX-A", None, "pm-slug"), "stale (un-refreshed) pmus leg is gated even when Kalshi is fresh");
+        pm.insert("pm-slug".to_string());
+        assert!(all_legs_fresh(&k, &pm, "KX-A", None, "pm-slug"), "both legs fresh -> tradeable");
+        assert!(!all_legs_fresh(&HashSet::new(), &pm, "KX-A", None, "pm-slug"), "the mirror: a stale Kalshi leg is gated even when pmus is fresh");
+        k.insert("KX-B".to_string());
+        assert!(all_legs_fresh(&k, &pm, "KX-A", Some("KX-B"), "pm-slug"), "sports: both Kalshi tickers + pmus fresh -> tradeable");
+        let mut k_a_only: HashSet<String> = HashSet::new();
+        k_a_only.insert("KX-A".to_string());
+        assert!(!all_legs_fresh(&k_a_only, &pm, "KX-A", Some("KX-B"), "pm-slug"), "sports with team-B not fresh is gated");
+    }
 
     #[test]
     fn pct_summary_basic_and_clears() {

@@ -31,6 +31,10 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
 /// Resolve the exec-log file path for the run MODE (2026-06-15: keep dry-run records OUT of the live exec
 /// log so a paper run can't pollute the real-money audit trail). LIVE -> `CROSSARB_EXEC_LOG` (default
 /// `executions.jsonl`), UNCHANGED. DRY-RUN -> `CROSSARB_EXEC_LOG_DRYRUN` if set, else the live path with
@@ -138,6 +142,25 @@ pub fn book_snapshot(phase: &str, market: &str, pm_bid: Option<f64>, pm_ask: Opt
         "k_bid": k_bid,
         "k_ask": k_ask,
         "depth_c2": depth_c2,
+    }), live);
+}
+
+/// APPROVED-ENTRY economics (0017 follow-up / backlog #7) — net edge (¢), the velocity metric `edge_rate`
+/// (¢/$-day, the `MIN_EDGE_RATE_CPD` gate's units), direction, size, and per-pair cost, ONE line per fired
+/// entry. The gate is ENABLED live but was uncalibrated because this metric never reached the JSONL; logging
+/// it per fire gives the opportunity distribution to set the threshold from MEASURED rates. Joins to the
+/// same-slug `fire_outcome` (lock vs abort) so edge_rate correlates to whether the fire actually locked.
+/// `live` routes a dry-run record to the `.dryrun` log. No-op under `cargo test`.
+#[allow(clippy::too_many_arguments)]
+pub fn approved(slug: &str, edge_net_cents: f64, edge_rate_cpd: f64, dir: &str, size: u32, cost_per: f64, live: bool) {
+    record(serde_json::json!({
+        "event": "approved",
+        "market": slug,
+        "edge_net_c": round2(edge_net_cents),
+        "edge_rate_cpd": round2(edge_rate_cpd),
+        "dir": dir,
+        "size": size,
+        "cost_per": round2(cost_per),
     }), live);
 }
 
