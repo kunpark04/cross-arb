@@ -181,9 +181,9 @@ pub(crate) fn apply_outcome(
                 if let Some(pos) = &out.position {
                     subtract_exposure(exposure, pos, out.cost_per);
                 }
-                // pmus-first ABORT (0020): the fast (Kalshi) leg carries the `HedgeNotFilled` sentinel iff we
-                // deliberately never opened it (the slow pmus hedge didn't fill first). That's NOT a naked leg
-                // (nothing filled) — route it explicitly instead of the recover/fail-close path.
+                // DYNAMIC-ORDER ABORT (0020/0025): the SECOND (deeper) leg carries the `HedgeNotFilled` sentinel
+                // iff we deliberately never opened it (the first-fired/thinner leg didn't fill first). That's NOT
+                // a naked leg (nothing filled) — route it explicitly instead of the recover/fail-close path.
                 match classify_entry_miss(&out.ack) {
                     // hedge RESTED (Ok, not filled): no position, but its GTC order would fill later unhedged
                     // -> cancel it (best-effort). No halt — this is the EXPECTED skip on a non-fillable hedge.
@@ -192,7 +192,9 @@ pub(crate) fn apply_outcome(
                     // abort cooldown is a clean production follow-up — not needed for the gated 1-contract test.)
                     EntryMiss::CleanAbort(rest_idx) => {
                         cancel_resting_hedge(backend, &out.slug, &out.ack, out.position.as_ref(), rest_idx);
-                        crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge did not fill; cancelled, no position", live);
+                        // the rested hedge can be EITHER venue under the dynamic order [0025] — report the actual one.
+                        let venue = out.position.as_ref().and_then(|p| p.legs.get(rest_idx)).map(|l| format!("{:?}", l.venue)).unwrap_or_else(|| "?".into());
+                        crate::exec_log::fire_outcome(&out.slug, "abort_clean", &format!("{venue} hedge rested unfilled; cancelled, no position"), live);
                     }
                     // hedge ERR'd. TWO sub-cases (2026-06-15 refinement, NARROWED for scale-in):
                     //   * DEFINITE not-filled venue REJECTION (`is_definite_not_filled`: a 4xx that NAMES a
@@ -206,25 +208,36 @@ pub(crate) fn apply_outcome(
                         // the HEDGE leg's error — NOT the `HedgeNotFilled` sentinel (the fast leg we never
                         // opened). Both legs are `Err` here; skip the sentinel so we classify the REAL hedge
                         // fate, independent of which slot (a/b) the pmus hedge occupied.
-                        let hedge_err = [&out.ack.a, &out.ack.b]
-                            .into_iter()
-                            .filter_map(|r| r.as_ref().err())
-                            .find(|e| !matches!(e, exec::ExecError::HedgeNotFilled));
+                        // the HEDGE = the leg that actually ERR'd (NOT the `HedgeNotFilled` sentinel for the
+                        // second leg we never opened). The dynamic order [0025] fires the THINNER leg first, so
+                        // the hedge can be EITHER venue — report the ACTUAL one (was hardcoded "pmus", now stale).
+                        let hedge_slot = if matches!(&out.ack.a, Err(e) if !matches!(e, exec::ExecError::HedgeNotFilled)) {
+                            Some(0usize)
+                        } else if matches!(&out.ack.b, Err(e) if !matches!(e, exec::ExecError::HedgeNotFilled)) {
+                            Some(1usize)
+                        } else {
+                            None
+                        };
+                        let hedge_venue = hedge_slot
+                            .and_then(|i| out.position.as_ref().and_then(|p| p.legs.get(i)))
+                            .map(|l| format!("{:?}", l.venue))
+                            .unwrap_or_else(|| "?".into());
+                        let hedge_err = hedge_slot.and_then(|i| if i == 0 { out.ack.a.as_ref().err() } else { out.ack.b.as_ref().err() });
                         if hedge_err.is_some_and(is_definite_not_filled) {
                             eprintln!(
-                                "[live] pmus-first abort on {}: the pmus hedge leg was DEFINITELY rejected ({hedge_err:?}) — \
-                                 nothing filled, Kalshi leg never opened (NO position) -> CLEAN abort, no halt.",
+                                "[live] dynamic-order abort on {}: the first-fired {hedge_venue} leg was DEFINITELY rejected ({hedge_err:?}) — \
+                                 nothing filled, the second leg never opened (NO position) -> CLEAN abort, no halt.",
                                 out.slug
                             );
-                            crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge definitively rejected; no position", live);
+                            crate::exec_log::fire_outcome(&out.slug, "abort_clean", &format!("{hedge_venue} leg definitively rejected; no position"), live);
                         } else {
                             halt.store(true, std::sync::atomic::Ordering::Relaxed);
                             eprintln!(
-                                "[live] CRITICAL pmus-first abort on {}: the pmus hedge leg ERR'd (a={:?} b={:?}) — \
+                                "[live] CRITICAL dynamic-order abort on {}: the first-fired {hedge_venue} leg ERR'd (a={:?} b={:?}) — \
                                  order fate UNKNOWN (may have landed) -> KILL-SWITCH engaged; reconcile positions before resuming.",
                                 out.slug, out.ack.a, out.ack.b
                             );
-                            crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", "pmus hedge err -> halt", live);
+                            crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", &format!("{hedge_venue} leg err -> halt"), live);
                         }
                     }
                     // FIX A: a real one-leg-filled outcome is a NAKED directional leg. AUTO-RECOVER (cancel the
