@@ -76,8 +76,15 @@ See [deploy/README.md](deploy/README.md).
   **hypothesis to confirm across more games, not yet a class property** (the 06-10 MLB markets did *not*
   replicate it). So scaling = **breadth of depth-AND-edge events** sized to each book's depth, not bigger
   clips in one corner ([tasks/lessons.md](tasks/lessons.md) L16).
-  **Magnitudes are PRELIMINARY** and come from a **single ~8h morning window** (no afternoon/evening coverage;
-  all "/day" figures are a ×3 extrapolation). Two adversarial reviews
+  **Magnitudes are PRELIMINARY**: the live monitor has now accumulated **5.3 days (2026-06-09→14, 197
+  capturable ≥1¢/≥30s episodes)** — superseding the early "single ~8h morning window ×3-extrapolated" basis —
+  but **one day (06-10) supplies ~52%**, so it stays *one-day-dominated*, not a settled distribution.
+  **WHERE (5.3d):** Sports ~66% / Weather ~30% / Econ ~4% (econ under-sampled, release-gated); the deep-AND-edge
+  corner is **MLB**, while the high tennis/ITF *count* is one-day + phantom-inflated ([L20]/[0012](decisions/0012-clip-allocation-edge-floor-and-phantom-filter.md)).
+  **WHEN:** an afternoon/evening-ET concentration (14–16 + 20–21 ET sports game windows; weather afternoon
+  high-lock; econ 8:30 AM print) — direction credible, magnitude one-day-dominated. **Most edges are sub-second**
+  (median 1 s; only ~15% last ≥30 s) → mostly not raceable (matches the ~29%-die-<250 ms leg-fill finding). Two
+  adversarial reviews
   ([independent-review](tasks/independent-review-2026-06-09.md), [reviewer-audit](tasks/reviewer-audit-2026-06-09.md))
   found the earlier "$/day" prose unsupported and a capital double-count (~6–7× — now fixed in `capital_sim.py`:
   corrected peak ≈ $13.6k / ~6%/day, still preliminary). Treat edge size as unproven until the live monitor +

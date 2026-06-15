@@ -42,6 +42,16 @@ latency stage, then ran the first live armed all-events arb — it hit a naked l
   delay itself caused the Kalshi miss. **Follow-ups:** (a) fire the SECOND leg more aggressively but cap the
   pay-up at the edge floor (cut the residual miss rate without eating the edge); (b) log recovery-cost-gate
   rejection counts to calibrate the 1.0 ratio (too-strict? unknown at n=1); (c) snapshot books at entry+recovery.
+- **Follow-ups (a)+(b)+(c) BUILT (`dcb0254`):** capped-aggressive second leg (`pricing::apply_second_leg_markup`,
+  `AGGRESSIVE_SECOND_LEG` on — once pmus fills, raise the Kalshi BUY limit by the realized edge SURPLUS so it
+  fills through the serial-delay move, capped at 5¢, never below the floor; thin arbs stay passive → cheap
+  recovery); per-gate **rejection counter** (`risk::reject_label` + heartbeat — answers "is the recovery gate
+  too strict?" with data, not n=1); **entry book snapshots** (`exec_log::book_snapshot`). 160 tests, clippy clean.
+- **WHERE/WHEN edges come from (5.3-day persistence, agent analysis):** Sports ~66% / Weather ~30% / Econ ~4%
+  (econ under-sampled); the deep-AND-edge corner is **MLB** (the high tennis/ITF *count* is one-day + phantom-
+  inflated, [L20]/0012); afternoon/evening-ET concentration (game windows) but **one-day-dominated** (06-10 =
+  52% of capturable). **Most edges are sub-second (median 1 s; ~15% ≥30 s)** — the structural reason the serial
+  second leg misses. CLAUDE.md's stale "8h window ×3" framing refreshed to this 5.3-day basis.
 
 ---
 
