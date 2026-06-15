@@ -243,6 +243,17 @@ pub(crate) fn apply_outcome(
                         }
                     }
                 }
+                // COID BURN (2026-06-15 tiplem-zozkar fix): the pair did NOT lock, but if ANY leg actually
+                // created a venue order under `xarb-{slug}-{idx}`, that coid is BURNT (the venue dedups on
+                // client_order_id even after a cancel/recover). Advance the per-slug index so the NEXT fire on
+                // this slug gets a FRESH coid instead of re-colliding into a `409 order_already_exists`
+                // fail-close halt. (The both-filled LOCK branch already advanced above; this covers the
+                // naked-recovered + rested-abort paths. Over-advancing when nothing landed is impossible here —
+                // `entry_landed_order` is false unless a real order id exists; skipping an index is harmless
+                // anyway, reusing a burnt one is not.)
+                if entry_landed_order(&out.ack) {
+                    *next_pos_index.entry(out.slug.clone()).or_insert(0) += 1;
+                }
             }
             // EVERY Entry resolution stamps the per-slug cooldown (the caller inserts on this `Some`) — the
             // fire site already stamped it; re-stamping on resolution extends the window past a churn burst.
@@ -318,6 +329,19 @@ pub(crate) fn naked_filled_idx(ack: &exec::PairAck) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Did this terminal Entry outcome actually CREATE a real order at a venue under the entry coid
+/// (`xarb-{slug}-{idx}-{tag}`)? True iff ANY ack leg is `Ok` with a non-empty `venue_order_id` — whether it
+/// FILLED, RESTED, or filled-then-got-recovered. Such a coid is BURNT at the venue (both venues dedup on
+/// client_order_id PERMANENTLY — a cancelled/recovered order's coid still `409 order_already_exists` on
+/// reuse), so the per-slug index MUST advance past it even though the pair did NOT lock. Without this, a fire
+/// that fills-then-recovers (the 2026-06-15 tiplem-zozkar incident: Kalshi filled @30c, pmus IOC-expired, the
+/// naked Kalshi leg recovered to flat — but no LOCK, so the index stayed 0) leaves the burnt coid in place;
+/// the NEXT fire on the slug reuses it -> `409 order_already_exists` -> a FALSE fail-close halt on a flat book.
+/// An empty `venue_order_id` (a dedup-409 reject, or a hedge we never opened) created nothing -> not burnt.
+fn entry_landed_order(ack: &exec::PairAck) -> bool {
+    [&ack.a, &ack.b].iter().any(|r| matches!(r, Ok(a) if !a.venue_order_id.is_empty()))
 }
 
 /// Is this `Err` a DEFINITE not-filled venue REJECTION — the order was unambiguously rejected/killed and
@@ -1021,6 +1045,62 @@ mod tests {
         let unwind = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         apply_outcome(&dry_backend(), &positions, &kb, &pmb, &mut exp, &mut pending, &mut flat, &mut next_idx, &tx, &halt, unwind);
         assert_eq!(next_idx.get(&slug).copied(), Some(2), "an unwind NEVER decrements the index — no coid reuse after a front-removal");
+    }
+
+    /// COID-BURN DETECTION (the tiplem-zozkar incident, pure-fn level): a leg that created a real venue order
+    /// (non-empty `venue_order_id`) BURNS its coid even if the pair didn't lock; an empty id (dedup-reject /
+    /// never-opened hedge) created nothing. `entry_landed_order` is the gate that decides the index must advance.
+    #[test]
+    fn entry_landed_order_detects_a_burnt_coid_on_a_non_lock_outcome() {
+        // Kalshi leg FILLED (real order id) then to-be-recovered; pmus hedge never opened -> coid IS burnt.
+        let burnt = exec::PairAck {
+            a: Err(exec::ExecError::HedgeNotFilled),
+            b: Ok(exec::Ack { client_order_id: "xarb-s-0-B".into(), venue_order_id: "K-89ac".into(), filled: true, fill_qty: 1.0, simulated: false }),
+        };
+        assert!(entry_landed_order(&burnt), "a filled leg with a real venue order id burns the coid -> the index MUST advance");
+        // a rested-then-cancelled leg ALSO carries a real order id (filled:false but venue_order_id set) -> burnt.
+        let rested = exec::PairAck {
+            a: Ok(exec::Ack { client_order_id: "xarb-s-0-A".into(), venue_order_id: "PM-rest".into(), filled: false, fill_qty: 0.0, simulated: false }),
+            b: Err(exec::ExecError::HedgeNotFilled),
+        };
+        assert!(entry_landed_order(&rested), "a rested-then-cancelled leg's coid is burnt too (venue dedups on it)");
+        // a dedup-409 reject (no order created, empty id) + a never-opened hedge -> NOTHING landed.
+        let nothing = exec::PairAck {
+            a: Err(exec::ExecError::HedgeNotFilled),
+            b: Ok(exec::Ack { client_order_id: "xarb-s-0-B".into(), venue_order_id: "".into(), filled: false, fill_qty: 0.0, simulated: false }),
+        };
+        assert!(!entry_landed_order(&nothing), "an empty venue_order_id (rejected, nothing created) did NOT burn the coid");
+    }
+
+    /// COID-BURN INDEX ADVANCE (the 2026-06-15 tiplem-zozkar incident, end-to-end): a fire that FILLS one leg
+    /// then RECOVERS it (naked -> flatten) did NOT lock, but BURNT its entry coid at the venue. The per-slug
+    /// index MUST still advance 0 -> 1, so the NEXT fire on the slug gets a FRESH coid instead of re-colliding
+    /// into `409 order_already_exists` -> a false fail-close halt (which is exactly what halted the live bot).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn naked_recover_advances_coid_index_so_next_fire_gets_a_fresh_coid() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let mut next_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let (pair, pos, cp) = wx_entry_pair(); // leg0 = YES@pmus(slug); leg1 = NO@Kalshi
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // a priceable pmus book so the naked (pmus) leg's flatten can be priced (no halt noise).
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+        // pmus leg A FILLED live (real venue_order_id -> coid burnt); Kalshi hedge B never opened.
+        let a = Ok(exec::Ack { client_order_id: "xarb-s-0-A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b = Err(exec::ExecError::HedgeNotFilled);
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        apply_outcome(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &mut next_idx, &tx, &halt, out);
+        assert_eq!(next_idx.get(&slug).copied(), Some(1), "a naked-recovered entry (filled then flattened) advances the coid index 0 -> 1 — the burnt coid is never reused on the next fire");
     }
 
     fn dry_backend() -> std::sync::Arc<dyn ExecutionBackend> {
