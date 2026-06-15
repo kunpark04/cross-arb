@@ -263,16 +263,19 @@ pub(crate) fn apply_outcome(
     }
 }
 
-/// Which leg of a non-both-filled pair is the NAKED one: returns `Some(0)` if leg `a` filled LIVE (not a
-/// simulated dry-run ack) while `b` did not fill, `Some(1)` for the mirror, else `None` (no real naked leg
-/// — both errored, both simulated, or both filled). "Did not fill" covers an `Err` AND an `Ok`-but-resting
-/// (accepted, not filled) leg — a resting leg leaves the other filled leg just as naked as an errored one.
+/// Which leg of a non-both-filled pair holds a REAL (live) naked position: returns `Some(0)` if leg `a` has
+/// a LIVE fill of ANY size — FULL or PARTIAL (`fill_qty > 0`, not a simulated dry-run ack) — while `b` did
+/// not fully fill, `Some(1)` for the mirror, else `None` (no real naked leg — both errored, both simulated,
+/// or both fully filled). A PARTIAL (`0 < fill_qty < qty`) counts: pmus ignores FOK and can leave a
+/// `cumQuantity:0.01` position that `filled:false` would hide — that partial is naked and the recovery
+/// unwinds its EXACT `fill_qty`. "Did not fully fill" covers an `Err` AND an `Ok`-but-not-full leg.
 pub(crate) fn naked_filled_idx(ack: &exec::PairAck) -> Option<usize> {
-    let live_filled = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Ok(a) if a.filled && !a.simulated);
-    let not_filled = |r: &Result<exec::Ack, exec::ExecError>| !matches!(r, Ok(a) if a.filled);
-    if live_filled(&ack.a) && not_filled(&ack.b) {
+    // a live position exists on ANY non-zero fill (full OR partial), excluding simulated dry-run acks.
+    let live_has_fill = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Ok(a) if a.fill_qty > 0.0 && !a.simulated);
+    let not_full = |r: &Result<exec::Ack, exec::ExecError>| !matches!(r, Ok(a) if a.filled);
+    if live_has_fill(&ack.a) && not_full(&ack.b) {
         Some(0)
-    } else if live_filled(&ack.b) && not_filled(&ack.a) {
+    } else if live_has_fill(&ack.b) && not_full(&ack.a) {
         Some(1)
     } else {
         None
@@ -303,8 +306,12 @@ pub(crate) fn classify_entry_miss(ack: &exec::PairAck) -> EntryMiss {
         return EntryMiss::NakedOrOther; // no sentinel -> not a pmus-first abort
     };
     match hedge {
-        Ok(a) if !a.filled => EntryMiss::CleanAbort(hedge_idx), // rested -> cancel it, no position
-        Ok(_) => EntryMiss::NakedOrOther, // hedge FILLED but the other is the sentinel (shouldn't occur) -> recover it
+        // a PARTIAL pmus fill (`0 < fill_qty < qty`, so `!filled`) is a REAL naked position, NOT a clean
+        // abort: pmus ignores FOK and runs entries IMMEDIATE_OR_CANCEL, so a qty=5 can return cumQuantity:0.01
+        // with the rest expired. Route it to NakedOrOther so the recovery UNWINDS the exact `fill_qty` —
+        // CleanAbort would cancel an already-expired order and leave the 0.01 naked + untracked (the M'Chich bug).
+        Ok(a) if a.fill_qty > 0.0 => EntryMiss::NakedOrOther, // partial (or full) fill -> recover/unwind it
+        Ok(_) => EntryMiss::CleanAbort(hedge_idx), // truly nothing filled (rested/expired, fill_qty==0) -> cancel it, no position
         Err(_) => EntryMiss::AmbiguousAbort, // hedge errored -> order fate unknown -> halt
     }
 }
@@ -335,15 +342,36 @@ pub(crate) fn cancel_resting_hedge(
     println!("[live] pmus-first ABORT on {slug}: pmus hedge did not fill -> NO position (no resting order to cancel).");
 }
 
-/// FIX A — NAKED-LEG AUTO-RECOVERY. On a one-leg-filled entry outcome: (1) if the UNFILLED leg is an
-/// `Ok`-but-resting order with a venue order id, CANCEL it (spawned, best-effort); (2) FLATTEN the FILLED
-/// leg with a single marketable SELL (best YES bid for a YES leg, `1 - YES ask` for a NO leg) read from
-/// that leg's LIVE book, fired through the single-leg `submit` primitive on a spawned task; the SELL's
-/// outcome routes back as a `SubmitKind::Recovery` so a SELL that ITSELF fails to fill re-trips the halt.
-/// Does NOT record a hedge; the reservation was already released by the caller. Returns TRUE iff recovery
-/// was LAUNCHED; FALSE (caller halts as the backstop) when there is no real naked leg OR the filled leg
-/// cannot be priced (one-sided book) / its (venue, market, side) is unavailable. FAIL SAFE: any uncertainty
-/// about the flatten price/route returns FALSE -> halt, never an un-flattened silent naked leg.
+/// The indices of EVERY leg holding a REAL (live) naked fill of ANY size (`Ok(a) if a.fill_qty > 0 &&
+/// !simulated`). Single-leg case: `[i]`. The 2026-06-15 BOTH-PARTIAL case (pmus fully fills, then Kalshi
+/// ALSO partial-fills its FOK — unverified at >1 contract but treated as live): `[0, 1]` — both legs carry a
+/// position and BOTH must flatten. Empty iff no real naked leg (both errored / both simulated / both full).
+fn naked_filled_indices(ack: &exec::PairAck) -> Vec<usize> {
+    let live_has_fill = |r: &Result<exec::Ack, exec::ExecError>| matches!(r, Ok(a) if a.fill_qty > 0.0 && !a.simulated);
+    [&ack.a, &ack.b]
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| live_has_fill(r))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// FIX A — NAKED-LEG AUTO-RECOVERY, VENUE-AGNOSTIC + COMPLETE (2026-06-15). On a non-both-FULL entry outcome,
+/// EVERY leg that holds a live fill of ANY size (`fill_qty > 0` — FULL or a sub-1 PARTIAL) is flattened, EACH
+/// at its OWN `fill_qty`, so no partial position ever persists on EITHER venue. The single-leg case (one leg
+/// filled, the other rested/erred/never-sent) is unchanged — one cancel + one SELL. The new BOTH-naked case
+/// (pmus fully fills, Kalshi ALSO partial-fills its FOK) fires a SELL on each — never abandons the second leg.
+///
+/// Steps: (1) any UNFILLED leg that is an `Ok`-but-resting order with a venue id is CANCELLed (spawned,
+/// best-effort); (2) each naked leg is FLATTENed with a marketable SELL sized to its EXACT `fill_qty`
+/// (`frac_qty`), fired via the single-leg `submit` on a spawned task — each SELL's outcome routes back as a
+/// `SubmitKind::Recovery` so a SELL that ITSELF fails to fill re-trips the halt. Records no hedge.
+///
+/// SAFETY (fail-CLOSE, ATOMIC LAUNCH): returns FALSE (caller halts as the backstop) and fires NOTHING when —
+/// no real naked leg / no leg metadata; ANY UNFILLED leg ERR'd with an unknown order fate (it may secretly be
+/// a LOCK — `HedgeNotFilled` is the one KNOWN-no-order exception); OR ANY naked leg can't be priced
+/// (one-sided book). Pricing every naked leg BEFORE firing any SELL means a half-recovery (one leg flattened,
+/// the other abandoned) is impossible — either every naked leg launches a flatten or none does and we halt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recover_naked_leg(
     backend: &std::sync::Arc<dyn ExecutionBackend>,
@@ -355,26 +383,32 @@ pub(crate) fn recover_naked_leg(
     ack: &exec::PairAck,
     position: Option<&Position>,
 ) -> bool {
-    let Some(filled_idx) = naked_filled_idx(ack) else {
+    let naked = naked_filled_indices(ack);
+    if naked.is_empty() {
         return false; // no real (live) naked leg -> nothing to recover; caller's halt is a no-op anyway
-    };
+    }
     // the held legs (with venue/market/side) we built the entry from — positional: legs[i] <-> ack {a,b}.
     let Some(pos) = position else { return false }; // no leg metadata -> can't price/route -> halt backstop
-    let resting_idx = 1 - filled_idx;
-    let filled_leg = &pos.legs[filled_idx];
-    let resting_ack = if resting_idx == 0 { &ack.a } else { &ack.b };
+    let leg_ack = |i: usize| if i == 0 { &ack.a } else { &ack.b };
 
-    // AMBIGUOUS UNFILLED LEG (2026-06-15): under FOK a clean MISS returns Ok(not-filled); an Err means a
-    // 4xx-reject or a transport error whose order fate is UNKNOWN — it may have LANDED + FILLED. If we
-    // flattened the KNOWN-filled leg now and the "unfilled" leg actually filled too, we'd UN-HEDGE a real
-    // LOCK (sell off one side of a both-filled pair). FAIL CLOSED: return false so the caller halts for a
-    // manual reconcile, rather than guess. (A clean Ok-but-resting unfilled leg proceeds to recovery below.)
-    if resting_ack.is_err() {
-        eprintln!(
-            "[live] CRITICAL NAKED LEG on {slug}: the unfilled leg ERR'd ({resting_ack:?}) — its order fate is \
-             UNKNOWN (may have FILLED) -> NOT flattening (could be a real LOCK); HALTING for manual reconcile."
-        );
-        return false;
+    // AMBIGUOUS UNFILLED LEG (2026-06-15): for each leg NOT in the naked set (it did not fill any size), an
+    // `Err` whose fate is UNKNOWN may secretly have LANDED + FILLED — flattening the naked leg(s) now could
+    // UN-HEDGE a real LOCK. FAIL CLOSED: halt for a manual reconcile rather than guess. `HedgeNotFilled` is
+    // the one exception (the pmus-first sentinel for a leg we DELIBERATELY never sent — no order exists, so it
+    // can't be a hidden lock); a clean `Ok`-but-resting leg is also fine (a known no-fill). With BOTH legs
+    // naked there is no such "other" leg, so this never fires for the both-partial case.
+    for &i in &[0usize, 1] {
+        if naked.contains(&i) {
+            continue;
+        }
+        let other = leg_ack(i);
+        if other.is_err() && !matches!(other, Err(exec::ExecError::HedgeNotFilled)) {
+            eprintln!(
+                "[live] CRITICAL NAKED LEG on {slug}: the unfilled leg ERR'd ({other:?}) — its order fate is \
+                 UNKNOWN (may have FILLED) -> NOT flattening (could be a real LOCK); HALTING for manual reconcile."
+            );
+            return false;
+        }
     }
 
     // W-1: the slug's flatten slot is occupied — by WHAT decides whether this naked leg is covered.
@@ -391,51 +425,73 @@ pub(crate) fn recover_naked_leg(
         None => {}                               // slot free -> fire the recovery below
     }
 
-    // PRICE the filled leg's marketable SELL from its LIVE book. Unpriceable (one-sided book / no book) ->
-    // FALSE so the caller halts: we must NOT leave the filled leg silently naked. The flatten is a SELL, so
-    // it FLOOR-quantizes to the leg's pmus tick (W2) — `Position` now carries `pm_min_tick` on the pmus leg —
-    // before the cent floor, so a coarse-tick pmus market doesn't reject the recovery SELL.
-    let book = match filled_leg.venue {
-        Venue::Kalshi => lock(kalshi_books).get(&filled_leg.market).map(|b| b.touch()),
-        Venue::Pmus => pmus_books.get(&filled_leg.market).map(|b| b.touch()),
-    };
-    let Some(exit) = book.and_then(|b| flatten_exit_cents(filled_leg, &b)) else {
-        eprintln!("[live] CRITICAL NAKED LEG on {slug}: filled {:?} leg can't be priced for a flatten (one-sided book) -> halting", filled_leg.venue);
-        return false;
-    };
+    // PRICE EVERY naked leg's marketable SELL from its LIVE book BEFORE firing any of them (atomic launch). An
+    // unpriceable leg (one-sided book / no book) -> FALSE so the caller halts AND no SELL has fired yet — we
+    // never half-recover (flatten one naked leg, abandon the other). The flatten is a SELL, so it
+    // FLOOR-quantizes to the leg's pmus tick (W2) before the cent floor, so a coarse-tick pmus market doesn't
+    // reject the recovery SELL.
+    let mut sells: Vec<OrderIntent> = Vec::with_capacity(naked.len());
+    for &filled_idx in &naked {
+        let filled_leg = &pos.legs[filled_idx];
+        // the EXACT filled quantity (full OR a sub-1 partial like 0.01) — the recovery SELL unwinds THIS,
+        // never the requested intent `pos.size` (which would over-sell a partial). `naked_filled_indices`
+        // already proved `fill_qty > 0` on this Ok leg; default 0.0 keeps it total (defensive).
+        let filled_qty = match leg_ack(filled_idx) { Ok(a) => a.fill_qty, Err(_) => 0.0 };
+        let book = match filled_leg.venue {
+            Venue::Kalshi => lock(kalshi_books).get(&filled_leg.market).map(|b| b.touch()),
+            Venue::Pmus => pmus_books.get(&filled_leg.market).map(|b| b.touch()),
+        };
+        let Some(exit) = book.and_then(|b| flatten_exit_cents(filled_leg, &b)) else {
+            eprintln!("[live] CRITICAL NAKED LEG on {slug}: filled {:?} leg can't be priced for a flatten (one-sided book) -> halting (no SELL fired)", filled_leg.venue);
+            return false;
+        };
+        // a marketable SELL of the EXACT (venue, market, side) held, sized to the ACTUAL filled qty
+        // (`frac_qty` carries the possibly sub-1 amount UNROUNDED; the integer `qty` is a ceil fallback ≥1 for
+        // the dry-run/log path and whole-share venues).
+        sells.push(OrderIntent {
+            venue: filled_leg.venue,
+            market: filled_leg.market.clone(),
+            action: Action::Sell,
+            side: filled_leg.side,
+            price_cents: exit,
+            qty: filled_qty.ceil().max(1.0) as u32,
+            frac_qty: Some(filled_qty),
+            client_order_id: format!("recover-{slug}-{filled_idx}"),
+        });
+    }
 
-    // (1) CANCEL the resting leg if it is an accepted-but-resting order with a venue order id (an Err leg
-    //     created no order to cancel). Best-effort + spawned: a cancel failure still leaves the FLATTEN as
-    //     the real risk reducer, and a GTC resting order that never fills is harmless once we're flat.
-    if let Ok(a) = resting_ack {
-        if !a.filled && !a.venue_order_id.is_empty() {
-            let target = exec::CancelTarget {
-                venue: pos.legs[resting_idx].venue,
-                venue_order_id: a.venue_order_id.clone(),
-                market: pos.legs[resting_idx].market.clone(),
-            };
-            spawn_cancel(backend, slug, target);
+    // (1) CANCEL each truly-resting (Ok, not-filled, with a venue order id) leg NOT in the naked set — an Err
+    //     leg created no order to cancel, and a naked (partially-filled) leg gets a SELL, not a cancel.
+    //     Best-effort + spawned: a cancel failure still leaves the FLATTEN as the real risk reducer.
+    for &i in &[0usize, 1] {
+        if naked.contains(&i) {
+            continue;
+        }
+        if let Ok(a) = leg_ack(i) {
+            if !a.filled && !a.venue_order_id.is_empty() {
+                let target = exec::CancelTarget {
+                    venue: pos.legs[i].venue,
+                    venue_order_id: a.venue_order_id.clone(),
+                    market: pos.legs[i].market.clone(),
+                };
+                spawn_cancel(backend, slug, target);
+            }
         }
     }
 
-    // (2) FLATTEN the filled leg: one marketable SELL of the EXACT (venue, market, side) held, fired on a
-    //     spawned task via the single-leg `submit`. Mark the slug `flattening` so a burst can't double-fire.
-    let sell = OrderIntent {
-        venue: filled_leg.venue,
-        market: filled_leg.market.clone(),
-        action: Action::Sell,
-        side: filled_leg.side,
-        price_cents: exit,
-        qty: pos.size,
-        client_order_id: format!("recover-{slug}-{filled_idx}"),
-    };
-    eprintln!(
-        "[live] CRITICAL NAKED LEG on {slug}: one live leg filled, the other did not -> AUTO-RECOVERING \
-         (cancel resting leg + SELL {:?} {:?} {}x @ {}c to flatten). No hedge recorded.",
-        sell.venue, sell.side, sell.qty, sell.price_cents
-    );
+    // (2) FLATTEN every naked leg. Mark the slug `flattening` so a burst can't double-fire; each SELL reports
+    //     back as a `SubmitKind::Recovery` whose arm halts iff that SELL did NOT fill (so an abandoned partial
+    //     can never go silent). For the both-naked case BOTH SELLs fire under the one Recovery slot.
     flattening.insert(slug.to_string(), FlatKind::Recovery);
-    spawn_flatten(backend, outcome_tx, slug.to_string(), sell);
+    for sell in sells {
+        let sold = sell.frac_qty.unwrap_or(sell.qty as f64);
+        eprintln!(
+            "[live] CRITICAL NAKED LEG on {slug}: live leg filled ({sold} of {} requested), pair is not a clean lock \
+             -> AUTO-RECOVERING (SELL {:?} {:?} {sold}x @ {}c to flatten). No hedge recorded.",
+            pos.size, sell.venue, sell.side, sell.price_cents
+        );
+        spawn_flatten(backend, outcome_tx, slug.to_string(), sell);
+    }
     true
 }
 
@@ -592,8 +648,9 @@ mod tests {
     /// (halt — order fate unknown); no sentinel = the real naked/recover path (unchanged).
     #[test]
     fn classify_entry_miss_routes_the_pmus_first_abort() {
+        // a CLEAN abort needs fill_qty==0 (nothing filled, just rested/expired); a full fill carries the qty.
         let ok = |filled: bool, oid: &str| -> Result<exec::Ack, exec::ExecError> {
-            Ok(exec::Ack { client_order_id: "c".into(), venue_order_id: oid.into(), filled, simulated: false })
+            Ok(exec::Ack { client_order_id: "c".into(), venue_order_id: oid.into(), filled, fill_qty: if filled { 1.0 } else { 0.0 }, simulated: false })
         };
         let sentinel = || -> Result<exec::Ack, exec::ExecError> { Err(exec::ExecError::HedgeNotFilled) };
         let errd = || -> Result<exec::Ack, exec::ExecError> { Err(exec::ExecError::Rejected("boom".into())) };
@@ -608,6 +665,14 @@ mod tests {
         assert!(matches!(classify_entry_miss(&exec::PairAck { a: ok(true, "K1"), b: ok(false, "PM1") }), EntryMiss::NakedOrOther));
         // defensive: hedge FILLED but the OTHER leg is the sentinel (shouldn't occur) -> NakedOrOther (recover it)
         assert!(matches!(classify_entry_miss(&exec::PairAck { a: ok(true, "PM1"), b: sentinel() }), EntryMiss::NakedOrOther));
+        // (c) PARTIAL pmus hedge (Ok, filled:false, fill_qty:0.01) + sentinel -> NOT a CleanAbort: pmus ignores
+        // FOK and partial-filled, so the 0.01 is a REAL naked position -> NakedOrOther (recover/unwind it). A
+        // CleanAbort here would cancel an already-expired order and abandon the 0.01 (the M'Chich incident).
+        let partial = || -> Result<exec::Ack, exec::ExecError> {
+            Ok(exec::Ack { client_order_id: "c".into(), venue_order_id: "PM1".into(), filled: false, fill_qty: 0.01, simulated: false })
+        };
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: partial(), b: sentinel() }), EntryMiss::NakedOrOther), "a partial pmus fill is a naked position, not a clean abort");
+        assert!(matches!(classify_entry_miss(&exec::PairAck { a: sentinel(), b: partial() }), EntryMiss::NakedOrOther), "mirror: partial pmus on leg b");
     }
 
     /// `track_position` does NOT enroll a WORLD-CUP pair in the MLB postponement poll (no statsapi WC
@@ -619,8 +684,8 @@ mod tests {
         let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pair = wc_pair();
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 1, client_order_id: "a".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 55, qty: 1, client_order_id: "b".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 1, frac_qty: None, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 55, qty: 1, frac_qty: None, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         track_position(&positions, &pair, pos, 0.97, 0.03, Dir::PK);
@@ -647,8 +712,8 @@ mod tests {
             pm_min_tick: None, pm_min_qty: None,
         };
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, client_order_id: "a".into() },
-            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, frac_qty: None, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, frac_qty: None, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         // RESERVE at spawn (exposure bumps) then APPEND the leg on both-filled (exposure stays reserved).
@@ -687,8 +752,8 @@ mod tests {
             pm_min_tick: None, pm_min_qty: None,
         };
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, client_order_id: "a".into() },
-            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, client_order_id: "b".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 4, frac_qty: None, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 4, frac_qty: None, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         track_position(&positions, &pair, pos.clone(), 0.97, 0.03, Dir::PK);
@@ -705,10 +770,10 @@ mod tests {
     }
 
     fn sim_ack(coid: &str) -> Result<exec::Ack, exec::ExecError> {
-        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "SIMULATED".into(), filled: true, simulated: true })
+        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "SIMULATED".into(), filled: true, fill_qty: 3.0, simulated: true })
     }
     fn live_ack(coid: &str) -> Result<exec::Ack, exec::ExecError> {
-        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "v1".into(), filled: true, simulated: false })
+        Ok(exec::Ack { client_order_id: coid.into(), venue_order_id: "v1".into(), filled: true, fill_qty: 3.0, simulated: false })
     }
     fn wx_entry_pair() -> (LivePair, Position, f64) {
         let pair = LivePair {
@@ -718,8 +783,8 @@ mod tests {
             pm_min_tick: None, pm_min_qty: None,
         };
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "xarb-…-A".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "xarb-…-B".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "xarb-…-A".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, frac_qty: None, client_order_id: "xarb-…-B".into() },
         ];
         (pair.clone(), position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs), 0.97)
     }
@@ -791,6 +856,29 @@ mod tests {
 
     fn dry_backend() -> std::sync::Arc<dyn ExecutionBackend> {
         std::sync::Arc::new(exec::DryRunBackend)
+    }
+
+    /// A test backend that RECORDS every `submit`ted single-leg intent (the recovery SELL) so a test can
+    /// assert the EXACT qty/frac_qty the recovery fired. `submit` returns a simulated filled ack (like
+    /// dry-run); `submit_pair`/`cancel` delegate to the dry-run shape.
+    #[derive(Default)]
+    struct RecordingBackend {
+        submitted: std::sync::Mutex<Vec<OrderIntent>>,
+    }
+    impl ExecutionBackend for RecordingBackend {
+        fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> exec::PairAck {
+            exec::DryRunBackend.submit_pair(a, b)
+        }
+        fn submit(&self, intent: &OrderIntent) -> Result<exec::Ack, exec::ExecError> {
+            self.submitted.lock().unwrap().push(intent.clone());
+            exec::DryRunBackend.submit(intent)
+        }
+        fn cancel(&self, target: &exec::CancelTarget) -> Result<(), exec::ExecError> {
+            exec::DryRunBackend.cancel(target)
+        }
+        fn label(&self) -> &'static str {
+            "dry-run"
+        }
     }
     fn empty_kbooks() -> std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>> {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -912,8 +1000,8 @@ mod tests {
         reserve_exposure(&mut exp, &pos, cp);
         pending.insert(slug.clone());
         // both legs filled live with DISTINCT venue order ids.
-        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-ORD-1".into(), filled: true, simulated: false });
-        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-ORD-2".into(), filled: true, simulated: false });
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-ORD-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-ORD-2".into(), filled: true, fill_qty: 3.0, simulated: false });
         let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         let sp = positions.lock().unwrap().get(&slug).cloned().expect("position recorded");
@@ -942,8 +1030,8 @@ mod tests {
         reserve_exposure(&mut exp, &pos, cp);
         pending.insert(slug.clone());
         // leg A filled live; leg B ACCEPTED but resting (Ok, filled:false) -> not both-filled -> naked.
-        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "K-1".into(), filled: true, simulated: false });
-        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "PM-2".into(), filled: false, simulated: false });
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "K-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "PM-2".into(), filled: false, fill_qty: 0.0, simulated: false });
         let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
         assert!(!positions.lock().unwrap().contains_key(&slug), "a one-resting-leg entry is NOT recorded as a hedge");
@@ -975,8 +1063,8 @@ mod tests {
         pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
         pmus_books.insert(slug.clone(), pb);
         // leg A (pmus) filled LIVE; leg B (Kalshi) resting with a venue order id (so it gets cancelled).
-        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, simulated: false });
-        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, fill_qty: 0.0, simulated: false });
         let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // RECOVERY launched: no held hedge recorded, reservation released, NOT a bare halt, slug marked flattening.
@@ -990,6 +1078,148 @@ mod tests {
         let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
         assert_eq!(recovered.kind, SubmitKind::Recovery, "the flatten routes back as a Recovery outcome");
         assert!(matches!(&recovered.ack.a, Ok(a) if a.filled), "leg a is the SELL and the dry-run flatten fills");
+    }
+
+    /// (b) PARTIAL-FILL RECOVERY (the 2026-06-15 M'Chich incident): a pmus-first entry where the pmus leg
+    /// PARTIAL-filled (`fill_qty=0.01` of a requested 3) — pmus ignores FOK — is detected as a REAL naked
+    /// position (`naked_filled_idx` keys on `fill_qty>0`, not `filled`), and the recovery SELL is sized to the
+    /// ACTUAL filled qty 0.01 (`frac_qty`), NOT the intent `pos.size` 3. Selling 3 would over-sell a 0.01
+    /// position (opening a 2.99 SHORT). The RecordingBackend captures the fired SELL so we assert its size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_pmus_fill_recovers_sized_to_fill_qty_not_intent() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair(); // leg0 = YES@pmus(slug) qty 3; leg1 = NO@Kalshi
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // a priceable pmus book for the partially-filled leg so the flatten can be priced.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+        // pmus leg A PARTIAL-filled 0.01 of 3 (filled:false, fill_qty:0.01); under pmus-first the Kalshi leg B
+        // never opened -> the HedgeNotFilled sentinel. The 0.01 is naked + must be unwound at exactly 0.01.
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: false, fill_qty: 0.01, simulated: false });
+        let b = Err(exec::ExecError::HedgeNotFilled);
+        // a RECORDING backend so we can read the recovery SELL's exact qty/frac_qty.
+        let rec = std::sync::Arc::new(RecordingBackend::default());
+        let backend: std::sync::Arc<dyn ExecutionBackend> = rec.clone();
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        let mut rx = run_apply(&backend, &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
+        // the partial is recovered (NOT a clean abort that abandons it): slug marked flattening, no halt, no held hedge.
+        assert!(flat.contains_key(&slug), "the partial is treated as a naked position -> recovery launched (flattening)");
+        assert!(!halt.load(Ordering::Relaxed), "recovery flattens the partial -> no bare halt");
+        assert!(!positions.lock().unwrap().contains_key(&slug), "no hedge recorded for a partial");
+        assert!(exp.total.abs() < 1e-9, "the entry reservation is released");
+        // drain the Recovery outcome so the spawned SELL has fired, then inspect the captured SELL.
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
+        assert_eq!(recovered.kind, SubmitKind::Recovery);
+        let fired = rec.submitted.lock().unwrap();
+        assert_eq!(fired.len(), 1, "exactly one recovery SELL fired");
+        let sell = &fired[0];
+        assert_eq!(sell.action, Action::Sell, "the recovery is a SELL (flatten)");
+        assert_eq!(sell.venue, Venue::Pmus, "the partially-filled leg is the pmus YES leg");
+        assert_eq!(sell.frac_qty, Some(0.01), "the SELL is sized to the EXACT partial 0.01, never the intent qty 3");
+        assert_ne!(sell.qty, 3, "the recovery must NOT sell the requested intent size (would over-sell the partial)");
+        assert_eq!(sell.qty, 1, "the integer fallback is ceil(0.01)=1, but frac_qty carries the exact 0.01 to the venue");
+    }
+
+    /// (b2) BOTH-NAKED RECOVERY (the >1-contract gap the independent review flagged): pmus (leg0) FULLY fills
+    /// 10, then Kalshi (leg1) ALSO partial-fills its FOK — 7 of 10 — so BOTH legs carry a live position but it
+    /// is NOT a clean both-FULL lock (leg1 `filled:false`). The fix flattens BOTH legs, EACH sized to its OWN
+    /// `fill_qty` (pmus SELL 10, Kalshi SELL 7) — the pre-fix `naked_filled_idx` recovered only ONE leg and
+    /// ABANDONED the Kalshi 7-contract partial naked. Neither leg is left un-unwound; no over-sell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_legs_partial_recovers_each_sized_to_own_fill_qty() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair(); // leg0 = YES@pmus(slug); leg1 = NO@Kalshi(pair.kalshi)
+        let slug = pos.market.clone();
+        let kalshi_market = pos.legs[1].market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // a priceable pmus book (for the YES leg0 flatten) AND a priceable Kalshi book (for the NO leg1
+        // flatten — a NO SELL prices off `1 - YES ask`, so a YES ask must be present). BOTH legs must price or
+        // the atomic launch fails-closed.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+        // KalshiBook::apply_snapshot(yes_bids, no_bids); YES ask = 1 - best NO bid. NO bid 0.90 -> YES ask
+        // 0.10 -> the NO-leg flatten prices at 1 - 0.10 = 0.90 = 90c (a valid tick) so leg1 is priceable.
+        let kbooks = empty_kbooks();
+        {
+            let mut kb = book::KalshiBook::new();
+            kb.apply_snapshot(&[(0.10, 500.0)], &[(0.90, 500.0)]);
+            kbooks.lock().unwrap().insert(kalshi_market.clone(), kb);
+        }
+        // pmus leg A FULLY filled 10; Kalshi leg B partial-filled 7 of 10 (filled:false) — pmus is whole-share
+        // here only for the test's clean integers (the partial path is venue-agnostic).
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 10.0, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, fill_qty: 7.0, simulated: false });
+        let rec = std::sync::Arc::new(RecordingBackend::default());
+        let backend: std::sync::Arc<dyn ExecutionBackend> = rec.clone();
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        let mut rx = run_apply(&backend, &positions, &kbooks, &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
+        // BOTH partials treated as naked -> recovery launched (not a both-full lock, not a halt, no hedge).
+        assert!(flat.contains_key(&slug), "the both-naked pair is recovered (flattening), not recorded as a lock");
+        assert!(!halt.load(Ordering::Relaxed), "both legs are priceable -> recovery flattens both, no halt");
+        assert!(!positions.lock().unwrap().contains_key(&slug), "a non-both-FULL pair is NOT a recorded hedge");
+        assert!(exp.total.abs() < 1e-9, "the entry reservation is released");
+        // drain BOTH Recovery outcomes so both spawned SELLs have fired.
+        for _ in 0..2 {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
+            assert_eq!(r.kind, SubmitKind::Recovery);
+        }
+        let fired = rec.submitted.lock().unwrap();
+        assert_eq!(fired.len(), 2, "EXACTLY two recovery SELLs fired — neither leg abandoned");
+        let pmus_sell = fired.iter().find(|s| s.venue == Venue::Pmus).expect("a pmus recovery SELL");
+        let kalshi_sell = fired.iter().find(|s| s.venue == Venue::Kalshi).expect("a Kalshi recovery SELL");
+        assert_eq!(pmus_sell.action, Action::Sell);
+        assert_eq!(kalshi_sell.action, Action::Sell);
+        assert_eq!(pmus_sell.frac_qty, Some(10.0), "the pmus leg unwinds its OWN fill 10");
+        assert_eq!(kalshi_sell.frac_qty, Some(7.0), "the Kalshi leg unwinds its OWN partial 7 — never the intent size, never the pmus 10");
+    }
+
+    /// (b3) BOTH-NAKED FAIL-CLOSE (atomic launch): pmus (leg0) fully fills 10, Kalshi (leg1) partial-fills 7,
+    /// but the Kalshi leg CANNOT be priced (no Kalshi book). Recovery must fire NEITHER SELL and HALT — a
+    /// half-recovery that flattens the pmus 10 while abandoning the Kalshi 7 is the exact bug we forbid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_legs_partial_one_unpriceable_fails_closed_fires_nothing() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // ONLY the pmus book is priceable; the Kalshi leg has NO book -> its flatten can't be priced.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 10.0, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, fill_qty: 7.0, simulated: false });
+        let rec = std::sync::Arc::new(RecordingBackend::default());
+        let backend: std::sync::Arc<dyn ExecutionBackend> = rec.clone();
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        run_apply(&backend, &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!(halt.load(Ordering::Relaxed), "an unpriceable naked leg -> fail-close halt (backstop)");
+        assert!(!flat.contains_key(&slug), "atomic launch: the slug is NOT marked flattening when launch fails");
+        assert_eq!(rec.submitted.lock().unwrap().len(), 0, "NO SELL fired — never half-recover (flatten pmus, abandon Kalshi)");
+        assert!(exp.total.abs() < 1e-9, "the reservation is still released");
     }
 
     /// FIX W2 end-to-end: a one-leg-filled entry whose FILLED leg is a coarse-tick pmus market still RECOVERS
@@ -1011,8 +1241,8 @@ mod tests {
             pm_min_tick: Some(0.05), pm_min_qty: None,
         };
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 10, qty: 2, client_order_id: "xarb-…-A".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 88, qty: 2, client_order_id: "xarb-…-B".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 10, qty: 2, frac_qty: None, client_order_id: "xarb-…-A".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 88, qty: 2, frac_qty: None, client_order_id: "xarb-…-B".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         // the tick is recorded ONLY on the pmus leg (W2); the Kalshi leg carries None.
@@ -1027,8 +1257,8 @@ mod tests {
         let mut pb = book::PmusBook::new();
         pb.apply_snapshot(&[(0.93, 500.0)], &[(0.95, 500.0)]);
         pmus_books.insert(slug.clone(), pb);
-        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, simulated: false });
-        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b = Ok(exec::Ack { client_order_id: "B".into(), venue_order_id: "K-2".into(), filled: false, fill_qty: 0.0, simulated: false });
         let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: 0.97, entry_net: 0.03, entry_dir: Dir::PK };
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // RECOVERY launched (not the halt backstop): the coarse-tick SELL was priceable.
@@ -1060,7 +1290,7 @@ mod tests {
         let halt2 = AtomicBool::new(false);
         let mut flat2: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         flat2.insert("s".to_string(), FlatKind::Recovery);
-        let ok = exec::PairAck { a: Ok(exec::Ack { client_order_id: "r".into(), venue_order_id: "v".into(), filled: true, simulated: false }), b: Err(exec::ExecError::Rejected("recovery has no second leg".into())) };
+        let ok = exec::PairAck { a: Ok(exec::Ack { client_order_id: "r".into(), venue_order_id: "v".into(), filled: true, fill_qty: 3.0, simulated: false }), b: Err(exec::ExecError::Rejected("recovery has no second leg".into())) };
         let out2 = SubmitOutcome { slug: "s".into(), kind: SubmitKind::Recovery, ack: ok, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat2, &halt2, out2);
         assert!(!halt2.load(Ordering::Relaxed), "a filled recovery SELL clears without halting");
@@ -1073,7 +1303,7 @@ mod tests {
         assert_eq!(naked_filled_idx(&exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::RateLimited) }), Some(0));
         assert_eq!(naked_filled_idx(&exec::PairAck { a: Err(exec::ExecError::RateLimited), b: live_ack("b") }), Some(1));
         // a resting (Ok, filled:false) other leg still leaves the filled leg naked.
-        let resting = Ok(exec::Ack { client_order_id: "r".into(), venue_order_id: "v".into(), filled: false, simulated: false });
+        let resting = Ok(exec::Ack { client_order_id: "r".into(), venue_order_id: "v".into(), filled: false, fill_qty: 0.0, simulated: false });
         assert_eq!(naked_filled_idx(&exec::PairAck { a: live_ack("a"), b: resting }), Some(0));
         // both filled -> no naked leg; both errored -> none; a simulated fill is not a LIVE naked leg.
         assert_eq!(naked_filled_idx(&exec::PairAck { a: live_ack("a"), b: live_ack("b") }), None);
@@ -1092,8 +1322,8 @@ mod tests {
         let mut slug = String::new();
         for (i, &(cost_per, entry_net)) in costs_nets.iter().enumerate() {
             let legs = [
-                OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: format!("a{i}") },
-                OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: format!("b{i}") },
+                OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: format!("a{i}") },
+                OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, frac_qty: None, client_order_id: format!("b{i}") },
             ];
             let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
             reserve_exposure(exp, &pos, cost_per);
@@ -1185,7 +1415,7 @@ mod tests {
         c
     }
     fn held_leg(entry_net: f64, dir: Dir) -> postpone::HeldLeg {
-        let leg = OrderIntent { venue: Venue::Pmus, market: "s".into(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "x".into() };
+        let leg = OrderIntent { venue: Venue::Pmus, market: "s".into(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "x".into() };
         let pos = position_from_intents("s", Cat::Weather, "c", None, &[leg.clone(), OrderIntent { venue: Venue::Kalshi, market: "K".into(), side: Side::No, ..leg }]);
         postpone::HeldLeg { pos, cost_per: 0.9, entry_net, entry_dir: dir }
     }
@@ -1286,8 +1516,8 @@ mod tests {
         // -> NOT both_filled -> release the ADD's exact reservation; the add's naked leg can't be priced (no
         // book) -> halt backstop. Crucially this touches ONLY the add's reservation, not the base's.
         let add_legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "a2".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "b2".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "a2".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, frac_qty: None, client_order_id: "b2".into() },
         ];
         let add_pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs);
         reserve_exposure(&mut exp, &add_pos, 0.95);
@@ -1354,8 +1584,8 @@ mod tests {
         let reserved_after_one = exp.total;
         // the ADD's both-filled entry outcome (dry-run simulated fills) -> APPEND, keep the reservation.
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "a2".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "b2".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "a2".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, frac_qty: None, client_order_id: "b2".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         reserve_exposure(&mut exp, &pos, 0.95); // spawn-reserve the add
@@ -1410,8 +1640,8 @@ mod tests {
         flat.insert(slug.clone(), FlatKind::Unwind);
         // the in-flight ADD is spawn-reserved on top, then lands HALF-FILLED (leg A live, leg B errored).
         let add_legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "add-a".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "add-b".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "add-a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, frac_qty: None, client_order_id: "add-b".into() },
         ];
         let add_pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs);
         reserve_exposure(&mut exp, &add_pos, 0.95);
@@ -1425,7 +1655,7 @@ mod tests {
         pmus_books.insert(slug.clone(), pb);
         // the unfilled leg is a CLEAN FOK-miss (Ok, not filled) — so it reaches the W-1 unwind-slot check
         // rather than the 2026-06-15 ambiguous-Err early fail-close (which is exercised separately below).
-        let resting = || Ok(exec::Ack { client_order_id: "add-b".into(), venue_order_id: "PM-2".into(), filled: false, simulated: false });
+        let resting = || Ok(exec::Ack { client_order_id: "add-b".into(), venue_order_id: "PM-2".into(), filled: false, fill_qty: 0.0, simulated: false });
         let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("add-a"), b: resting() }, position: Some(add_pos), pair: Some(pair.clone()), cost_per: 0.95, entry_net: 0.06, entry_dir: Dir::PK };
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // THE FIX: the add's naked leg is NOT silently abandoned — the bot FAIL-CLOSES (halt). (Pre-fix this
@@ -1465,8 +1695,8 @@ mod tests {
     async fn errd_unfilled_leg_fails_closed_even_with_priceable_book() {
         let pair = wx_pair();
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "a".into() },
-            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "b".into() },
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, frac_qty: None, client_order_id: "b".into() },
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         let slug = pos.market.clone();
@@ -1488,7 +1718,7 @@ mod tests {
         // CONTRAST: the same priceable book + an Ok-but-resting (clean FOK miss) DOES recover -> true.
         let mut flat2: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
-        let resting = Ok(exec::Ack { client_order_id: "b".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
+        let resting = Ok(exec::Ack { client_order_id: "b".into(), venue_order_id: "K-2".into(), filled: false, fill_qty: 0.0, simulated: false });
         let ok_miss = exec::PairAck { a: live_ack("a"), b: resting };
         let launched2 = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat2, &tx2, &slug, &ok_miss, Some(&pos));
         assert!(launched2, "a clean Ok-but-resting miss (not an Err) still recovers when the book is priceable");

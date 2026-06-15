@@ -104,6 +104,7 @@ pub(crate) fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32) -> Opt
             side: leg.side,
             price_cents: pc,
             qty: size,
+            frac_qty: None, // entries are whole-share; only a partial-fill recovery SELL sets a fractional qty
             client_order_id: format!("xarb-{}-{}", pair.slug, leg.tag),
         });
     }
@@ -503,8 +504,8 @@ mod tests {
     #[test]
     fn position_from_intents_records_exact_legs() {
         let legs = [
-            OrderIntent { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 7, client_order_id: "xarb-…-A".into() },
-            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 7, client_order_id: "xarb-…-B".into() },
+            OrderIntent { venue: Venue::Pmus, market: "aec-mlb-lad-pit-2026-06-16".into(), action: Action::Buy, side: Side::Yes, price_cents: 55, qty: 7, frac_qty: None, client_order_id: "xarb-…-A".into() },
+            OrderIntent { venue: Venue::Kalshi, market: "KXMLBGAME-26JUN16-PIT".into(), action: Action::Buy, side: Side::Yes, price_cents: 42, qty: 7, frac_qty: None, client_order_id: "xarb-…-B".into() },
         ];
         let pos = position_from_intents("aec-mlb-lad-pit-2026-06-16", Cat::Sports, "mlb-2026-06-16", None, &legs);
         assert_eq!(pos.market, "aec-mlb-lad-pit-2026-06-16"); // pair identity = the pmus slug
@@ -552,7 +553,7 @@ mod tests {
     #[test]
     fn realized_edge_recheck_skips_a_rounded_under_floor_pair() {
         let cfg = crate::config::Config::test_default(); // edge_floor_cents = 2.0
-        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, client_order_id: "x".into() };
+        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, frac_qty: None, client_order_id: "x".into() };
         // 49 + 49 = 98c -> gross 2c, but marginal taker fees on both legs eat it below the 2c floor -> SKIP.
         assert!(!realized_edge_clears_floor(&cfg, &[leg(Venue::Pmus, 49), leg(Venue::Kalshi, 49)]));
         // 5 + 90 = 95c -> gross 5c, fees on the cheap+dear legs leave well over 2c -> FIRE.
@@ -566,7 +567,7 @@ mod tests {
     /// surplus above the floor there is NO pay-up (the arb falls back to the cheap recovery).
     #[test]
     fn second_leg_markup_pays_up_on_kalshi_capped_and_floor_safe() {
-        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, client_order_id: "x".into() };
+        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, frac_qty: None, client_order_id: "x".into() };
         let mut cfg = crate::config::Config::test_default(); // edge_floor_cents = 2.0
 
         // FAT arb (30 + 30 = 60c, ~40c gross) -> surplus far exceeds the 5c cap -> Kalshi pays up by 5c.

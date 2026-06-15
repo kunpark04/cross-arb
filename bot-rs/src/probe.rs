@@ -58,6 +58,7 @@ fn place_cancel(backend: &Arc<dyn ExecutionBackend>, venue: Venue, market: &str,
         side,
         price_cents: 1, // lowest tick
         qty: 1,
+        frac_qty: None, // a whole-share 1-contract probe
         // `nonce` (a per-run timestamp) + `side` make the Kalshi client_order_id UNIQUE — Kalshi dedups on it,
         // so a reused id 409s ("order already exists"). Fresh nonce -> fresh, placeable id.
         client_order_id: format!("probe-{venue:?}-{side:?}-{nonce}-{i}"),

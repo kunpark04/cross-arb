@@ -134,6 +134,11 @@ pub struct OrderIntent {
     pub side: Side,
     pub price_cents: u8, // 1..=99
     pub qty: u32,
+    /// FRACTIONAL override for the venue payload (default `None`). When `Some(q)` the payload builder sends
+    /// EXACTLY `q` (not the integer `qty`) — for a partial-fill RECOVERY SELL that must unwind a sub-1 pmus
+    /// fill (`cumQuantity` can be `0.01`); rounding it to the `u32` `qty` would drop the position. `None` on
+    /// every entry/unwind leg (whole-share); only the naked-leg recovery of a PARTIAL pmus fill sets it.
+    pub frac_qty: Option<f64>,
     /// Idempotency key. **Kalshi ONLY** dedupes on this (`client_order_id` is a real idempotency token).
     /// **pmus does NOT** — its CreateOrder has no `clientOrderId` field (silently dropped) and order
     /// creation is NOT idempotent, so a pmus timeout/RateLimited is "unknown" and must be reconciled via
