@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::exec::ExecutionBackend;
 use crate::pair::LivePair;
-use crate::pricing::build_legs;
+use crate::pricing::{apply_second_leg_markup, build_legs};
 use crate::risk::{evaluate, Exposure};
 use crate::types::*;
 use crate::{postpone, unwind};
@@ -175,7 +175,13 @@ fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &dyn Ex
             println!("  APPROVED size={}  (edge {:.1}c @ {:.2}c/$-day, dir {:?})", a.size, edge.net * 100.0, a.edge_rate, edge.dir);
             // build both legs from the BOOKS (same unified path the live loop uses) and fire.
             match build_legs(pair, q, edge.dir, a.size) {
-                Some(legs) => fire_legs(backend, &legs),
+                Some(mut legs) => {
+                    // mirror the live loop: pay up the SECOND (Kalshi) leg by the capped edge surplus (0020).
+                    if cfg.aggressive_second_leg {
+                        apply_second_leg_markup(cfg, &mut legs);
+                    }
+                    fire_legs(backend, &legs);
+                }
                 None => println!("  (no two-sided book to price both legs)"),
             }
         }
