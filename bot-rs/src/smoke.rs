@@ -173,8 +173,9 @@ fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &dyn Ex
     match evaluate(cfg, q, &edge, &Exposure::new(), 1000) {
         Ok(a) => {
             println!("  APPROVED size={}  (edge {:.1}c @ {:.2}c/$-day, dir {:?})", a.size, edge.net * 100.0, a.edge_rate, edge.dir);
-            // build both legs from the BOOKS (same unified path the live loop uses) and fire.
-            match build_legs(pair, q, edge.dir, a.size) {
+            // build both legs from the BOOKS (same unified path the live loop uses) and fire. The offline
+            // smoke is always a fresh single position -> pos_index 0 (`xarb-{slug}-0-{tag}`).
+            match build_legs(pair, q, edge.dir, a.size, 0) {
                 Some(mut legs) => {
                     // mirror the live loop: pay up the SECOND (Kalshi) leg by the capped edge surplus (0020).
                     if cfg.aggressive_second_leg {

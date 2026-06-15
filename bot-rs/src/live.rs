@@ -86,6 +86,11 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
     // slot (which doesn't cover a freshly-naked add leg) apart from a recovery-held one.
     let mut pending_entries: HashSet<String> = HashSet::new();
     let mut flattening: HashMap<String, FlatKind> = HashMap::new();
+    // MONOTONIC per-slug entry-coid index (scale-in dedup fix): PEEKED at fire to build `xarb-{slug}-{idx}-{tag}`,
+    // ADVANCED only on a both-filled commit (in apply_outcome), and NEVER reset — so an unwound-then-re-added slug
+    // never reuses an index whose Kalshi coid could still be live (which would `409 already exists`). See the
+    // advance site + the never-reset rationale in apply_outcome.
+    let mut next_pos_index: HashMap<String, u32> = HashMap::new();
 
     // PER-SLUG ENTRY COOLDOWN (2026-06-15 incident): a slug stamps `Instant::now()` the moment an entry FIRES
     // and again on EVERY entry OUTCOME; a fresh entry on a slug is refused while `elapsed < entry_cooldown_s`.
@@ -221,7 +226,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 if let Some(out) = o {
                     // re-stamp the per-slug cooldown on EVERY entry resolution (Some(slug) iff Entry) so a
                     // settled/aborted/recovered entry extends the window past a churn burst (2026-06-15).
-                    if let Some(s) = apply_outcome(&backend, &positions, &kalshi_books, &pmus_books, &mut exposure, &mut pending_entries, &mut flattening, &outcome_tx, &halt, out) {
+                    if let Some(s) = apply_outcome(&backend, &positions, &kalshi_books, &pmus_books, &mut exposure, &mut pending_entries, &mut flattening, &mut next_pos_index, &outcome_tx, &halt, out) {
                         cooldown.insert(s, std::time::Instant::now());
                     }
                 }
@@ -422,8 +427,13 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 }
                 // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
                 // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
-                // one-sided book) yields no legs -> skip rather than fire a naked leg.
-                let Some(mut legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
+                // one-sided book) yields no legs -> skip rather than fire a naked leg. PEEK the MONOTONIC per-slug
+                // index (NOT `held_legs.len()`, which reuses an index after an unwind's front-removal -> dedup-409
+                // -> a fresh naked pmus leg + halt). It makes the entry coid unique per position so a
+                // scale-in/re-entry add does NOT dedup-collide with a held coid, stays stable across a within-fire
+                // retry (it advances only on a both-filled lock, in apply_outcome), and NEVER reuses a removed index.
+                let pos_index = *next_pos_index.get(&pair.slug).unwrap_or(&0);
+                let Some(mut legs) = build_legs(&pair, &quote, edge.dir, a.size, pos_index) else { continue };
                 // W6: re-validate the edge from the ROUNDED leg prices (each leg rounds to a whole cent
                 // independently, eroding up to +1c of cost). Skip the fire if the realized net fell under the
                 // floor or the pair would cost >= 100c — the gated edge and the booked edge must agree.

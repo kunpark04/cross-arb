@@ -125,6 +125,13 @@ pub(crate) fn qualifying_add(cfg: &Config, held: &[postpone::HeldLeg], edge: &Ed
 /// RETURNS `Some(slug)` for ANY `SubmitKind::Entry` outcome (lock / abort_clean / abort_ambiguous / recover /
 /// naked_halt) so the caller can STAMP a per-slug entry cooldown on EVERY entry resolution — not just the
 /// fire site (2026-06-15 churn fix). `None` for Unwind/Recovery (those don't gate a fresh entry).
+///
+/// `next_pos_index` is the MONOTONIC per-slug entry-coid counter (Change 1, 2026-06-15): the fire site PEEKS
+/// it to build the entry coid (`xarb-{slug}-{idx}-{tag}`), and it ADVANCES here — and ONLY here — when a NEW
+/// position actually COMMITS (a both-filled lock -> `track_position`). Advancing at COMMIT (not at fire) is
+/// what preserves within-fire idempotency: a non-filling retry never reaches this branch, so the peeked index
+/// is unchanged and the retry reuses the SAME coid (the venue dedup then prevents a double-fill). The counter
+/// is NEVER reset — see the advance site below for why a `drop_slug` must NOT restart it at 0.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_outcome(
     backend: &std::sync::Arc<dyn ExecutionBackend>,
@@ -134,6 +141,7 @@ pub(crate) fn apply_outcome(
     exposure: &mut Exposure,
     pending_entries: &mut std::collections::HashSet<String>,
     flattening: &mut std::collections::HashMap<String, FlatKind>,
+    next_pos_index: &mut std::collections::HashMap<String, u32>,
     outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
     halt: &std::sync::atomic::AtomicBool,
     out: SubmitOutcome,
@@ -157,6 +165,14 @@ pub(crate) fn apply_outcome(
                     // STORED on the HeldLeg so a later per-leg unwind subtracts EXACTLY this leg (R1) and a
                     // later add gates on max(entry_net)+tau / same-direction.
                     track_position(positions, &pair, pos, out.cost_per, out.entry_net, out.entry_dir);
+                    // ADVANCE the monotonic per-slug coid index — ONLY here (a NEW position actually committed).
+                    // The fire site peeked this value as the position's index; the next position must get a
+                    // STRICTLY HIGHER one, so step it past the index just consumed. NEVER reset: even after a
+                    // `drop_slug` empties this slug's legs (Unwind branch), the counter PERSISTS for the run, so a
+                    // dropped-then-re-appearing slug continues (2, 3, …) and can NEVER reuse `xarb-{slug}-{idx}`
+                    // for an index whose Kalshi order might still be live (Kalshi dedups on client_order_id —
+                    // reuse would `409 order already exists`, the collision this whole change closes).
+                    *next_pos_index.entry(out.slug.clone()).or_insert(0) += 1;
                     crate::exec_log::fire_outcome(&out.slug, "lock", "both legs filled", live);
                 }
             } else {
@@ -178,16 +194,38 @@ pub(crate) fn apply_outcome(
                         cancel_resting_hedge(backend, &out.slug, &out.ack, out.position.as_ref(), rest_idx);
                         crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge did not fill; cancelled, no position", live);
                     }
-                    // hedge ERR'd: its order's fate is UNKNOWN (a transport error may have landed it). Fail
-                    // CLOSED — HALT so the owner reconciles before any unhedged pmus order can fill silently.
+                    // hedge ERR'd. TWO sub-cases (2026-06-15 refinement, NARROWED for scale-in):
+                    //   * DEFINITE not-filled venue REJECTION (`is_definite_not_filled`: a 4xx that NAMES a
+                    //     no-fill condition and is NOT a dedup/conflict): the pmus hedge was unambiguously
+                    //     killed, the Kalshi leg was never opened -> NOTHING filled on EITHER leg. A CLEAN
+                    //     abort: no position, no halt, and a rejected order never rested (nothing to cancel).
+                    //   * GENUINELY AMBIGUOUS (transport / 5xx / timeout / a dedup-409 whose existing order may
+                    //     have filled / 408 / 425): the pmus order MAY have landed + filled silently -> FAIL
+                    //     CLOSED, HALT so the owner reconciles before an unhedged pmus fill goes untracked.
                     EntryMiss::AmbiguousAbort => {
-                        halt.store(true, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!(
-                            "[live] CRITICAL pmus-first abort on {}: the pmus hedge leg ERR'd (a={:?} b={:?}) — \
-                             order fate UNKNOWN (may have landed) -> KILL-SWITCH engaged; reconcile positions before resuming.",
-                            out.slug, out.ack.a, out.ack.b
-                        );
-                        crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", "pmus hedge err -> halt", live);
+                        // the HEDGE leg's error — NOT the `HedgeNotFilled` sentinel (the fast leg we never
+                        // opened). Both legs are `Err` here; skip the sentinel so we classify the REAL hedge
+                        // fate, independent of which slot (a/b) the pmus hedge occupied.
+                        let hedge_err = [&out.ack.a, &out.ack.b]
+                            .into_iter()
+                            .filter_map(|r| r.as_ref().err())
+                            .find(|e| !matches!(e, exec::ExecError::HedgeNotFilled));
+                        if hedge_err.is_some_and(is_definite_not_filled) {
+                            eprintln!(
+                                "[live] pmus-first abort on {}: the pmus hedge leg was DEFINITELY rejected ({hedge_err:?}) — \
+                                 nothing filled, Kalshi leg never opened (NO position) -> CLEAN abort, no halt.",
+                                out.slug
+                            );
+                            crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge definitively rejected; no position", live);
+                        } else {
+                            halt.store(true, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "[live] CRITICAL pmus-first abort on {}: the pmus hedge leg ERR'd (a={:?} b={:?}) — \
+                                 order fate UNKNOWN (may have landed) -> KILL-SWITCH engaged; reconcile positions before resuming.",
+                                out.slug, out.ack.a, out.ack.b
+                            );
+                            crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", "pmus hedge err -> halt", live);
+                        }
                     }
                     // FIX A: a real one-leg-filled outcome is a NAKED directional leg. AUTO-RECOVER (cancel the
                     // resting leg + flatten the filled leg at a marketable book price); the fail-close halt is
@@ -279,6 +317,78 @@ pub(crate) fn naked_filled_idx(ack: &exec::PairAck) -> Option<usize> {
         Some(1)
     } else {
         None
+    }
+}
+
+/// Is this `Err` a DEFINITE not-filled venue REJECTION — the order was unambiguously rejected/killed and
+/// did NOT fill — vs a GENUINELY AMBIGUOUS error whose order fate is UNKNOWN (it may have landed + filled)?
+///
+/// This is the cardinal Err-classification (2026-06-15): a DEFINITE rejection means the OTHER (filled) leg is
+/// safely naked and can be AUTO-FLATTENED; an AMBIGUOUS error must FAIL-CLOSE (halt) because flattening could
+/// un-hedge a real lock. The boundary is deliberately CONSERVATIVE — only an unmistakable rejection returns
+/// `true`; anything whose fate we can't prove returns `false` (halt). Widening this wrongly is the cardinal
+/// sin (un-hedging a real lock), so when in doubt we HALT.
+///
+/// DEFINITE (true): a `Rejected` whose body NAMES a clear no-fill condition (`fill_or_kill` /
+/// `insufficient` / `rejected` — the captured live case is `409 fill_or_kill_insufficient_resting_volume`)
+/// AND does NOT name a dedup/conflict (`already exists` / `duplicate` / a bare `conflict`). A 4xx status is
+/// NECESSARY but NOT sufficient: a 4xx that doesn't name a no-fill condition, or that names a dedup/conflict,
+/// is AMBIGUOUS (the order MAY have landed — see below). This is NARROWER than "any 4xx -> definite" (2026-06-15
+/// scale-in refinement): the deterministic entry coid (`xarb-{slug}-{idx}-{tag}`) means a scale-in/re-entry
+/// retry can collide on the coid and the venue answers `409 order already exists` — that 409 does NOT mean
+/// "no fill", it means "I already have this order" (which may itself have FILLED) -> must HALT, not flatten.
+///
+/// AMBIGUOUS (false): a `Rejected` with a **5xx** status (the server may have processed it); a transport/
+/// connection error (`transport:` / panicked — the request may have reached the venue); a **dedup/conflict**
+/// 4xx (`already exists` / `duplicate` / `conflict` — the order may already be live + filled); a received-
+/// but-uncertain **408** request-timeout or **425** too-early (the venue got it, fate unknown); `RateLimited`
+/// (a timeout maps here — fate unknown); and `HedgeNotFilled`/`KeysUnavailable`/`LiveDisabled`/
+/// `TransportNotWired` (handled elsewhere or impossible on the live naked path) — all HALT. NB: `HedgeNotFilled`
+/// (a leg we DELIBERATELY never sent) is treated separately by the callers as a KNOWN no-order, never via this fn.
+pub(crate) fn is_definite_not_filled(e: &exec::ExecError) -> bool {
+    match e {
+        // a rejected order: parse the leading HTTP status from the body head (`post_leg` formats it as
+        // "{status} {body}"). The status narrows the window; the BODY decides — a 4xx is necessary but the
+        // body must name a no-fill condition AND must NOT name a dedup/conflict.
+        exec::ExecError::Rejected(body) => {
+            let lower = body.to_ascii_lowercase();
+            // a transport/panic `Rejected` has NO leading status and MAY have landed -> ambiguous.
+            if lower.starts_with("transport:") || lower.contains("panicked") {
+                return false;
+            }
+            // a dedup/conflict (the deterministic-coid collision a scale-in/re-entry add provokes) is NOT a
+            // no-fill — the existing order it conflicts with may have FILLED. Ambiguous regardless of status.
+            if lower.contains("already exists") || lower.contains("duplicate") || lower.contains("conflict") {
+                return false;
+            }
+            if let Some(code) = body.split_whitespace().next().and_then(|t| t.parse::<u16>().ok()) {
+                // 408 request-timeout / 425 too-early: the venue RECEIVED the request but its fate is uncertain
+                // (it may have processed + filled) -> ambiguous, even though both are 4xx.
+                if code == 408 || code == 425 {
+                    return false;
+                }
+                // 5xx: the server may have processed the order -> ambiguous.
+                if (500..600).contains(&code) {
+                    return false;
+                }
+                // a non-4xx (1xx/2xx/3xx) status in an Err shouldn't occur; it names no no-fill condition below
+                // and so falls through to `false` — defensive, never auto-flatten on an unexpected status.
+            }
+            // a 4xx that NAMES a clear no-fill condition (FOK kill / insufficient resting volume / explicit
+            // reject) and survived the dedup/conflict + 408/425 + 5xx exclusions above -> a terminal venue "no".
+            lower.contains("fill_or_kill")
+                || lower.contains("insufficient")
+                || lower.contains("rejected")
+        }
+        // a timeout maps to RateLimited (post_leg) — the order's fate is UNKNOWN -> ambiguous (halt).
+        exec::ExecError::RateLimited => false,
+        // these mean NO order was sent, but they never co-occur with the OTHER leg filling LIVE (a no-creds
+        // build errors BOTH legs), so they can't reach the live naked path. Treat as ambiguous (halt) — never
+        // widen auto-flatten to a state we can't prove is a clean miss.
+        exec::ExecError::HedgeNotFilled
+        | exec::ExecError::KeysUnavailable
+        | exec::ExecError::LiveDisabled
+        | exec::ExecError::TransportNotWired => false,
     }
 }
 
@@ -391,23 +501,36 @@ pub(crate) fn recover_naked_leg(
     let Some(pos) = position else { return false }; // no leg metadata -> can't price/route -> halt backstop
     let leg_ack = |i: usize| if i == 0 { &ack.a } else { &ack.b };
 
-    // AMBIGUOUS UNFILLED LEG (2026-06-15): for each leg NOT in the naked set (it did not fill any size), an
-    // `Err` whose fate is UNKNOWN may secretly have LANDED + FILLED — flattening the naked leg(s) now could
-    // UN-HEDGE a real LOCK. FAIL CLOSED: halt for a manual reconcile rather than guess. `HedgeNotFilled` is
-    // the one exception (the pmus-first sentinel for a leg we DELIBERATELY never sent — no order exists, so it
-    // can't be a hidden lock); a clean `Ok`-but-resting leg is also fine (a known no-fill). With BOTH legs
-    // naked there is no such "other" leg, so this never fires for the both-partial case.
+    // AMBIGUOUS vs DEFINITE-REJECTED UNFILLED LEG (2026-06-15 refinement): for each leg NOT in the naked set
+    // (it did not fill any size), an `Err` is one of two kinds:
+    //   * DEFINITE not-filled venue REJECTION (`is_definite_not_filled`: a 4xx that NAMES a FOK/insufficient/
+    //     reject condition and is NOT a dedup/conflict — the captured live case is `409
+    //     fill_or_kill_insufficient_resting_volume`): the order was unambiguously KILLED and did NOT fill, so
+    //     the naked (filled) leg is safely flattenable — CONTINUE to the recovery below (no halt). This is the
+    //     self-heal: a clean venue "no" is equivalent to an `Ok`-but-resting miss, not a hidden lock.
+    //   * GENUINELY AMBIGUOUS (transport / 5xx / timeout / a dedup-409 `order already exists` whose existing
+    //     order may have FILLED / 408 / 425 / unknown): the order MAY have landed + FILLED, so flattening the
+    //     naked leg could UN-HEDGE a real LOCK. FAIL CLOSED: halt for a manual reconcile.
+    // `HedgeNotFilled` (the pmus-first sentinel for a leg we DELIBERATELY never sent — no order exists, so it
+    // can't be a hidden lock) is the one exception that ALSO continues; a clean `Ok`-but-resting leg is fine
+    // too. With BOTH legs naked there is no such "other" leg, so this never fires for the both-partial case.
     for &i in &[0usize, 1] {
         if naked.contains(&i) {
             continue;
         }
-        let other = leg_ack(i);
-        if other.is_err() && !matches!(other, Err(exec::ExecError::HedgeNotFilled)) {
+        if let Err(e) = leg_ack(i) {
+            let known_no_fill = matches!(e, exec::ExecError::HedgeNotFilled) || is_definite_not_filled(e);
+            if !known_no_fill {
+                eprintln!(
+                    "[live] CRITICAL NAKED LEG on {slug}: the unfilled leg ERR'd ({e:?}) — its order fate is \
+                     UNKNOWN (may have FILLED) -> NOT flattening (could be a real LOCK); HALTING for manual reconcile."
+                );
+                return false;
+            }
             eprintln!(
-                "[live] CRITICAL NAKED LEG on {slug}: the unfilled leg ERR'd ({other:?}) — its order fate is \
-                 UNKNOWN (may have FILLED) -> NOT flattening (could be a real LOCK); HALTING for manual reconcile."
+                "[live] NAKED LEG on {slug}: the unfilled leg was DEFINITELY rejected ({e:?}) — order did NOT \
+                 fill, so the filled leg is safely naked -> AUTO-FLATTENING (no halt)."
             );
-            return false;
         }
     }
 
@@ -806,7 +929,8 @@ mod tests {
         out: SubmitOutcome,
     ) -> tokio::sync::mpsc::UnboundedReceiver<SubmitOutcome> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
-        apply_outcome(backend, positions, kalshi_books, pmus_books, exp, pending, flat, &tx, halt, out);
+        let mut next_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        apply_outcome(backend, positions, kalshi_books, pmus_books, exp, pending, flat, &mut next_idx, &tx, halt, out);
         rx
     }
 
@@ -825,7 +949,8 @@ mod tests {
         out: SubmitOutcome,
     ) -> Option<String> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
-        apply_outcome(backend, positions, kalshi_books, pmus_books, exp, pending, flat, &tx, halt, out)
+        let mut next_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        apply_outcome(backend, positions, kalshi_books, pmus_books, exp, pending, flat, &mut next_idx, &tx, halt, out)
     }
 
     /// COOLDOWN CONTRACT (2026-06-15): `apply_outcome` returns `Some(slug)` for EVERY Entry outcome (so the
@@ -852,6 +977,49 @@ mod tests {
         // RECOVERY (its SELL filled) -> None
         let recovery = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Recovery, ack: exec::PairAck { a: sim_ack("a"), b: Err(exec::ExecError::Rejected("unused".into())) }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
         assert_eq!(run_apply_ret(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, recovery), None, "Recovery does not cool the entry slug");
+    }
+
+    /// MONOTONIC COID INDEX (the scale-in dedup fix): the per-slug entry-coid index advances on EVERY both-filled
+    /// lock and is NEVER decremented by an unwind — so a position opened AFTER a front-removal unwind gets a
+    /// STRICTLY HIGHER index and can never reuse a coid (`xarb-{slug}-{idx}`) whose Kalshi order could still be
+    /// live (which would `409 order already exists`). This is the core property the fix exists to guarantee.
+    #[test]
+    fn next_pos_index_is_monotonic_never_reused_after_unwind() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let mut next_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let kb = empty_kbooks();
+        let pmb = std::collections::HashMap::new();
+
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+
+        // LOCK #1 (the fire peeked idx 0) -> the per-slug counter advances to 1.
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        let lock1 = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        apply_outcome(&dry_backend(), &positions, &kb, &pmb, &mut exp, &mut pending, &mut flat, &mut next_idx, &tx, &halt, lock1);
+        assert_eq!(next_idx.get(&slug).copied(), Some(1), "a both-filled lock advances the per-slug coid index (0 -> 1)");
+
+        // LOCK #2 on the SAME slug (a scale-in add, fire peeked idx 1) -> advances to 2 (unique per position).
+        let (pair2, pos2, cp2) = wx_entry_pair();
+        reserve_exposure(&mut exp, &pos2, cp2);
+        pending.insert(slug.clone());
+        let lock2 = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: Some(pos2), pair: Some(pair2), cost_per: cp2, entry_net: 0.03, entry_dir: Dir::PK };
+        apply_outcome(&dry_backend(), &positions, &kb, &pmb, &mut exp, &mut pending, &mut flat, &mut next_idx, &tx, &halt, lock2);
+        assert_eq!(next_idx.get(&slug).copied(), Some(2), "a second lock advances the index again (1 -> 2)");
+
+        // UNWIND the slug -> the index must NOT be decremented: a later add then gets idx 2, NEVER reusing idx
+        // 0/1 whose Kalshi coid could still be live. This is the regression the front-removal `held_legs.len()`
+        // bug would have caused (re-add -> idx 1 -> dedup-409 -> a fresh naked pmus leg + halt).
+        let unwind = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
+        apply_outcome(&dry_backend(), &positions, &kb, &pmb, &mut exp, &mut pending, &mut flat, &mut next_idx, &tx, &halt, unwind);
+        assert_eq!(next_idx.get(&slug).copied(), Some(2), "an unwind NEVER decrements the index — no coid reuse after a front-removal");
     }
 
     fn dry_backend() -> std::sync::Arc<dyn ExecutionBackend> {
@@ -1078,6 +1246,98 @@ mod tests {
         let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
         assert_eq!(recovered.kind, SubmitKind::Recovery, "the flatten routes back as a Recovery outcome");
         assert!(matches!(&recovered.ack.a, Ok(a) if a.filled), "leg a is the SELL and the dry-run flatten fills");
+    }
+
+    /// THE 409-AUTO-FLATTEN REFINEMENT END-TO-END (2026-06-15): the captured LIVE incident — pmus leg FILLED
+    /// (1 contract), the Kalshi hedge was REJECTED `409 fill_or_kill_insufficient_resting_volume`. The OLD
+    /// fail-close treated ANY `Err` on the unfilled leg as ambiguous -> HALT (idle bot, naked pmus leg). The
+    /// refinement classifies the 409 as a DEFINITE no-fill -> `apply_outcome` routes to RECOVER (auto-flatten
+    /// the naked pmus leg), NO halt. The CONTRAST (a transport Err -> still HALTS) is asserted in the same test
+    /// so the boundary is pinned at the routing layer, not just the classifier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outcome_409_fok_reject_recovers_while_transport_err_still_halts() {
+        use std::sync::{Arc, Mutex};
+        // a priceable pmus book for the filled leg so the flatten can be priced in BOTH sub-cases.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        {
+            let (_p, pos0, _c) = wx_entry_pair();
+            let mut pb = book::PmusBook::new();
+            pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+            pmus_books.insert(pos0.market.clone(), pb);
+        }
+
+        // (1) the 409 case -> RECOVER. pmus leg A filled LIVE; Kalshi leg B = the captured 409 reject.
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        let a = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b = Err(exec::ExecError::Rejected(r#"409 {"error":{"code":"fill_or_kill_insufficient_resting_volume"}}"#.into()));
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a, b }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
+        assert!(!halt.load(Ordering::Relaxed), "a 409 FOK reject is a DEFINITE no-fill -> recover, NOT halt");
+        assert!(flat.contains_key(&slug), "the naked pmus leg is marked flattening (auto-recovery launched)");
+        assert!(!positions.lock().unwrap().contains_key(&slug), "no hedge recorded (the Kalshi leg was rejected)");
+        assert!(exp.total.abs() < 1e-9, "the entry reservation is released");
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("recovery outcome timed out").expect("an outcome was sent");
+        assert_eq!(recovered.kind, SubmitKind::Recovery, "the 409 case flattens -> a Recovery outcome");
+
+        // (2) the AMBIGUOUS transport case -> STILL HALTS (cardinal-sin guard intact: an unknown-fate Err never
+        //     auto-flattens, since the Kalshi order might secretly have landed + filled = a real lock).
+        let positions2 = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp2 = Exposure::new();
+        let mut pending2: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat2: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt2 = AtomicBool::new(false);
+        let (pair2, pos2, cp2) = wx_entry_pair();
+        let slug2 = pos2.market.clone();
+        reserve_exposure(&mut exp2, &pos2, cp2);
+        pending2.insert(slug2.clone());
+        let a2 = Ok(exec::Ack { client_order_id: "A".into(), venue_order_id: "PM-1".into(), filled: true, fill_qty: 3.0, simulated: false });
+        let b2 = Err(exec::ExecError::Rejected("transport: connection reset by peer".into()));
+        let out2 = SubmitOutcome { slug: slug2.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: a2, b: b2 }, position: Some(pos2), pair: Some(pair2), cost_per: cp2, entry_net: 0.03, entry_dir: Dir::PK };
+        run_apply(&dry_backend(), &positions2, &empty_kbooks(), &pmus_books, &mut exp2, &mut pending2, &mut flat2, &halt2, out2);
+        assert!(halt2.load(Ordering::Relaxed), "an ambiguous transport Err on the unfilled leg STILL fail-closes (halt)");
+        assert!(!flat2.contains_key(&slug2), "no auto-flatten for an unknown-fate Err (could un-hedge a real lock)");
+    }
+
+    /// pmus-first ABORT path, refined: when the pmus HEDGE leg ERR'd (the fast Kalshi leg was never opened),
+    /// a DEFINITE rejection (4xx/FOK) is a CLEAN abort (nothing filled, no halt — the bot self-heals), while a
+    /// genuinely AMBIGUOUS hedge Err (the pmus order may have landed) STILL HALTS. The sentinel can be on
+    /// EITHER leg slot; the classifier must read the REAL hedge error, not the sentinel.
+    #[test]
+    fn pmus_first_abort_clean_on_definite_reject_halts_on_ambiguous() {
+        use std::sync::{Arc, Mutex};
+        let run_abort = |hedge_err: exec::ExecError, hedge_on_a: bool| -> bool {
+            let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let mut exp = Exposure::new();
+            let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+            let halt = AtomicBool::new(false);
+            let (pair, pos, cp) = wx_entry_pair();
+            let slug = pos.market.clone();
+            reserve_exposure(&mut exp, &pos, cp);
+            pending.insert(slug.clone());
+            // one leg is the never-opened fast-leg sentinel; the OTHER is the pmus hedge's resolved Err.
+            let sentinel = Err(exec::ExecError::HedgeNotFilled);
+            let ack = if hedge_on_a { exec::PairAck { a: Err(hedge_err), b: sentinel } } else { exec::PairAck { a: sentinel, b: Err(hedge_err) } };
+            let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+            run_apply(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, out);
+            assert!(exp.total.abs() < 1e-9, "the reservation is released in every abort case");
+            assert!(!positions.lock().unwrap().contains_key(&slug), "no position on an abort");
+            halt.load(Ordering::Relaxed)
+        };
+        // DEFINITE 409 reject (the live shape) -> CLEAN abort, NO halt — sentinel on EITHER slot.
+        assert!(!run_abort(exec::ExecError::Rejected(r#"409 {"error":{"code":"fill_or_kill_insufficient_resting_volume"}}"#.into()), true), "409 hedge reject (hedge on a) -> clean abort, no halt");
+        assert!(!run_abort(exec::ExecError::Rejected("409 fok insufficient".into()), false), "409 hedge reject (hedge on b) -> clean abort, no halt");
+        // AMBIGUOUS hedge Err (transport / rate-limit) -> the pmus order MAY have landed -> STILL HALTS.
+        assert!(run_abort(exec::ExecError::Rejected("transport: reset".into()), true), "a transport hedge Err -> halt (fate unknown)");
+        assert!(run_abort(exec::ExecError::RateLimited, false), "a rate-limited (timeout) hedge -> halt (fate unknown)");
     }
 
     /// (b) PARTIAL-FILL RECOVERY (the 2026-06-15 M'Chich incident): a pmus-first entry where the pmus leg
@@ -1686,13 +1946,16 @@ mod tests {
         assert!(!covered_unw, "an unwind-held slot does NOT cover a fresh naked leg -> false -> caller fail-closes");
     }
 
-    /// AMBIGUOUS-LEG FAIL-CLOSE (2026-06-15): when the UNFILLED leg ERR'd (a 4xx/transport error, fate
-    /// UNKNOWN — it may have FILLED), `recover_naked_leg` must FAIL CLOSED (return false -> caller halts)
-    /// EVEN when the filled leg's book IS priceable. Flattening the known-filled leg while the "unfilled" one
-    /// might also have filled would un-hedge a real LOCK. A clean Ok-but-resting miss (FOK kill) still
-    /// recovers — contrast asserted here so the gate is by ERR, not by "not filled".
+    /// AMBIGUOUS-LEG FAIL-CLOSE vs DEFINITE-REJECTION AUTO-FLATTEN (2026-06-15 refinement). When the UNFILLED
+    /// leg ERR'd, `recover_naked_leg` splits on `is_definite_not_filled`:
+    ///   * a GENUINELY AMBIGUOUS err (transport / 5xx — fate UNKNOWN, may have FILLED) must FAIL CLOSED
+    ///     (return false -> caller halts) EVEN when the filled leg's book IS priceable — flattening could
+    ///     un-hedge a real LOCK.
+    ///   * a DEFINITE not-filled venue REJECTION (the live `409 fill_or_kill_insufficient_resting_volume`,
+    ///     a 4xx) is a CLEAN miss — the filled leg is safely naked -> AUTO-FLATTEN (return true, no halt).
+    ///   * a clean Ok-but-resting miss still recovers (the gate is by ERR KIND, not "not filled").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn errd_unfilled_leg_fails_closed_even_with_priceable_book() {
+    async fn errd_unfilled_leg_fails_closed_or_recovers_by_err_kind() {
         let pair = wx_pair();
         let legs = [
             OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, frac_qty: None, client_order_id: "a".into() },
@@ -1700,22 +1963,43 @@ mod tests {
         ];
         let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
         let slug = pos.market.clone();
-        // a PRICEABLE pmus book for the filled leg — so an Ok-resting miss WOULD recover; an Err must NOT.
+        // a PRICEABLE pmus book for the filled leg — so the OUTCOME is governed by the Err kind, not pricing.
         let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
         let mut pb = book::PmusBook::new();
         pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
         pmus_books.insert(slug.clone(), pb);
 
-        // leg A (pmus) filled LIVE; leg B (Kalshi) ERR'd -> fate unknown -> FAIL CLOSED (false), no flatten spawned.
+        // (1) AMBIGUOUS: leg A (pmus) filled LIVE; leg B (Kalshi) had a TRANSPORT error (fate unknown) -> FAIL
+        //     CLOSED (false), no flatten spawned, slot untouched.
         let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
-        let errd = exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::Rejected("400 bad".into())) };
-        let launched = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat, &tx, &slug, &errd, Some(&pos));
-        assert!(!launched, "an ERR'd unfilled leg (fate unknown) must fail closed -> false -> caller halts");
+        let ambiguous = exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::Rejected("transport: connection reset".into())) };
+        let launched = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat, &tx, &slug, &ambiguous, Some(&pos));
+        assert!(!launched, "a transport-error unfilled leg (fate unknown) must fail closed -> false -> caller halts");
         assert!(!flat.contains_key(&slug), "no recovery flatten was marked (could un-hedge a possible lock)");
         assert!(rx.try_recv().is_err(), "no recovery SELL was spawned for an ambiguous-Err naked outcome");
 
-        // CONTRAST: the same priceable book + an Ok-but-resting (clean FOK miss) DOES recover -> true.
+        // (1b) AMBIGUOUS: a 5xx server error is also fate-unknown -> still fail closed.
+        let mut flat5: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let (tx5, _rx5) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let server_err = exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::Rejected("503 service unavailable".into())) };
+        assert!(!recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat5, &tx5, &slug, &server_err, Some(&pos)),
+            "a 5xx (server may have processed it) is ambiguous -> fail closed");
+
+        // (2) DEFINITE REJECTION: the captured LIVE incident — leg B is a `409
+        //     fill_or_kill_insufficient_resting_volume`. The order was unambiguously killed (no fill), so the
+        //     naked pmus leg AUTO-FLATTENS -> true + the slug is marked for recovery (NOT a halt).
+        let mut flat409: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let (tx409, _rx409) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let rejected = exec::PairAck {
+            a: live_ack("a"),
+            b: Err(exec::ExecError::Rejected(r#"409 {"error":{"code":"fill_or_kill_insufficient_resting_volume","message":"..."}}"#.into())),
+        };
+        let launched409 = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat409, &tx409, &slug, &rejected, Some(&pos));
+        assert!(launched409, "a 409 fill_or_kill_insufficient_resting_volume is a DEFINITE no-fill -> auto-flatten (not halt)");
+        assert_eq!(flat409.get(&slug), Some(&FlatKind::Recovery), "the definite-rejection case marks the slug for recovery");
+
+        // (3) CONTRAST: a clean Ok-but-resting (FOK miss, not an Err) still recovers -> true.
         let mut flat2: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
         let resting = Ok(exec::Ack { client_order_id: "b".into(), venue_order_id: "K-2".into(), filled: false, fill_qty: 0.0, simulated: false });
@@ -1723,5 +2007,51 @@ mod tests {
         let launched2 = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat2, &tx2, &slug, &ok_miss, Some(&pos));
         assert!(launched2, "a clean Ok-but-resting miss (not an Err) still recovers when the book is priceable");
         assert_eq!(flat2.get(&slug), Some(&FlatKind::Recovery), "the clean-miss case marks the slug for recovery");
+    }
+
+    /// The Err-classification boundary (`is_definite_not_filled`) — the cardinal money-path check: ONLY an
+    /// unmistakable venue rejection auto-flattens; everything fate-unknown halts. Widening this wrongly could
+    /// un-hedge a real lock (the cardinal sin), so the table is asserted exhaustively. NARROWED for scale-in /
+    /// re-entry (2026-06-15): a 4xx is NECESSARY but NOT sufficient — the body must NAME a no-fill condition
+    /// and must NOT name a dedup/conflict (the deterministic-coid collision an add provokes), and 408/425 are
+    /// excluded as received-but-uncertain.
+    #[test]
+    fn is_definite_not_filled_classifies_only_unmistakable_rejections() {
+        use exec::ExecError::*;
+        // DEFINITE (true): the captured live 409 FOK-insufficient, and a body that NAMES a no-fill condition.
+        assert!(is_definite_not_filled(&Rejected(r#"409 {"error":{"code":"fill_or_kill_insufficient_resting_volume"}}"#.into())),
+            "the legitimate FOK-insufficient 409 still auto-flattens");
+        assert!(is_definite_not_filled(&Rejected("422 order rejected".into())), "a 4xx naming 'rejected' is a no-fill");
+        assert!(is_definite_not_filled(&Rejected("400 insufficient balance".into())), "a 4xx naming 'insufficient' is a no-fill");
+        // a body that names the rejection without a parseable leading status still counts (belt-and-suspenders).
+        assert!(is_definite_not_filled(&Rejected("order rejected: insufficient resting volume".into())));
+        assert!(is_definite_not_filled(&Rejected("fill_or_kill could not be satisfied".into())));
+
+        // AMBIGUOUS (false) — the NARROWING. A 4xx that does NOT name a no-fill condition is fate-unknown:
+        assert!(!is_definite_not_filled(&Rejected("400 bad request".into())), "a bare 400 names no no-fill condition -> ambiguous (was true)");
+        assert!(!is_definite_not_filled(&Rejected("422 unprocessable".into())), "a bare 422 names no no-fill condition -> ambiguous (was true)");
+        assert!(!is_definite_not_filled(&Rejected("499 client closed".into())), "a bare 499 names no no-fill condition -> ambiguous (was true)");
+        // DEDUP / CONFLICT 409 (the deterministic-coid collision a scale-in/re-entry add provokes): the
+        // existing order it conflicts with MAY have FILLED -> NOT a no-fill, must HALT (the new safety case).
+        assert!(!is_definite_not_filled(&Rejected("409 order already exists".into())), "a dedup-409 -> ambiguous (the existing order may have filled)");
+        assert!(!is_definite_not_filled(&Rejected(r#"409 {"error":"duplicate client_order_id"}"#.into())), "a duplicate-coid 409 -> ambiguous");
+        assert!(!is_definite_not_filled(&Rejected("409 conflict".into())), "a bare 409 conflict -> ambiguous");
+        // a dedup/conflict body wins even when it ALSO names a no-fill word (the conflict exclusion precedes).
+        assert!(!is_definite_not_filled(&Rejected("409 rejected: order already exists".into())), "conflict exclusion precedes the no-fill keyword");
+        // 408 request-timeout / 425 too-early: the venue RECEIVED it, fate uncertain -> ambiguous.
+        assert!(!is_definite_not_filled(&Rejected("408 request timeout".into())), "a 408 is received-but-uncertain -> ambiguous");
+        assert!(!is_definite_not_filled(&Rejected("425 too early".into())), "a 425 is received-but-uncertain -> ambiguous");
+        // a 5xx, a transport/connection error, a panic, a timeout, and the never-sent / sentinel variants — all HALT.
+        assert!(!is_definite_not_filled(&Rejected("500 internal".into())));
+        assert!(!is_definite_not_filled(&Rejected("503 service unavailable".into())));
+        assert!(!is_definite_not_filled(&Rejected("transport: connection reset".into())));
+        assert!(!is_definite_not_filled(&Rejected("submit panicked".into())));
+        assert!(!is_definite_not_filled(&RateLimited));
+        assert!(!is_definite_not_filled(&HedgeNotFilled));
+        assert!(!is_definite_not_filled(&KeysUnavailable));
+        assert!(!is_definite_not_filled(&LiveDisabled));
+        assert!(!is_definite_not_filled(&TransportNotWired));
+        // a bare 2xx (shouldn't occur in an Err, defensive) is NOT a 4xx/5xx and names no rejection -> false.
+        assert!(!is_definite_not_filled(&Rejected("200 ok".into())));
     }
 }

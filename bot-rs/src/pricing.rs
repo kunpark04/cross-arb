@@ -70,15 +70,26 @@ fn plan_legs(pair: &LivePair, q: &Quote, dir: Dir) -> Option<[PlannedLeg; 2]> {
 }
 
 /// Plan + price-to-tick both legs into `OrderIntent`s ready to submit. `None` if any leg can't be priced
-/// (one-sided book) or rounds outside the 1..=99c venue tick range. The two legs share the pmus slug
-/// (the pair identity) in their client_order_id so retries dedupe per pair-leg.
+/// (one-sided book) or rounds outside the 1..=99c venue tick range.
+///
+/// `pos_index` is the POSITION sequence on this slug at fire-decision time (the count of already-held legs:
+/// 0 for the initial entry, 1 for the first scale-in/re-entry add, …). It is woven into each leg's
+/// `client_order_id` (`xarb-{slug}-{idx}-{tag}`) so the coid is UNIQUE PER POSITION while still DETERMINISTIC
+/// per (position, leg): a RETRY of the SAME fire-attempt reuses the same coid (so the venue's deterministic-
+/// coid dedup still prevents a double-fill within one attempt), but an ADD onto a held slug gets a fresh idx
+/// and so does NOT dedup-collide with the held position's coid (which would `409 order already exists` and —
+/// post the Change-1 narrowing — HALT). `pos_index` only advances when a NEW position is actually recorded
+/// (`track_position` after a both-filled lock); a non-filling retry leaves the held count, hence the index,
+/// unchanged — no double-fill window. The default single-position path always passes `0`, so its coid is
+/// `xarb-{slug}-0-{tag}` (the only behavioral delta from the prior `xarb-{slug}-{tag}` is the `-0-` segment;
+/// the coid is still a stable, deterministic, per-leg id).
 ///
 /// FIX C — per-market pmus constraints: a pmus leg is (1) SKIPPED (whole pair -> None) if `size` is below
 /// the market's `minimumTradeQty` (a sub-min order would REJECT, leaving the OTHER leg naked — fail safe),
 /// and (2) QUANTIZED to the market's `orderPriceMinTickSize` if the whole-cent price isn't already a valid
 /// multiple (a coarser-than-cent tick; finer ticks like 0.001 leave whole cents unchanged). Kalshi is
 /// integer-cent + whole-share, so its legs are untouched.
-pub(crate) fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32) -> Option<[OrderIntent; 2]> {
+pub(crate) fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32, pos_index: u32) -> Option<[OrderIntent; 2]> {
     let planned = plan_legs(pair, q, dir)?;
     let mut out: Vec<OrderIntent> = Vec::with_capacity(2);
     for leg in planned {
@@ -105,7 +116,9 @@ pub(crate) fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32) -> Opt
             price_cents: pc,
             qty: size,
             frac_qty: None, // entries are whole-share; only a partial-fill recovery SELL sets a fractional qty
-            client_order_id: format!("xarb-{}-{}", pair.slug, leg.tag),
+            // unique-per-position (pos_index), deterministic-per-(position,leg) so a within-fire retry reuses
+            // it (dedup prevents a double-fill) but an add gets a fresh idx (no collision with the held coid).
+            client_order_id: format!("xarb-{}-{}-{}", pair.slug, pos_index, leg.tag),
         });
     }
     Some([out.remove(0), out.remove(0)])
@@ -333,18 +346,42 @@ mod tests {
     #[test]
     fn leg_prices_come_from_books_not_edge() {
         let (pair, q) = (wx_pair(), q_pk());
-        let pk = build_legs(&pair, &q, Dir::PK, 1).unwrap();
+        let pk = build_legs(&pair, &q, Dir::PK, 1, 0).unwrap();
         // leg A = YES@pmus(slug) @ 7c (pmus YES ask 0.07); leg B = NO@Kalshi(ticker) @ 90c (1 - 0.10).
         assert_eq!((pk[0].venue, pk[0].side, pk[0].price_cents), (Venue::Pmus, Side::Yes, 7));
         assert_eq!(pk[0].market, "tc-temp-nychigh-2026-06-11-gte95f"); // pmus leg -> slug
         assert_eq!((pk[1].venue, pk[1].side, pk[1].price_cents), (Venue::Kalshi, Side::No, 90));
         assert_eq!(pk[1].market, "KXHIGHNY-26JUN11-T95"); // LEG-MARKET FIX: Kalshi leg -> the TICKER, not the slug
         // KP flips cheap/dear: YES@Kalshi(ticker) 0.11; NO@pmus(slug) = 1 - 0.05 = 0.95.
-        let kp = build_legs(&pair, &q, Dir::KP, 1).unwrap();
+        let kp = build_legs(&pair, &q, Dir::KP, 1, 0).unwrap();
         assert_eq!((kp[0].venue, kp[0].side, kp[0].price_cents), (Venue::Kalshi, Side::Yes, 11));
         assert_eq!(kp[0].market, "KXHIGHNY-26JUN11-T95");
         assert_eq!((kp[1].venue, kp[1].side, kp[1].price_cents), (Venue::Pmus, Side::No, 95));
         assert_eq!(kp[1].market, "tc-temp-nychigh-2026-06-11-gte95f");
+    }
+
+    /// UNIQUE-PER-POSITION, STABLE-PER-FIRE-RETRY COID (the scale-in/re-entry dedup fix). `pos_index` makes
+    /// the entry coid `xarb-{slug}-{idx}-{tag}`: the INITIAL position (idx 0) and the 1st ADD (idx 1) get
+    /// DISTINCT coids (so the add never `409 order already exists`-collides with the held position on Kalshi's
+    /// deterministic-coid dedup), while a RE-FIRE at the SAME index reuses the SAME coid (so a within-fire
+    /// retry still dedups -> no double-fill). The leg tag ('A'/'B') keeps the two legs of one position distinct.
+    #[test]
+    fn entry_coid_is_unique_per_position_and_stable_per_index() {
+        let (pair, q) = (wx_pair(), q_pk());
+        let initial = build_legs(&pair, &q, Dir::PK, 1, 0).unwrap();
+        let first_add = build_legs(&pair, &q, Dir::PK, 1, 1).unwrap();
+        // the default single-position path is `xarb-{slug}-0-{tag}` (only delta from the old `-{tag}` is `-0-`).
+        assert_eq!(initial[0].client_order_id, format!("xarb-{}-0-A", pair.slug));
+        assert_eq!(initial[1].client_order_id, format!("xarb-{}-0-B", pair.slug));
+        // the 1st ADD (idx 1) gets DISTINCT coids per leg -> no dedup collision with the held idx-0 position.
+        assert_eq!(first_add[0].client_order_id, format!("xarb-{}-1-A", pair.slug));
+        assert_ne!(initial[0].client_order_id, first_add[0].client_order_id, "initial vs add: DISTINCT coids");
+        assert_ne!(initial[1].client_order_id, first_add[1].client_order_id, "both legs differ across positions");
+        // a RE-FIRE at the SAME index (a within-fire retry that didn't lock -> the held count is unchanged)
+        // reuses the EXACT coid, so the venue's deterministic-coid dedup prevents a double-fill within one add.
+        let refire = build_legs(&pair, &q, Dir::PK, 1, 1).unwrap();
+        assert_eq!(refire[0].client_order_id, first_add[0].client_order_id, "same index -> same coid (idempotent retry)");
+        assert_eq!(refire[1].client_order_id, first_add[1].client_order_id);
     }
 
     /// ROUTING (the money-path self-review item a): a WORLD-CUP outcome pair MUST take the BINARY `signal`
@@ -373,7 +410,7 @@ mod tests {
             days_to_event: Some(1.0),
         };
         // PK legs = YES@pmus(slug) @ 42c + NO@Kalshi(ticker) @ (1-0.45)=55c — the weather/econ 1:1 shape.
-        let pk = build_legs(&pair, &q, Dir::PK, 1).unwrap();
+        let pk = build_legs(&pair, &q, Dir::PK, 1, 0).unwrap();
         assert_eq!((pk[0].venue, pk[0].side, pk[0].price_cents), (Venue::Pmus, Side::Yes, 42));
         assert_eq!(pk[0].market, "atc-fwc-ger-cuw-2026-06-14-ger", "the pmus leg uses the outcome SLUG");
         assert_eq!((pk[1].venue, pk[1].side, pk[1].price_cents), (Venue::Kalshi, Side::No, 55));
@@ -382,7 +419,7 @@ mod tests {
         // the SAME outcome (same slug/ticker pair) — so it pays $1 whichever way THIS outcome resolves.
         assert!(pk[0].side == Side::Yes && pk[1].side == Side::No, "YES@one venue + NO@other on the same outcome");
         // KP flips: YES@Kalshi(ticker) 46c + NO@pmus(slug) = 1 - 0.40 = 60c. Still the 1:1 binary shape.
-        let kp = build_legs(&pair, &q, Dir::KP, 1).unwrap();
+        let kp = build_legs(&pair, &q, Dir::KP, 1, 0).unwrap();
         assert_eq!((kp[0].venue, kp[0].side, kp[0].market.as_str()), (Venue::Kalshi, Side::Yes, "KXWCGAME-26JUN14GERCUW-GER"));
         assert_eq!((kp[1].venue, kp[1].side, kp[1].market.as_str()), (Venue::Pmus, Side::No, "atc-fwc-ger-cuw-2026-06-14-ger"));
     }
@@ -417,14 +454,14 @@ mod tests {
             days_to_event: Some(1.0),
         };
         // PK: leg A = YES@pmus(slug) @ pm_ask 55c; leg B = YES@Kalshi-B(PIT ticker) @ kB_ask 42c.
-        let pk = build_legs(&pair, &q, Dir::PK, 3).unwrap();
+        let pk = build_legs(&pair, &q, Dir::PK, 3, 0).unwrap();
         assert_eq!((pk[0].venue, pk[0].side, pk[0].price_cents), (Venue::Pmus, Side::Yes, 55));
         assert_eq!(pk[0].market, "aec-mlb-lad-pit-2026-06-16");
         assert_eq!((pk[1].venue, pk[1].side, pk[1].price_cents), (Venue::Kalshi, Side::Yes, 42));
         assert_eq!(pk[1].market, "KXMLBGAME-26JUN16-PIT", "PK leg2 = YES on the AWAY team's Kalshi TICKER");
         assert!(pk[0].qty == 3 && pk[1].qty == 3);
         // KP: leg A = YES@Kalshi-A(LAD ticker) @ kA_ask 58c; leg B = NO@pmus(slug) @ 1-pm_bid = 46c.
-        let kp = build_legs(&pair, &q, Dir::KP, 3).unwrap();
+        let kp = build_legs(&pair, &q, Dir::KP, 3, 0).unwrap();
         assert_eq!((kp[0].venue, kp[0].side, kp[0].price_cents), (Venue::Kalshi, Side::Yes, 58));
         assert_eq!(kp[0].market, "KXMLBGAME-26JUN16-LAD", "KP leg1 = YES on the HOME team's Kalshi TICKER");
         assert_eq!((kp[1].venue, kp[1].side, kp[1].price_cents), (Venue::Pmus, Side::No, 46));
@@ -473,14 +510,14 @@ mod tests {
         // (1) min-qty skip: pmus minimumTradeQty = 2, configured size 1 -> the pmus leg is sub-min -> None.
         let mut pair = wx_pair();
         pair.pm_min_qty = Some(2.0);
-        assert!(build_legs(&pair, &q_pk(), Dir::PK, 1).is_none(), "size below pmus minimumTradeQty -> skip the pair");
-        assert!(build_legs(&pair, &q_pk(), Dir::PK, 2).is_some(), "size at the minimum is allowed");
+        assert!(build_legs(&pair, &q_pk(), Dir::PK, 1, 0).is_none(), "size below pmus minimumTradeQty -> skip the pair");
+        assert!(build_legs(&pair, &q_pk(), Dir::PK, 2, 0).is_some(), "size at the minimum is allowed");
 
         // (2) tick quantization: pmus tick 0.05; dir PK leg A = YES@pmus (a BUY) @ pm_ask 0.07 -> ceils UP to
         // 0.10 = 10c (stays marketable; nearest-rounding to 5c would have rested it below the 7c offer).
         let mut pair2 = wx_pair();
         pair2.pm_min_tick = Some(0.05);
-        let pk = build_legs(&pair2, &q_pk(), Dir::PK, 1).unwrap();
+        let pk = build_legs(&pair2, &q_pk(), Dir::PK, 1, 0).unwrap();
         assert_eq!((pk[0].venue, pk[0].price_cents), (Venue::Pmus, 10), "pmus BUY leg ceils UP to the 0.05 tick (marketable)");
         // the Kalshi NO leg (1 - 0.10 = 0.90) is NOT quantized by the pmus tick -> stays 90c.
         assert_eq!((pk[1].venue, pk[1].price_cents), (Venue::Kalshi, 90), "Kalshi leg is integer-cent, untouched");
@@ -492,9 +529,9 @@ mod tests {
     fn one_sided_book_blocks_leg_construction() {
         let (pair, mut q) = (wx_pair(), q_pk());
         q.k.yes_bid = None; // no Kalshi bid -> can't price the NO@Kalshi leg (dir PK)
-        assert!(build_legs(&pair, &q, Dir::PK, 1).is_none()); // -> the live loop `continue`s, no naked leg
+        assert!(build_legs(&pair, &q, Dir::PK, 1, 0).is_none()); // -> the live loop `continue`s, no naked leg
         // the OTHER direction (KP needs Kalshi YES ask + pmus YES bid) still prices -> two legs.
-        assert!(build_legs(&pair, &q, Dir::KP, 1).is_some());
+        assert!(build_legs(&pair, &q, Dir::KP, 1, 0).is_some());
     }
 
     /// `position_from_intents` builds the held Position straight from the two entry OrderIntents: each leg

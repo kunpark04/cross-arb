@@ -16,6 +16,7 @@ mod config;
 mod discovery;
 mod exec;
 mod exec_log;
+mod flatten;
 mod ledger;
 mod live;
 mod matcher;
@@ -73,6 +74,21 @@ async fn main() {
         ExecutionMode::Live => std::sync::Arc::new(LiveBackend::new(&cfg)),
     };
     println!("execution backend : {}\n", backend.label());
+
+    // `--flatten <venue> <market> <side> <qty>`: SURGICAL one-shot — read ONLY that market's book and fire
+    // EXACTLY ONE marketable SELL to close the named leg, then exit. NO discovery, NO loop, NO other orders.
+    // Same prod/settle consent gates above; a real order only when EXECUTION_MODE=live (dry-run prints + sends
+    // nothing). Used to flatten a live naked leg the bot couldn't auto-recover.
+    if let Some(parsed) = flatten::parse_flatten(&std::env::args().collect::<Vec<_>>()) {
+        match parsed {
+            Ok(req) => flatten::run(&cfg, backend, req).await,
+            Err(why) => {
+                eprintln!("[flatten] {why}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // `--probe-no`: LIVE verification of the Kalshi NO-leg `no_price` write-mapping (audit's top pre-arming
     // risk) — a 1¢ BUY-NO on a fully-empty book. Same consent gates; real order only when EXECUTION_MODE=live.
