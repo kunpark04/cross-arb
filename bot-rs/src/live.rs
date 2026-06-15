@@ -81,6 +81,12 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
     let mut pending_entries: HashSet<String> = HashSet::new();
     let mut flattening: HashMap<String, FlatKind> = HashMap::new();
 
+    // `CROSSARB_MAX_ENTRIES=N`: stop opening NEW entries after N have fired this run (recovery/unwind still run;
+    // the held position settles normally). For a SAFE first live run set it to 1 -> the bot fires EXACTLY ONE
+    // round-trip then holds, so an unattended/overnight arming yields a single reviewable trade. Absent = unlimited.
+    let max_entries: Option<u32> = std::env::var("CROSSARB_MAX_ENTRIES").ok().and_then(|s| s.parse::<u32>().ok());
+    let mut entries_fired: u32 = 0;
+
     // SCALE-IN vs RE-ENTRY proxy (design §3): a slug is in `edge_live` while a same-direction qualifying arb
     // is currently present on it (inserted/removed each frame, below). At ADD time `edge_live.contains(slug)`
     // => SCALE-IN (base episode still OPEN), else RE-ENTRY (base held, its edge already closed). Conservative
@@ -324,6 +330,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
         if halt.load(Ordering::Relaxed)
             || pending_entries.contains(&slug)
             || flattening.contains_key(&slug)
+            || max_entries.is_some_and(|m| entries_fired >= m) // CROSSARB_MAX_ENTRIES: stop opening new entries
         {
             continue;
         }
@@ -377,6 +384,10 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             // deref-clone the shared `Arc<LivePair>` into the owned `LivePair` the outcome carries (only on
             // the rare approved-fire path, never per frame); the poll reads its league/date/abbrevs later.
             spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir);
+            entries_fired += 1;
+            if max_entries == Some(entries_fired) {
+                println!("[live] CROSSARB_MAX_ENTRIES={entries_fired} reached — holding this position to settlement; NO new entries will open (recovery/unwind stay active).");
+            }
         }
     }
     if halt.load(Ordering::Relaxed) {
