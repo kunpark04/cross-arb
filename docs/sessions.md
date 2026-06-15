@@ -6,6 +6,39 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 14) — DYNAMIC fire-order (fire the thinner leg first) [0025] + recovery hardened on BOTH venues; pmus is the binding leg (live-corroborated)
+
+A long order-path session: shipped the dynamic fire-order, hardened recovery end-to-end, and live-corroborated
+that **pmus is the universal thin binding leg**. Every fix was live-exposed (no demo).
+
+- **Recovery hardened — 3 fixes:** (a) **self-healing recovery** — a DEFINITE venue rejection (4xx
+  FOK-insufficient) AUTO-FLATTENS the naked leg instead of HALTING; a dedup/conflict-409 + ambiguous errs still
+  fail-close (`e480f07`: narrow-4xx + unique/MONOTONIC scale-in coid + a `--flatten` operator CLI). (b)
+  **fractional full-fill** — the recovery compared `fill_qty` to the rounded-up INTEGER qty, so a 0.87 partial
+  that DID flatten read "unfilled" → false kill-switch; now compares `frac_qty` (`4f3959a`). (c) **Kalshi count
+  as int** — the float `1.0` 400'd, 0024's flagged WARN, live-exposed by the dynamic order (`634c5f1`, [L39]).
+- **DYNAMIC fire-order [0025] (`9c0c55d`, adversarial-reviewed SAFE_TO_ARM):** fire the THINNER leg first
+  (per-leg ask-volume), so its FOK-reject is a clean abort, never a naked commit (extends 0020's pmus-first;
+  recovery flattens EITHER venue). Owner pushed *simultaneous* ×3 — refuted (the fades are pmus-no-liquidity,
+  not an ordering problem; [L40]). Live-verified: a Kalshi-first naked leg (`miahigh`) auto-flattened cleanly;
+  the cap=2 scale-in add fired; 0 halts post-fix.
+- **Reconciliation (94 fires, all runs):** ~19 clean locks (12 settled, **every one profitable**, +53¢ gross /
+  ~+38¢ net, 0 losers), ~72 clean aborts, ~12 naked-leg events (10 recovered, 2 halted — both the pre-fix bugs).
+  GIB naked leg manually `--flatten`ed **+66¢**; pietai settled −51¢. Net session positive; settlement identity
+  held on all 12 settled locks.
+- **Liquidity corroboration (live vs backtest):** pmus-thin CONFIRMED (pmus fails ~9× Kalshi, EVERY category).
+  Sports has the deepest *displayed* books (median `depth_c2` 57 vs weather 2) but aborts MORE (80% vs 60%) and
+  the depth EVAPORATES at fire (aborted fires had HIGHER `depth_c2` than locked) — so "sports = where we scale"
+  is a Kalshi-side fact that doesn't survive cross-venue. **Scaling reframes to breadth + edge-quality (the maker
+  study), not depth per pair**; MLB line-lag stays n=1 (instrument, don't bet). [L37]
+- **NEEDS_MANUAL audit** → `research/needs-manual-settlement-2026-06-15.md`: 353 co-listed → 37 IDENTICAL · 236
+  TAIL · **80 NEEDS_MANUAL** · 0 DIVERGENT. 36 weather = a rules-text station-naming gap (~certainly clean,
+  promote via `verify_settlement.py`); 44 sports (40 ITF + 4 esports/WNBA) = genuine unpriced void-tail unknowns.
+- **Owner feedback:** do small contained fixes DIRECTLY, not via the coding-agent ([L38]); FOK-limit only, never
+  market orders ([L40]).
+
+---
+
 ## 2026-06-15 (cont. 13) — pmus IGNORES fill-or-kill → partial-fill naked-position fix [0024]; capacity = the thin leg; relaunch 5-contract + scale-in
 
 The owner caught a stray pmus position (M'Chich, `aec-itfm-andchi-timbre`) the bot had no record of. Root cause:

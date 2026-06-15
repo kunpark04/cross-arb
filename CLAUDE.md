@@ -89,6 +89,13 @@ See [deploy/README.md](deploy/README.md).
   found the earlier "$/day" prose unsupported and a capital double-count (~6–7× — now fixed in `capital_sim.py`:
   corrected peak ≈ $13.6k / ~6%/day, still preliminary). Treat edge size as unproven until the live monitor +
   `scripts/capital_sim.py` accumulate. The bot decides what to trade.
+  **LIVE-CORROBORATED 2026-06-15 (94 fires, [0025](decisions/0025-dynamic-fire-order.md), cont. 14):** pmus is the
+  binding thin leg across **ALL** categories (fails ~9× Kalshi); SPORTS has the deepest *displayed* book (median
+  `depth_c2` 57 vs weather 2) **but aborts MORE** (80% vs 60%) and the displayed depth **evaporates at fire** (aborted
+  fires logged HIGHER `depth_c2` than locked) — so the deep Kalshi sports books don't translate to fillable
+  cross-venue size. The bot now fires the **THINNER leg first** ([0025], superseding 0020's fixed pmus-first), and the
+  scaling lever reframes from "which category" to **breadth + the maker study + transient depth windows, not depth
+  per pair** (the MLB line-lag window stays n=1 — instrument it, don't bet it). [tasks/lessons.md](tasks/lessons.md) L37–L40.
 - **Hardened post-review (three passes):** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
   `bot/monitor.py`) plus per-transition depth + staleness instrumentation. `age` is a coarse staleness hint
   (a resting-but-tradeable quote and a wedged stream both accrue large `age`); **depth** does the real

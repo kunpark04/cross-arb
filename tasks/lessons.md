@@ -588,3 +588,41 @@ deep on BOTH sides (weather, liquid sports). `depth_c2` is the right IDEA but tr
 on thin/fast books treat it as an upper bound that won't hold, and let the order's ACTUAL fill (now captured as
 `fill_qty`, [L36]) be the truth. The big edges that look attractive live precisely in the thin corners you can't fill
 ([L16]) — edge-location ≠ capacity.
+
+## L38 — For small, contained fixes, edit directly — don't spin up the coding-agent
+
+**Pattern:** The owner twice said "again, do not launch coding-agent, just do it yourself" — for the
+fractional-fill fix and the dynamic order. The coding-agent (and its review) is real overhead (latency; once it
+left a mid-wiring BROKEN tree that didn't compile) that isn't worth it for a few-line change to known files.
+
+**Rule:** Judge by scope. A few-line change to files you've already read → edit it yourself (Edit/Write) +
+`cargo test`. Reserve the coding-agent for larger / unfamiliar / multi-file work where its self-review adds
+value, and the adversarial-review WORKFLOW for re-arming a money path. The build-it-yourself default is faster,
+and the owner prefers it.
+
+## L39 — A WARN flagged in a DORMANT path goes LIVE when a new feature activates it; a money-path review must verify the PAYLOAD is venue-ACCEPTED, not just that the logic fires
+
+**Pattern:** [0024] flagged a residual WARN — the Kalshi recovery SELL serialized a float `count` — as
+"safe-degrading, dormant under pmus-first (the naked leg is always pmus)." The DYNAMIC order [0025] made the
+Kalshi leg recoverable; its FIRST naked-Kalshi recovery sent `count:1.0` → Kalshi 400 "cannot unmarshal number
+1.0 into … int" → kill-switch + a naked Kalshi leg. The dynamic-order adversarial review verified recovery FIRES
+a Kalshi SELL (logic) but NOT that the Kalshi PAYLOAD is accepted.
+
+**Rule:** A flagged WARN in a currently-unreachable path is a LANDMINE for the feature that reaches it — resolve
+it (or re-scope the feature) before activating the path, not after a live halt. And a money-path review must
+trace the order to venue-ACCEPTANCE — the exact serialization the venue unmarshals (Kalshi `count` is a
+whole-share INT; pmus `quantity` is fractional) — not just that the right function fires. Logic-correct ≠
+payload-accepted ([L32] is the read-side twin of this).
+
+## L40 — On a thin book the "fades" are a LIQUIDITY problem, not an order-type one; market orders slip PAST the edge into a loss
+
+**Pattern:** Owner: "fade one after another — fire both at once / try market orders?" But ~72 of 94 fires aborted
+because the pmus leg got `409 insufficient_resting_volume` — pmus had NO resting volume to buy at any price near
+the edge. Neither simultaneous fire nor a market order can buy what isn't offered; a market order on the cases
+where pmus has SOME volume walks DOWN the thin book past the edge (a +3¢ arb → a −3¢ loss).
+
+**Rule:** A FOK-limit ABORT on a thin book is the CORRECT $0 outcome — the arb can't lock at a price that pays,
+so don't book a slippage loss to force a fill. The only safe "more aggressive" knob is raising the *bounded*
+limit markup (capped by the edge, can't lose); market orders are the unbounded version where the losses live.
+The constraint is pmus LIQUIDITY — scale by breadth + the maker study + transient depth windows ([L37]), not by
+changing the order type.
