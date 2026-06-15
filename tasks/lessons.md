@@ -477,3 +477,29 @@ live-side guard — this is its unit-test-side twin). Keep an env-gated raw-resp
 next venue drift (renamed field, async-vs-sync fill — [L23]) is one probe away from visible, not one naked
 position away. And re-confirm: "it rested / I cancelled it" is a hypothesis to verify against positions, never a
 fact ([L26]) — here the bot's own fill flag was the thing that was wrong.
+
+## L33 — First live arb hit a naked leg; recovery on a thin book cost ~2× the edge → fire the slow/uncertain leg first + gate on recovery cost
+
+**Pattern:** The first live armed arb (`atc-fwc-swe-tun-2026-06-14-swe`, a settle-clean WC outcome, 1 contract)
+fired both legs CONCURRENTLY (`tokio::join!`). The Kalshi taker leg filled in 220ms (BUY YES @ 86¢); the pmus
+hedge (BUY NO @ 8¢) **never filled** — non-marketable (the 8¢ NO was a phantom/stale quote), so pmus's
+`synchronousExecution` block held the POST the FULL ~1s window then returned a resting **GTC** order
+(`cumQuantity:0`). For that entire ~1.5s the Kalshi leg was **naked**. The W14 recovery flattened it by SELLING
+the Kalshi YES into the **77¢ bid** — but the buy was at the **86¢ ask**, so round-tripping crossed a **~9¢
+spread** on a thin WC book (its Kalshi book is empty on review = thin/intermittent). Recovery ≈ 9¢ vs an edge of
+4.8¢: **one failed hedge eats two good arbs.** Net −11.09¢. Two myths to kill: (a) *"pmus is slow"* — its raw RTT
+is ~57ms (faster than Kalshi); the 1.5s was the deliberate fill-block, NOT latency; (b) *"the price slid 9¢"* —
+more likely it was the **spread**, not a move (we bought the ask, sold the bid on a wide thin book; entry-side
+book wasn't logged, so it's inferred). Root cause: concurrent fire exposes the fast leg for the entire slow-leg
+block, and the depth gate validated only the side we TAKE, never the side we'd sell back into.
+
+**Rule:** For a two-venue arb where one leg is BOTH slower-to-confirm AND thinner/more-likely-to-fail (here pmus:
+it BLOCKS for a verdict via `synchronousExecution`, and it's the smaller venue), **fire that leg FIRST and
+serially** — resolve the uncertain leg before committing the fast/reliable one (Kalshi). Open the fast leg only
+AFTER the slow leg confirms FILLED; if it doesn't fill, **abort** — and because the slow order is GTC, **cancel
+its resting order** (a non-filled sync order rests and can fill later unhedged) and do NOT trip the fail-close
+halt (no leg filled = clean abort, not a naked leg). Then **gate on recovery cost**: the residual naked case
+(slow leg filled, fast leg failed) unwinds the slow leg → cost ≈ its bid↔ask spread; skip any arb whose slow-leg
+spread exceeds the edge, however deep the take side looks. The Kalshi spread is NOT gated — under pmus-first it
+locks and is held to settlement, never unwound. Decision [0020]. Corollary: log bid/ask/depth at BOTH entry and
+recovery so a naked leg's cost decomposes into spread-vs-move instead of being inferred after the fact.

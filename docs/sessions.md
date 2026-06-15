@@ -6,6 +6,35 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-14 (cont. 8) — FIRST LIVE ARB (owner-override, all-events) → naked leg on trade #1; recovery worked; → pmus-first + recovery-cost gate
+
+Owner: "measure the latency of EVERYTHING" + "look at all events, not just weather." Added the one unmeasured
+latency stage, then ran the first live armed all-events arb — it hit a naked leg, which paid for itself in findings.
+
+- **Latency instrumentation (`2174234`):** the in-loop COMPUTE per frame (book-apply→signal→risk→fire) was the
+  one stage never measured — now stamped at frame-receipt, read at the next loop-top (every continue-path timed),
+  reported p50/p99/max µs per 20s heartbeat + a per-fire `decision` µs on the ENTRY line. Live: **frame-compute
+  p50 ~9µs / p99 ~42µs, decision 15µs** → compute is ~10⁴× below the network leg; speed is 100% venue RTT, as the
+  thesis held. 157 tests, clippy clean.
+- **First live armed arb** (owner overrode the auto-mode classifier's block on `ASSUME_SPORTS/ECON_SETTLED`):
+  release binary, all 399 pairs, 1-contract / max-1-entry / velocity-gate-on (econ needs a 21¢ edge to clear the
+  1.0¢/$-day floor → never fires; the gate IS the capital-velocity filter — owner's call to leave econ in). Fired
+  on a **settle-clean WC outcome** (`atc-fwc-swe-tun`, dir KP, edge 4.8¢, decision 15µs).
+- **→ NAKED LEG on trade #1** (the gating risk, live): Kalshi BUY YES @86¢ filled (220ms); **pmus BUY NO @8¢ did
+  NOT fill** (1,533ms — a DELIBERATE `synchronousExecution` block on a non-marketable phantom hedge, NOT venue
+  slowness; pmus raw RTT ~57ms; the 1s window = `(leg_fill_timeout_ms/1000).max(1)`). W14 recovery cancelled the
+  pmus rest + SOLD Kalshi YES @77¢ → **flat, net −11.09¢.** Every safety + forensic layer (fill-detection
+  `fill_count_fp`, fail-close, exec log) worked exactly as designed.
+- **The −9¢ was the SPREAD, not a move:** bought the 86¢ ask, exited the 77¢ bid on a **thin** WC book (empty on
+  review) → recovery ≈ **2× the edge.** Concurrent fire left the fast Kalshi leg naked the whole ~1.5s pmus block.
+- **Decision [0020](../decisions/0020-pmus-first-serial-plus-recovery-cost-gate.md) + [L33]: pmus-first serial
+  execution** (fire the slow/uncertain pmus leg first; open Kalshi only on its confirmed fill ⇒ structurally no
+  naked fast leg; cancel the resting GTC pmus order on abort, no halt) **+ a recovery-cost gate** (skip arbs whose
+  pmus bid↔ask spread — the residual naked-unwind cost — exceeds the edge). Built + re-tested live this session.
+  Follow-up: snapshot the book at entry+recovery to measure spread-vs-move.
+
+---
+
 ## 2026-06-14 (cont. 7) — LIVE order-path verification (owner-gated, real account) → CRITICAL Kalshi fill-detection bug found + fixed
 
 Owner directive: "live verify everything you can, trigger it from this session, I override; measure latency in all
