@@ -312,6 +312,18 @@ fn pmus_order_filled(v: &serde_json::Value, qty: u32) -> bool {
     state.contains("FILL") && !state.contains("PARTIAL")
 }
 
+/// A FULL fill for a possibly-FRACTIONAL order. A fractional recovery SELL (`frac_qty` is `Some` — the venue
+/// qty IS the frac, e.g. 0.87) fills fully at `fill_qty >= frac`; comparing it to the rounded-up INTEGER qty
+/// (1) read a complete 0.87-of-0.87 flatten as "unfilled" and FALSE-tripped the kill-switch (live, laxhigh
+/// 2026-06-15). An integer order (`frac_qty` is `None`) defers to the venue body's full-fill semantics
+/// (`venue_full_fill`), UNCHANGED. epsilon guards the float repr of the frac.
+fn is_full_fill(fill_qty: f64, frac_qty: Option<f64>, venue_full_fill: bool) -> bool {
+    match frac_qty {
+        Some(frac) => fill_qty + 1e-9 >= frac,
+        None => venue_full_fill,
+    }
+}
+
 impl LiveBackend {
     pub fn new(cfg: &Config) -> Self {
         let keys = Self::load_keys(cfg); // None when env/keys absent -> live POST returns a typed error
@@ -560,10 +572,13 @@ impl LiveBackend {
         // `synchronousExecution` (`cumQuantity` / summed `executions`). `filled` = the FULL requested qty
         // filled; `fill_qty` carries the PARTIAL (pmus ignores FOK and can return `cumQuantity:0.01` of qty=5)
         // — a real naked position the recovery unwinds EXACTLY, which `filled:false` alone would hide.
-        let (fill_qty, filled) = match intent.venue {
+        let (fill_qty, venue_full_fill) = match intent.venue {
             Venue::Kalshi => (kalshi_fill_qty(&v), kalshi_order_filled(&v, intent.qty)),
             Venue::Pmus => (pmus_fill_qty(&v), pmus_order_filled(&v, intent.qty)),
         };
+        // A FRACTIONAL recovery SELL's full-fill is `fill_qty >= frac`, NOT the rounded-up integer qty (the
+        // laxhigh 2026-06-15 false-kill-switch). An integer order is unchanged (defers to `venue_full_fill`).
+        let filled = is_full_fill(fill_qty, intent.frac_qty, venue_full_fill);
         // EXECUTION LOG (always-on, exec_log.rs): one line per submit — success OR reject — with the RAW ack
         // next to the parsed `filled`/`venue_order_id`, so a parser-vs-reality drift (the fill_count_fp class)
         // is visible by eye/jq ([L32]).
@@ -1197,6 +1212,24 @@ mod tests {
         let full: serde_json::Value = serde_json::from_str(r#"{"order":{"fill_count_fp":"3.00"}}"#).unwrap();
         assert!(kalshi_order_filled(&full, 3));
         assert_eq!(kalshi_fill_qty(&serde_json::json!({"error":"x"})), 0.0, "no fill field -> 0.0 (fail-safe)");
+    }
+
+    /// FRACTIONAL-RECOVERY FULL FILL (the laxhigh 2026-06-15 false-kill-switch fix): a recovery SELL whose
+    /// venue qty IS the frac (0.87) fills FULLY at fill_qty 0.87 — even though the rounded-up integer qty is 1
+    /// and the venue's integer full-fill check (`venue_full_fill`) reads false. A PARTIAL of the frac is NOT a
+    /// full fill. An integer order (frac None) defers to the venue verdict, UNCHANGED.
+    #[test]
+    fn is_full_fill_uses_frac_not_rounded_integer_qty() {
+        // the live laxhigh case: frac 0.87, fill 0.87, the venue integer-check said false -> STILL a full fill
+        // (it sold the whole naked 0.87 -> flat; the OLD code false-halted on exactly this).
+        assert!(is_full_fill(0.87, Some(0.87), false), "a fractional recovery that fills its frac is FULL, not gated by the rounded-up integer qty");
+        // the M'Chich 0.01 case is equally a full fill at 0.01.
+        assert!(is_full_fill(0.01, Some(0.01), false), "the 0.01 fractional recovery fills fully at 0.01");
+        // a PARTIAL of the frac (0.5 of 0.87) is still partly naked -> NOT full.
+        assert!(!is_full_fill(0.5, Some(0.87), false), "a partial of the frac (0.5 of 0.87) is not a full fill");
+        // an INTEGER order (frac None) is UNCHANGED — it defers to the venue verdict.
+        assert!(is_full_fill(1.0, None, true), "an integer order defers to the venue full-fill verdict (true)");
+        assert!(!is_full_fill(0.0, None, false), "an integer order defers to the venue verdict (false)");
     }
 
     /// A recovery SELL's `frac_qty` (the EXACT partial, e.g. 0.01) is serialized as the venue `quantity`/`count`
