@@ -654,3 +654,19 @@ restored, or use absolute paths / tool-native dir flags (`git -C`, `cargo --mani
 specifically, ALWAYS `cd` to the bot dir IN the launch command (the bot also needs cwd=bot-rs for its relative
 `.env`/`executions.jsonl`) and verify it actually started (a 127 produces no process + no banner) before walking
 away.
+
+## L43 — An idempotency/dedup key must be unique across the FULL lifetime of the dedup AUTHORITY (the venue), not just the in-memory tracker — and cover EVERY way the key reaches it
+
+**Pattern:** The per-slug coid index (`xarb-{slug}-{idx}`) was fixed ONCE (`fc6a51d`) to advance when a leg
+filled-then-recovered (`Ok` with a `venue_order_id`). But it halted AGAIN the same evening on TWO sibling cases
+that fix missed: (1) a FOK-REJECTED pmus leg carries NO `venue_order_id` yet the venue STILL dedups its coid →
+reuse `409 order_already_exists`; (2) the index is IN-MEMORY and resets every run, but the venue's dedup is
+PERMANENT, so a RESTART reused coids burnt in a prior run. I patched the observed case twice instead of the
+class.
+
+**Rule:** When the dedup authority is EXTERNAL and PERSISTENT (a venue keying on `client_order_id` forever),
+the key must be unique over the authority's whole memory, not your process's. (a) Account for EVERY path the
+key reaches the venue — accepted, rested, AND rejected all "burn" it (a clean reject still consumes the key).
+(b) Add a per-PROCESS salt (`run_salt`, hex epoch-seconds) so in-memory counters that reset on restart can't
+collide with a prior run's burnt keys. When a fix for a dedup/idempotency bug only handles the one case you
+SAW, ask "what are the other ways this key gets consumed, and does my in-memory state outlive the venue's?"
