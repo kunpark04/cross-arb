@@ -670,3 +670,20 @@ key reaches the venue — accepted, rested, AND rejected all "burn" it (a clean 
 (b) Add a per-PROCESS salt (`run_salt`, hex epoch-seconds) so in-memory counters that reset on restart can't
 collide with a prior run's burnt keys. When a fix for a dedup/idempotency bug only handles the one case you
 SAW, ask "what are the other ways this key gets consumed, and does my in-memory state outlive the venue's?"
+
+## L44 — A measurement that JOINS two logs must match on a CONSISTENT clock; a venue-time vs receive-time mismatch is silent LOOK-AHEAD that flips the sign
+
+**Pattern:** The `p_hedge` maker measurement joined Kalshi trade prints (carrying a venue fill time `vt`) to the
+both-venue ladders (stamped on the monitor-RECEIVE clock `t`), looking the hedge ladder up at `vt`. But `t − vt`
+is a STRUCTURED ~150 s skew (Kalshi's batched trade feed), always positive — so the hedge was priced against the
+pmus book ~150 s BEFORE the fill propagated, i.e. before the informed flow that filled the maker emptied pmus.
+That look-ahead inflated `p_hedge` 36%→52% and flipped EV −0.8¢→+0.5¢ — it would have greenlit a −EV live build.
+A `MAX_GAP_S` sweep even "looked robust" (a TIGHTER window RAISED p_hedge), which is itself the leak signature.
+
+**Rule:** When a measurement JOINS two event streams by time, match them on the SAME clock — and prefer the clock
+the strategy could actually ACT on (here the receive clock: you can only hedge against the book you SEE when you
+learn of the fill, not the book as it was at the venue instant). A cross-clock join is silent look-ahead. Two
+tells: a metric that IMPROVES as the match window TIGHTENS under a known skew, and a directionally ASYMMETRIC
+flip when the clock is corrected (here 9:1 hedged→naked). Always run a DECISION-FLIPPING measurement past the
+stats-ml-logic-reviewer BEFORE acting — it caught this; the unit self-test did not (the bug was in the data
+JOIN, not the unit logic).
