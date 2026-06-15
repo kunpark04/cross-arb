@@ -332,16 +332,22 @@ pub(crate) fn naked_filled_idx(ack: &exec::PairAck) -> Option<usize> {
 }
 
 /// Did this terminal Entry outcome actually CREATE a real order at a venue under the entry coid
-/// (`xarb-{slug}-{idx}-{tag}`)? True iff ANY ack leg is `Ok` with a non-empty `venue_order_id` — whether it
-/// FILLED, RESTED, or filled-then-got-recovered. Such a coid is BURNT at the venue (both venues dedup on
-/// client_order_id PERMANENTLY — a cancelled/recovered order's coid still `409 order_already_exists` on
-/// reuse), so the per-slug index MUST advance past it even though the pair did NOT lock. Without this, a fire
-/// that fills-then-recovers (the 2026-06-15 tiplem-zozkar incident: Kalshi filled @30c, pmus IOC-expired, the
-/// naked Kalshi leg recovered to flat — but no LOCK, so the index stayed 0) leaves the burnt coid in place;
-/// the NEXT fire on the slug reuses it -> `409 order_already_exists` -> a FALSE fail-close halt on a flat book.
-/// An empty `venue_order_id` (a dedup-409 reject, or a hedge we never opened) created nothing -> not burnt.
+/// (`xarb-{salt}-{slug}-{idx}-{tag}`)? True iff ANY ack leg REACHED a venue under that coid: an `Ok` with a
+/// non-empty `venue_order_id` (FILLED / RESTED / filled-then-recovered) OR an `Err(Rejected)` (the venue SAW
+/// the coid and rejected it). BOTH burn the coid — both venues dedup on client_order_id PERMANENTLY, and a
+/// FOK-REJECTED order (`fill_or_kill_insufficient_resting_volume`, which carries NO `venue_order_id`) still
+/// makes a reuse `409 order_already_exists`. So the per-slug index MUST advance past it even though the pair
+/// did NOT lock. Two live incidents: the tiplem-zozkar case (Kalshi filled @30c then recovered) is the
+/// `Ok`-with-id arm; the 2026-06-15 evening mdwhigh case (fire #1 FOK-rejected, index stayed 0, fire #2 reused
+/// the coid -> dedup-409 -> false halt) is the `Err(Rejected)` arm that `fc6a51d` missed. NOT burnt:
+/// `HedgeNotFilled` (never sent) or a transport/RateLimited `Err` (which HALTS anyway — and a restart's fresh
+/// `run_salt` avoids any cross-run reuse).
 fn entry_landed_order(ack: &exec::PairAck) -> bool {
-    [&ack.a, &ack.b].iter().any(|r| matches!(r, Ok(a) if !a.venue_order_id.is_empty()))
+    [&ack.a, &ack.b].iter().any(|r| match r {
+        Ok(a) => !a.venue_order_id.is_empty(),
+        Err(exec::ExecError::Rejected(_)) => true,
+        _ => false,
+    })
 }
 
 /// Is this `Err` a DEFINITE not-filled venue REJECTION — the order was unambiguously rejected/killed and
@@ -615,7 +621,7 @@ pub(crate) fn recover_naked_leg(
             price_cents: exit,
             qty: filled_qty.ceil().max(1.0) as u32,
             frac_qty: Some(filled_qty),
-            client_order_id: format!("recover-{slug}-{filled_idx}"),
+            client_order_id: format!("recover-{}-{slug}-{filled_idx}", crate::exec::run_salt()),
         });
     }
 
@@ -1081,7 +1087,14 @@ mod tests {
             a: Err(exec::ExecError::HedgeNotFilled),
             b: Ok(exec::Ack { client_order_id: "xarb-s-0-B".into(), venue_order_id: "".into(), filled: false, fill_qty: 0.0, simulated: false }),
         };
-        assert!(!entry_landed_order(&nothing), "an empty venue_order_id (rejected, nothing created) did NOT burn the coid");
+        assert!(!entry_landed_order(&nothing), "a never-opened hedge (HedgeNotFilled) + an empty-id Ok did NOT burn the coid");
+        // a FOK-REJECTED leg carries NO venue_order_id, but the venue SAW the coid and dedups it -> burnt. The
+        // 2026-06-15 evening mdwhigh case fc6a51d missed: fire #1 fill_or_kill_insufficient -> index must advance.
+        let fok_rejected = exec::PairAck {
+            a: Err(exec::ExecError::Rejected("409 fill_or_kill_insufficient_resting_volume".into())),
+            b: Err(exec::ExecError::HedgeNotFilled),
+        };
+        assert!(entry_landed_order(&fok_rejected), "a submitted-then-FOK-rejected leg burns the coid -> the index MUST advance");
     }
 
     /// COID-BURN INDEX ADVANCE (the 2026-06-15 tiplem-zozkar incident, end-to-end): a fire that FILLS one leg

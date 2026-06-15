@@ -118,7 +118,7 @@ pub(crate) fn build_legs(pair: &LivePair, q: &Quote, dir: Dir, size: u32, pos_in
             frac_qty: None, // entries are whole-share; only a partial-fill recovery SELL sets a fractional qty
             // unique-per-position (pos_index), deterministic-per-(position,leg) so a within-fire retry reuses
             // it (dedup prevents a double-fill) but an add gets a fresh idx (no collision with the held coid).
-            client_order_id: format!("xarb-{}-{}-{}", pair.slug, pos_index, leg.tag),
+            client_order_id: format!("xarb-{}-{}-{}-{}", crate::exec::run_salt(), pair.slug, pos_index, leg.tag),
         });
     }
     Some([out.remove(0), out.remove(0)])
@@ -374,11 +374,13 @@ mod tests {
         let (pair, q) = (wx_pair(), q_pk());
         let initial = build_legs(&pair, &q, Dir::PK, 1, 0).unwrap();
         let first_add = build_legs(&pair, &q, Dir::PK, 1, 1).unwrap();
-        // the default single-position path is `xarb-{slug}-0-{tag}` (only delta from the old `-{tag}` is `-0-`).
-        assert_eq!(initial[0].client_order_id, format!("xarb-{}-0-A", pair.slug));
-        assert_eq!(initial[1].client_order_id, format!("xarb-{}-0-B", pair.slug));
+        // the default single-position path is `xarb-{salt}-{slug}-0-{tag}` (the `run_salt()` segment makes the
+        // coid unique across runs; the `-0-` index segment makes it unique across positions within a run).
+        let salt = crate::exec::run_salt();
+        assert_eq!(initial[0].client_order_id, format!("xarb-{}-{}-0-A", salt, pair.slug));
+        assert_eq!(initial[1].client_order_id, format!("xarb-{}-{}-0-B", salt, pair.slug));
         // the 1st ADD (idx 1) gets DISTINCT coids per leg -> no dedup collision with the held idx-0 position.
-        assert_eq!(first_add[0].client_order_id, format!("xarb-{}-1-A", pair.slug));
+        assert_eq!(first_add[0].client_order_id, format!("xarb-{}-{}-1-A", salt, pair.slug));
         assert_ne!(initial[0].client_order_id, first_add[0].client_order_id, "initial vs add: DISTINCT coids");
         assert_ne!(initial[1].client_order_id, first_add[1].client_order_id, "both legs differ across positions");
         // a RE-FIRE at the SAME index (a within-fire retry that didn't lock -> the held count is unchanged)

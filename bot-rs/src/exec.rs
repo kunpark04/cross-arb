@@ -56,6 +56,32 @@ pub enum ExecError {
     HedgeNotFilled,
 }
 
+/// A per-PROCESS coid salt, set once at first use. Venues dedup on `client_order_id` PERMANENTLY, but the
+/// in-memory per-slug coid index resets every run — so without a per-run salt a RESTART reuses `xarb-{slug}-0`
+/// coids already burnt at a venue in a PRIOR run -> `409 order_already_exists` -> a false fail-close halt on
+/// the first re-fire (the 2026-06-15 evening mdwhigh incident, after the within-run index advanced). The salt
+/// is constant within a run (stable for within-fire retries) and unique across runs. Overridable via
+/// `CROSSARB_RUN_ID` for reproducibility; defaults to hex epoch-seconds. Fixed `"t"` under `cargo test`.
+pub fn run_salt() -> &'static str {
+    static SALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| {
+        if cfg!(test) {
+            return "t".to_string();
+        }
+        if let Ok(id) = std::env::var("CROSSARB_RUN_ID") {
+            if !id.is_empty() {
+                return id;
+            }
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{secs:x}")
+    })
+    .as_str()
+}
+
 /// What `cancel` needs to reach the right venue endpoint for a resting order: the venue, its
 /// exchange-assigned order id (persisted from the ack), and — for pmus — the market slug its cancel body
 /// requires. Kalshi cancels by order id in the URL path; pmus needs `{marketSlug}` in the body.
