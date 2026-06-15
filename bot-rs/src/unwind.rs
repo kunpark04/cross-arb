@@ -47,7 +47,7 @@ pub fn unwind_orders(pos: &Position, exit_cents: [u8; 2]) -> [OrderIntent; 2] {
             price_cents: exit_cents[i],
             qty: pos.size,
             frac_qty: None, // a held both-filled position is whole-share; the postpone-unwind sells the full size
-            client_order_id: format!("unwind-{}-{}", pos.market, i),
+            client_order_id: format!("unwind-{}-{}-{}", crate::exec::run_salt(), pos.market, i),
         }
     })
 }

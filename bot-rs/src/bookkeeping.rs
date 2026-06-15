@@ -399,6 +399,13 @@ pub(crate) fn is_definite_not_filled(e: &exec::ExecError) -> bool {
             if lower.starts_with("transport:") || lower.contains("panicked") {
                 return false;
             }
+            // an INTERNAL gate rejection (the pmus live leg / cancel gated behind PMUS_POST_SIGNING_VERIFIED,
+            // exec.rs:549/717) was NEVER sent to a venue -> DEFINITELY not filled (the most definite no-fill
+            // there is). A forgotten arming flag must be a CLEAN abort/recovery, not a kill-switch halt (the
+            // 2026-06-15 evening incident). Specific to our own message — no venue rejection says "gated".
+            if lower.contains("gated") {
+                return true;
+            }
             // a dedup/conflict (the deterministic-coid collision a scale-in/re-entry add provokes) is NOT a
             // no-fill — the existing order it conflicts with may have FILLED. Ambiguous regardless of status.
             if lower.contains("already exists") || lower.contains("duplicate") || lower.contains("conflict") {
@@ -2172,5 +2179,9 @@ mod tests {
         assert!(!is_definite_not_filled(&TransportNotWired));
         // a bare 2xx (shouldn't occur in an Err, defensive) is NOT a 4xx/5xx and names no rejection -> false.
         assert!(!is_definite_not_filled(&Rejected("200 ok".into())));
+        // an INTERNAL gate rejection (never sent to a venue) is the MOST definite no-fill -> true (a forgotten
+        // PMUS_POST_SIGNING_VERIFIED must be a clean abort/recovery, not a halt — the 2026-06-15 evening incident).
+        assert!(is_definite_not_filled(&Rejected("pmus live leg gated — set PMUS_POST_SIGNING_VERIFIED=yes to arm".into())));
+        assert!(is_definite_not_filled(&Rejected("pmus cancel gated — set PMUS_POST_SIGNING_VERIFIED=yes to arm".into())));
     }
 }

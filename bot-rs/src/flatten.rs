@@ -85,7 +85,7 @@ pub fn build_flatten_sell(req: &FlattenReq, book: &Book) -> Option<OrderIntent> 
         price_cents,
         qty: req.qty,
         frac_qty: None, // a whole-contract operator flatten (the partial-fill recovery is the only fractional path)
-        client_order_id: format!("flatten-{}-{}-{}", venue_tag(req.venue), req.market, side_tag(req.side)),
+        client_order_id: format!("flatten-{}-{}-{}-{}", crate::exec::run_salt(), venue_tag(req.venue), req.market, side_tag(req.side)),
     })
 }
 
