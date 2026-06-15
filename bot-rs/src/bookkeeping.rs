@@ -633,6 +633,7 @@ pub(crate) fn spawn_submit(
     cost_per: f64,
     entry_net: f64,
     entry_dir: Dir,
+    fire_pmus_first: bool,
 ) {
     let backend = backend.clone();
     let outcome_tx = outcome_tx.clone();
@@ -643,7 +644,7 @@ pub(crate) fn spawn_submit(
         // otherwise the slug stays stuck in pending_entries/flattening forever (never re-tradeable / never
         // re-flattenable). A panic maps to a failed pair, so the outcome arm releases the reservation + slug.
         let ack = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            backend.submit_pair(&legs[0], &legs[1])
+            backend.submit_pair(&legs[0], &legs[1], fire_pmus_first)
         }))
         .unwrap_or_else(|_| {
             eprintln!("[live] CRITICAL submit task panicked for {slug} — reporting a failed pair (slug released)");
@@ -756,7 +757,7 @@ pub(crate) fn spawn_unwind(
     flattening.insert(slug.to_string(), FlatKind::Unwind);
     // carry the front leg's pos + cost_per so the outcome arm subtracts EXACTLY this leg (defensive; the arm
     // pops the front and uses the popped leg's OWN stored cost_per — the exact-release guarantee).
-    spawn_submit(backend, outcome_tx, SubmitKind::Unwind, slug.to_string(), orders, Some(front.pos), None, front.cost_per, 0.0, Dir::PK);
+    spawn_submit(backend, outcome_tx, SubmitKind::Unwind, slug.to_string(), orders, Some(front.pos), None, front.cost_per, 0.0, Dir::PK, true); // unwind flatten: pmus-first default
 }
 
 #[cfg(test)]
@@ -1034,8 +1035,8 @@ mod tests {
         submitted: std::sync::Mutex<Vec<OrderIntent>>,
     }
     impl ExecutionBackend for RecordingBackend {
-        fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> exec::PairAck {
-            exec::DryRunBackend.submit_pair(a, b)
+        fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent, fire_pmus_first: bool) -> exec::PairAck {
+            exec::DryRunBackend.submit_pair(a, b, fire_pmus_first)
         }
         fn submit(&self, intent: &OrderIntent) -> Result<exec::Ack, exec::ExecError> {
             self.submitted.lock().unwrap().push(intent.clone());

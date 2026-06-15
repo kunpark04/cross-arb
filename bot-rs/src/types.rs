@@ -116,6 +116,10 @@ pub struct Quote {
     /// Feeds the event-proximity entry gate — don't lock capital long before the event settles.
     /// `None` = unknown -> gate dormant. Stage-2 computes it from the event date in the market key.
     pub days_to_event: Option<f64>,
+    /// DYNAMIC ORDER (2026-06-15): fire the pmus leg FIRST iff it is the thinner (less ask-volume) leg —
+    /// else fire the Kalshi leg first so a thin-Kalshi FOK-reject is a clean abort, not a committed-then-naked
+    /// pmus leg (the 4 live Kalshi-409 fails). Computed at the signal from the per-leg ask ladders.
+    pub fire_pmus_first: bool,
 }
 
 /// A priced cross-venue edge, net of fees, per `$1` of payout.

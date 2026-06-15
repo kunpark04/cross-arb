@@ -14,6 +14,7 @@ pub(crate) fn q_pk() -> Quote {
         cluster: "nychigh-2026-06-11".into(),
         led_by: None,
         days_to_event: None,
+        fire_pmus_first: true,
     }
 }
 pub(crate) fn wx_pair() -> LivePair {

@@ -230,19 +230,26 @@ pub fn evaluate(
         return Err(Reject::BelowEdgeRateFloor(edge_rate));
     }
 
-    // 4a-bis. RECOVERY-COST gate (decision 0020). Under pmus-first execution the only residual naked case is
-    //     "pmus filled, Kalshi then failed" -> unwind the pmus leg -> cost ≈ its bid↔ask spread (side-invariant:
-    //     yes_ask − yes_bid). If that spread exceeds the edge, the rare-but-real naked tail dwarfs the win (the
-    //     first live arb's recovery ~9¢ on a thin book was ~2× its 4.8¢ edge). Skip such arbs. Gated only when
-    //     max_recovery_spread_ratio > 0 (prod default 1.0; test default 0 = OFF -> zero behavior change). The
-    //     KALSHI spread is deliberately NOT gated — under pmus-first the Kalshi leg locks and is held to
-    //     settlement, never unwound. A one-sided pmus book never reaches a fire (build_legs returns None), so
-    //     the missing-side case stays dormant here.
+    // 4a-bis. RECOVERY-COST gate (decision 0020, extended for the dynamic order 2026-06-15). The residual naked
+    //     case is "the FIRST-fired leg filled, the SECOND then FOK-missed" -> unwind the FIRST leg -> cost ≈ its
+    //     bid↔ask spread (side-invariant: yes_ask − yes_bid). If that spread exceeds the edge, the rare-but-real
+    //     naked tail dwarfs the win (the first live arb's recovery ~9¢ was ~2× its 4.8¢ edge). The first leg is
+    //     the THINNER one: pmus when fire_pmus_first, else the KALSHI leg — and the dynamic order routes to
+    //     Kalshi-first precisely when the Kalshi book is THIN (the case its spread is most likely WIDE), so the
+    //     Kalshi spread MUST be gated too now (it isn't "held to settlement, never unwound" anymore). Use that
+    //     leg's OWN book (Kalshi-B for a sports PK, else the single/Kalshi-A). Gated only when
+    //     max_recovery_spread_ratio > 0 (prod default 1.0; test default 0 = OFF -> zero behavior change).
     if cfg.max_recovery_spread_ratio > 0.0 {
-        if let (Some(bid), Some(ask)) = (q.pm.yes_bid, q.pm.yes_ask) {
-            let pmus_spread_cents = (ask - bid) * 100.0;
-            if pmus_spread_cents > cfg.max_recovery_spread_ratio * edge.net * 100.0 {
-                return Err(Reject::RecoveryCostExceedsEdge(pmus_spread_cents));
+        let (bid, ask) = if q.fire_pmus_first {
+            (q.pm.yes_bid, q.pm.yes_ask)
+        } else {
+            let kbk = if edge.dir == Dir::PK { q.k_b.as_ref().unwrap_or(&q.k) } else { &q.k };
+            (kbk.yes_bid, kbk.yes_ask)
+        };
+        if let (Some(bid), Some(ask)) = (bid, ask) {
+            let spread_cents = (ask - bid) * 100.0;
+            if spread_cents > cfg.max_recovery_spread_ratio * edge.net * 100.0 {
+                return Err(Reject::RecoveryCostExceedsEdge(spread_cents));
             }
         }
     }
@@ -367,6 +374,7 @@ mod tests {
             cluster: "nychigh-2026-06-11".into(),
             led_by: None,        // unknown until stage-2 tracks the prior book snapshot
             days_to_event: None, // ~now for weather
+            fire_pmus_first: true,
         }
     }
     fn edge() -> Edge {
@@ -397,6 +405,26 @@ mod tests {
         // gate OFF (ratio 0, the test default) -> the same wide spread passes -> zero behavior change
         c.max_recovery_spread_ratio = 0.0;
         assert!(evaluate(&c, &wide, &edge(), &Exposure::new(), 1000).is_ok(), "ratio 0 disables the gate");
+    }
+
+    /// DYNAMIC ORDER (review WARN-2 fix): the recovery-cost gate now prices the FIRST-fired/thinner leg. Under
+    /// Kalshi-first (fire_pmus_first=false — a thin-Kalshi book), a WIDE KALSHI spread is the naked-unwind cost
+    /// and is now GATED (previously un-gated); under pmus-first the SAME wide Kalshi spread is ignored.
+    #[test]
+    fn recovery_cost_gate_prices_the_kalshi_leg_under_kalshi_first() {
+        let mut c = cfg();
+        c.max_recovery_spread_ratio = 1.0;
+        let mut q = quote();
+        q.fire_pmus_first = false; // a thin-Kalshi book routes to Kalshi-first
+        q.k = Book { yes_bid: Some(0.40), yes_ask: Some(0.75), age_s: 0.1 }; // 35c Kalshi spread (the naked-leg cost)
+        q.pm = Book { yes_bid: Some(0.50), yes_ask: Some(0.51), age_s: 0.1 }; // tight pmus (ignored under Kalshi-first)
+        match evaluate(&c, &q, &edge(), &Exposure::new(), 1000) {
+            Err(Reject::RecoveryCostExceedsEdge(s)) => assert!((s - 35.0).abs() < 1e-6, "gates the KALSHI spread¢, got {s}"),
+            other => panic!("expected RecoveryCostExceedsEdge on the wide Kalshi leg, got {other:?}"),
+        }
+        // under pmus-first (fire_pmus_first=true) the gate prices the (tight) pmus leg -> the same wide Kalshi passes.
+        q.fire_pmus_first = true;
+        assert!(evaluate(&c, &q, &edge(), &Exposure::new(), 1000).is_ok(), "pmus-first prices the tight pmus leg, ignores the wide Kalshi spread");
     }
 
     #[test]

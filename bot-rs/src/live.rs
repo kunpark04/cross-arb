@@ -325,7 +325,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
         };
         // SPORTS (kalshi_b.is_some()) is 2-outcome: read pmus + Kalshi-A + Kalshi-B (ALL required) and use
         // the game signal/depth. Weather/econ is 1:1: pmus + the single Kalshi book + the binary signal.
-        let (k, k_b, depth_dir, edge) = {
+        let (k, k_b, depth_dir, edge, fp_first) = {
             let kb = lock(&kalshi_books);
             let Some(ka_book) = kb.get(&pair.kalshi) else { continue }; // no Kalshi-A book yet -> incomplete
             let k = ka_book.touch();
@@ -335,12 +335,14 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                     let Some(kb_book) = kb.get(tb) else { continue }; // no Kalshi-B book yet -> incomplete
                     let sig = signal::game_signal(pm.yes_bid, pm.yes_ask, k.yes_ask, kb_book.touch().yes_ask);
                     let depth = book::game_depth_at_edge(pmb, ka_book, kb_book, sig.edge.dir);
-                    (k, Some(kb_book.touch()), depth, sig.edge)
+                    let fp = book::fire_pmus_first_game(pmb, ka_book, kb_book, sig.edge.dir);
+                    (k, Some(kb_book.touch()), depth, sig.edge, fp)
                 }
                 None => {
                     let sig = signal::signal(&pm, &k);
                     let depth = book::depth_at_edge(ka_book, pmb, sig.edge.dir);
-                    (k, None, depth, sig.edge)
+                    let fp = book::fire_pmus_first(ka_book, pmb, sig.edge.dir);
+                    (k, None, depth, sig.edge, fp)
                 }
             }
         };
@@ -359,6 +361,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             cluster: pair.cluster.clone(),
             led_by,
             days_to_event: pair.days_to_event,
+            fire_pmus_first: fp_first,
         };
 
         // SCALE-IN/RE-ENTRY proxy bookkeeping (design §3): is a same-direction positive edge present on this
@@ -443,7 +446,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 // 0020 follow-up: under pmus-first the Kalshi leg fires SECOND (after the pmus block) and a
                 // passive limit MISSES when the price ticked during the wait (most edges are sub-second). Pay
                 // up to the edge SURPLUS (capped, never below the floor) so it still locks; it re-checks the floor.
-                let markup_c = if cfg.aggressive_second_leg { apply_second_leg_markup(cfg, &mut legs) } else { 0 };
+                let markup_c = if cfg.aggressive_second_leg { apply_second_leg_markup(cfg, &mut legs, quote.fire_pmus_first) } else { 0 };
                 // Record the velocity metric on the live order path (the owner calibrates MIN_EDGE_RATE_CPD
                 // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day). An
                 // ADD additionally logs its scale-in|re-entry tag + the base vs add net so an armed add is
@@ -473,7 +476,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 pending_entries.insert(slug.clone());
                 // deref-clone the shared `Arc<LivePair>` into the owned `LivePair` the outcome carries (only on
                 // the rare approved-fire path, never per frame); the poll reads its league/date/abbrevs later.
-                spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir);
+                spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir, quote.fire_pmus_first);
                 cooldown.insert(slug.clone(), std::time::Instant::now()); // 2026-06-15: start the per-slug entry cooldown at the fire
                 entries_fired += 1;
                 if max_entries == Some(entries_fired) {

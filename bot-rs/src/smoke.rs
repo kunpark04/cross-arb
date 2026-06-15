@@ -10,7 +10,7 @@ use crate::{postpone, unwind};
 /// wrapper kept for the OFFLINE smoke path (synchronous, no spawn); the live loop SPAWNS `submit_pair` off
 /// an `Arc<backend>` so the network RTT never blocks its `select!` (see `spawn_submit`).
 fn fire_legs(backend: &dyn ExecutionBackend, legs: &[OrderIntent; 2]) {
-    let _ = backend.submit_pair(&legs[0], &legs[1]);
+    let _ = backend.submit_pair(&legs[0], &legs[1], true); // smoke: dry-run, pmus-first default
 }
 
 /// Stage-1 smoke: prove the risk+exec spine behaves on real-shaped snapshots (weather/econ/sports).
@@ -35,6 +35,7 @@ pub(crate) fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
         cluster: "u3-2026-07-02".into(),
         led_by: None,
         days_to_event: None,
+        fire_pmus_first: true,
     };
     println!("[smoke] econ U-3 9c gap, settlement NOT yet verified:");
     report(cfg, &econ_pair, &econ, Edge { net: 0.09, dir: Dir::PK }, backend);
@@ -52,6 +53,7 @@ pub(crate) fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
         cluster: "nychigh-2026-06-11".into(),
         led_by: Some(Venue::Pmus), // cheap venue (dir PK) led -> benign
         days_to_event: None,
+        fire_pmus_first: true,
     };
     println!("[smoke] weather arb, verified, 3c edge, cheap-led (benign):");
     report(cfg, &wx_pair, &wx, Edge { net: 0.03, dir: Dir::PK }, backend);
@@ -89,6 +91,7 @@ pub(crate) fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
         cluster: "mlb-2026-06-16".into(),
         led_by: None,
         days_to_event: Some(5.0),
+        fire_pmus_first: true,
     };
     println!("[smoke] sports arb (assumed-settled), 5 days pre-game -> event-proximity gate:");
     report(&sc, &sport_pair, &sport, Edge { net: 0.03, dir: Dir::PK }, backend);
@@ -127,6 +130,7 @@ pub(crate) fn smoke(cfg: &Config, backend: &dyn ExecutionBackend) {
         cluster: wc_pair.cluster.clone(),
         led_by: None,
         days_to_event: Some(1.0),
+        fire_pmus_first: true,
     };
     println!("[smoke] world-cup outcome arb (BINARY: pmus YES + Kalshi NO on one outcome), 1 day pre-game:");
     report(&sc, &wc_pair, &wc, Edge { net: 0.03, dir: Dir::PK }, backend);
@@ -179,7 +183,7 @@ fn report(cfg: &Config, pair: &LivePair, q: &Quote, edge: Edge, backend: &dyn Ex
                 Some(mut legs) => {
                     // mirror the live loop: pay up the SECOND (Kalshi) leg by the capped edge surplus (0020).
                     if cfg.aggressive_second_leg {
-                        apply_second_leg_markup(cfg, &mut legs);
+                        apply_second_leg_markup(cfg, &mut legs, true); // smoke: pmus-first default
                     }
                     fire_legs(backend, &legs);
                 }

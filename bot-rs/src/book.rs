@@ -283,6 +283,34 @@ pub fn game_depth_at_edge(pm: &PmusBook, ka: &KalshiBook, kb: &KalshiBook, dir: 
     depth_curve(&a, &b)
 }
 
+/// Sum of resting ask-volume on a (price, qty) ladder — one leg's gross fillability.
+fn ladder_qty(l: &[(f64, f64)]) -> f64 {
+    l.iter().map(|(_, q)| q).sum()
+}
+
+/// DYNAMIC ORDER (2026-06-15): should the pmus leg fire FIRST? Fire the THINNER (less ask-volume) leg first
+/// so its FOK-reject is a clean abort, never a committed-then-naked leg. Reuses [`depth_at_edge`]'s per-leg
+/// ask ladders (the same YES/NO + dir transform); returns `true` (pmus first — the [0020] default, pmus
+/// usually the thinner one) iff the pmus leg has `<=` the Kalshi leg's ask-volume, and `false` (Kalshi first)
+/// when the Kalshi book is the thinner one (the 4 live Kalshi-409 fails: pietai/laxhigh/sly-gal). Ties + an
+/// empty book default to pmus-first.
+pub fn fire_pmus_first(k: &KalshiBook, pm: &PmusBook, dir: Dir) -> bool {
+    let (pmus, kalshi) = match dir {
+        Dir::PK => (pm.yes_ask_ladder(), no_ask_ladder(&k.yes_bid_ladder())),
+        Dir::KP => (no_ask_ladder(&pm.yes_bid_ladder()), k.yes_ask_ladder()),
+    };
+    ladder_qty(&pmus) <= ladder_qty(&kalshi)
+}
+
+/// SPORTS (2-outcome) variant of [`fire_pmus_first`] — the per-leg ask ladders of [`game_depth_at_edge`].
+pub fn fire_pmus_first_game(pm: &PmusBook, ka: &KalshiBook, kb: &KalshiBook, dir: Dir) -> bool {
+    let (pmus, kalshi) = match dir {
+        Dir::PK => (pm.yes_ask_ladder(), kb.yes_ask_ladder()),
+        Dir::KP => (no_ask_ladder(&pm.yes_bid_ladder()), ka.yes_ask_ladder()),
+    };
+    ladder_qty(&pmus) <= ladder_qty(&kalshi)
+}
+
 /// The cheap venue's YES-ask ladder for a direction, exposed for sizing/leg-sequencing in stage-2.
 pub fn cheap_yes_ask_ladder(k: &KalshiBook, pm: &PmusBook, dir: Dir) -> Vec<(f64, f64)> {
     match dir.cheap_venue() {
@@ -412,6 +440,35 @@ mod tests {
         assert_eq!((d2.c2, d2.c1, d2.c0), (12, 12, 12));
     }
 
+    /// DYNAMIC ORDER (the fire-thinner-leg-first decision): fire pmus first when it is thinner-or-equal (the
+    /// 0020 default), fire KALSHI first when the Kalshi book is the thin one (the live 409-fail class:
+    /// pietai/laxhigh/sly-gal). Uses the SAME per-leg ask ladders `depth_at_edge` does, so the YES/NO + dir
+    /// transform stays consistent.
+    #[test]
+    fn fire_pmus_first_picks_the_thinner_leg() {
+        // BINARY PK: pmus YES-ask thin (5), Kalshi NO-ask (from a deep YES-bid) deep (50) -> pmus first.
+        let mut pm = PmusBook::new();
+        pm.apply_snapshot(&[], &[(0.59, 5.0)]); // pmus YES ask .59 @5 (thin)
+        let mut k = KalshiBook::new();
+        k.apply_snapshot(&[(0.68, 50.0)], &[]); // Kalshi YES bid .68 @50 -> NO ask deep
+        assert!(fire_pmus_first(&k, &pm, Dir::PK), "pmus thinner -> pmus first (the 0020 default)");
+
+        // flip the thinness: pmus YES-ask deep (50), Kalshi NO-ask thin (1) -> KALSHI first (the 409 fix).
+        let mut pm2 = PmusBook::new();
+        pm2.apply_snapshot(&[], &[(0.59, 50.0)]);
+        let mut k2 = KalshiBook::new();
+        k2.apply_snapshot(&[(0.68, 1.0)], &[]); // Kalshi YES bid @1 -> NO ask thin
+        assert!(!fire_pmus_first(&k2, &pm2, Dir::PK), "thin Kalshi book -> Kalshi first (clean abort, no naked pmus)");
+
+        // SPORTS PK: pmus YES-ask deep (30) vs Kalshi-B YES-ask thin (2) -> Kalshi first.
+        let mut pm3 = PmusBook::new();
+        pm3.apply_snapshot(&[], &[(0.50, 30.0)]);
+        let ka = KalshiBook::new();
+        let mut kb = KalshiBook::new();
+        kb.apply_snapshot(&[], &[(0.44, 2.0)]); // Kalshi-B YES ask @2 (thin)
+        assert!(!fire_pmus_first_game(&pm3, &ka, &kb, Dir::PK), "sports: thin Kalshi-B -> Kalshi first");
+    }
+
     /// Best is O(1) via map ends, not a scan; a deeper book doesn't change the touch.
     #[test]
     fn deep_book_best_is_top_of_book() {
@@ -460,6 +517,7 @@ mod tests {
             cluster: "nychigh-2026-06-11".into(),
             led_by: None,
             days_to_event: None,
+            fire_pmus_first: true,
         };
         assert!(q.pm.age_s > 5.0 && q.k.age_s < 1.0);
         let cfg = crate::config::Config::test_default();

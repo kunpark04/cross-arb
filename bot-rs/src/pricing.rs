@@ -243,10 +243,14 @@ fn realized_surplus_cents(cfg: &Config, legs: &[OrderIntent; 2]) -> u8 {
 /// Re-checks the floor after the bump (fees shift at the new price) and REVERTS if it would not clear.
 /// Returns the markup (cents) actually applied to the Kalshi leg — 0 if none (thin arb / no Kalshi leg /
 /// reverted) — so the live path can LOG the pay-up per fire (instrumentation: is the pay-up helping?).
-pub(crate) fn apply_second_leg_markup(cfg: &Config, legs: &mut [OrderIntent; 2]) -> u8 {
-    // the SECOND-fired leg is the Kalshi one (pmus-first fires pmus, then Kalshi). Mark up that BUY only.
-    let Some(i) = legs.iter().position(|l| l.venue == Venue::Kalshi) else {
-        return 0; // no Kalshi leg (never for a cross-venue arb) -> nothing to do
+pub(crate) fn apply_second_leg_markup(cfg: &Config, legs: &mut [OrderIntent; 2], fire_pmus_first: bool) -> u8 {
+    // Mark up the SECOND-fired leg's BUY only (the racing leg — the first leg already committed; the second is
+    // the one that can miss on the serial delay). Under the dynamic order the second leg is Kalshi (pmus-first)
+    // or pmus (Kalshi-first — a thin-Kalshi book); the FIRST/clean-abort leg stays passive so it isn't
+    // over-aggressed into a needless commit-then-recover.
+    let second_venue = if fire_pmus_first { Venue::Kalshi } else { Venue::Pmus };
+    let Some(i) = legs.iter().position(|l| l.venue == second_venue) else {
+        return 0; // no such leg (never for a cross-venue arb) -> nothing to do
     };
     let markup = realized_surplus_cents(cfg, legs);
     if markup == 0 {
@@ -408,6 +412,7 @@ mod tests {
             cluster: pair.cluster.clone(),
             led_by: None,
             days_to_event: Some(1.0),
+            fire_pmus_first: true,
         };
         // PK legs = YES@pmus(slug) @ 42c + NO@Kalshi(ticker) @ (1-0.45)=55c — the weather/econ 1:1 shape.
         let pk = build_legs(&pair, &q, Dir::PK, 1, 0).unwrap();
@@ -452,6 +457,7 @@ mod tests {
             cluster: "mlb-2026-06-16".into(),
             led_by: None,
             days_to_event: Some(1.0),
+            fire_pmus_first: true,
         };
         // PK: leg A = YES@pmus(slug) @ pm_ask 55c; leg B = YES@Kalshi-B(PIT ticker) @ kB_ask 42c.
         let pk = build_legs(&pair, &q, Dir::PK, 3, 0).unwrap();
@@ -609,7 +615,7 @@ mod tests {
 
         // FAT arb (30 + 30 = 60c, ~40c gross) -> surplus far exceeds the 5c cap -> Kalshi pays up by 5c.
         let mut fat = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
-        assert_eq!(apply_second_leg_markup(&cfg, &mut fat), 5, "returns the 5c markup actually applied");
+        assert_eq!(apply_second_leg_markup(&cfg, &mut fat, true), 5, "pmus-first: returns the 5c markup on the Kalshi (second) leg");
         assert_eq!(fat[0].price_cents, 30, "the pmus (first) leg is NEVER marked up");
         assert_eq!(fat[1].price_cents, 35, "the Kalshi (second) leg pays up by the 5c cap");
         assert!(realized_edge_clears_floor(&cfg, &fat), "the bumped pair still clears the floor");
@@ -617,8 +623,21 @@ mod tests {
         // NO surplus above the floor (raise it so the same arb has no room) -> NO pay-up.
         cfg.edge_floor_cents = 50.0;
         let mut none = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
-        assert_eq!(apply_second_leg_markup(&cfg, &mut none), 0, "no surplus -> returns 0 markup");
+        assert_eq!(apply_second_leg_markup(&cfg, &mut none, true), 0, "no surplus -> returns 0 markup");
         assert_eq!(none[1].price_cents, 30, "no surplus above the floor -> no pay-up (cheap recovery instead)");
+    }
+
+    /// DYNAMIC ORDER: under Kalshi-first (fire_pmus_first=false — a thin-Kalshi book), the markup must target
+    /// the pmus (now the SECOND/racing) leg, NOT the Kalshi (now FIRST/clean-abort) leg — the wrong-leg-markup
+    /// fix. Otherwise the markup would over-aggress the leg whose FOK-reject is supposed to be a clean abort.
+    #[test]
+    fn second_leg_markup_targets_pmus_under_kalshi_first() {
+        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, frac_qty: None, client_order_id: "x".into() };
+        let cfg = crate::config::Config::test_default();
+        let mut fat = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
+        assert_eq!(apply_second_leg_markup(&cfg, &mut fat, false), 5, "kalshi-first: 5c markup on the pmus (second-fired) leg");
+        assert_eq!(fat[0].price_cents, 35, "the pmus (second-fired under Kalshi-first) leg pays up by 5c");
+        assert_eq!(fat[1].price_cents, 30, "the Kalshi (FIRST-fired) leg stays passive — not over-aggressed");
     }
 
     /// W4: `affordable` subtracts already-open `exposure.total` from the total-notional cap (the bankroll

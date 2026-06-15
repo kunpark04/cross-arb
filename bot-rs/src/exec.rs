@@ -96,7 +96,7 @@ pub trait ExecutionBackend: Send + Sync {
     /// connections (stage-2, `tokio::join!`); the dry-run backend logs both. This pair-shaped signature
     /// exists NOW so stage-2 can't accidentally harden a serial single-leg path — it's the single
     /// highest-leverage latency item from the rust review, and the only latency lever the code controls.
-    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck;
+    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent, fire_pmus_first: bool) -> PairAck;
     /// Fire ONE leg on its own. The pair is the normal unit (`submit_pair`); this single-leg primitive
     /// exists for the NAKED-LEG RECOVERY (`main::recover_naked_leg`): when only one entry leg filled, the
     /// other is cancelled and the filled leg is FLATTENED with a single marketable SELL — there is no second
@@ -131,8 +131,8 @@ impl DryRunBackend {
 }
 
 impl ExecutionBackend for DryRunBackend {
-    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
-        // both legs logged together — mirrors the concurrent live fire.
+    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent, _fire_pmus_first: bool) -> PairAck {
+        // both legs logged together — mirrors the concurrent live fire. (Order is irrelevant in dry-run.)
         PairAck {
             a: self.log_leg(a),
             b: self.log_leg(b),
@@ -321,6 +321,18 @@ fn is_full_fill(fill_qty: f64, frac_qty: Option<f64>, venue_full_fill: bool) -> 
     match frac_qty {
         Some(frac) => fill_qty + 1e-9 >= frac,
         None => venue_full_fill,
+    }
+}
+
+/// DYNAMIC ORDER: should leg `a` (slot a) fire FIRST? Fire the THINNER leg's slot first. `fire_pmus_first`
+/// (per-leg ask-volume, decided at the signal) says pmus-first or Kalshi-first; `a_is_pmus` says which slot
+/// holds the pmus leg (slot-a's venue varies by direction). Pure so the live serial-fire ORDER — including
+/// the brand-new Kalshi-first branch — is unit-tested, not just verified by inspection (the cardinal-sin path).
+fn fire_a_first(fire_pmus_first: bool, a_is_pmus: bool) -> bool {
+    if fire_pmus_first {
+        a_is_pmus
+    } else {
+        !a_is_pmus
     }
 }
 
@@ -618,14 +630,17 @@ impl LiveBackend {
     /// Kalshi filled @86¢, pmus never filled (1.5s block), and flattening the naked Kalshi leg cost ~9¢ on a
     /// thin book. Latency is network-bound regardless; the forgone fast-evaporating edges were phantom (the
     /// hedge wasn't executable). [L33]
-    fn run_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
-        // identify the pmus (blocking) leg; fire it first, open the OTHER leg only if it FILLED. A real arb
-        // always has exactly one pmus + one Kalshi leg; if neither is pmus (never, defensively), b-first
-        // serial is still naked-leg-free.
-        let a_is_pmus = a.venue == Venue::Pmus;
+    fn run_pair(&self, a: &OrderIntent, b: &OrderIntent, fire_pmus_first: bool) -> PairAck {
+        // DYNAMIC ORDER (2026-06-15): fire the THINNER leg FIRST, open the OTHER leg only if it FILLED, so the
+        // thinner leg's FOK-reject is a CLEAN abort (the deeper second leg is never sent — `HedgeNotFilled`),
+        // never a committed-then-naked leg. `fire_pmus_first` (per-leg ask-volume, decided at the signal)
+        // picks pmus-first (the 0020 default — pmus usually thinner) or Kalshi-first (a thin-Kalshi book — the
+        // 4 live Kalshi-409 fails). The PairAck preserves the a/b SLOTS (ack.a ↔ leg a) regardless of fire
+        // order, so all positional bookkeeping is unchanged; the recovery flattens whichever leg ends naked.
+        let a_first = fire_a_first(fire_pmus_first, a.venue == Venue::Pmus);
         let fut = async {
             let leg_filled = |r: &Result<Ack, ExecError>| matches!(r, Ok(ack) if ack.filled);
-            if a_is_pmus {
+            if a_first {
                 let ra = self.post_leg(a).await;
                 let rb = if leg_filled(&ra) { self.post_leg(b).await } else { Err(ExecError::HedgeNotFilled) };
                 PairAck { a: ra, b: rb }
@@ -749,8 +764,8 @@ impl LiveBackend {
 }
 
 impl ExecutionBackend for LiveBackend {
-    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent) -> PairAck {
-        // Fire BOTH legs CONCURRENTLY (tokio::join! inside run_pair) — each RSA-PSS (Kalshi) / Ed25519
+    fn submit_pair(&self, a: &OrderIntent, b: &OrderIntent, fire_pmus_first: bool) -> PairAck {
+        // Fire BOTH legs SERIALLY, THINNER leg first (run_pair) — each RSA-PSS (Kalshi) / Ed25519
         // (pmus) signed. Concurrency is the one latency lever the code owns (serial ~161 ms p50 ->
         // concurrent ~86 ms). Returns KeysUnavailable per-leg when the signing keys aren't loaded
         // (a dry-run/no-creds build) — that absence, plus the dry-run default, is what keeps real money
@@ -761,7 +776,7 @@ impl ExecutionBackend for LiveBackend {
                 b: Err(ExecError::KeysUnavailable),
             };
         }
-        self.run_pair(a, b)
+        self.run_pair(a, b, fire_pmus_first)
     }
     fn submit(&self, intent: &OrderIntent) -> Result<Ack, ExecError> {
         // single-leg recovery flatten. KeysUnavailable when keys aren't loaded (dry-run/no-creds build) —
@@ -819,7 +834,7 @@ mod tests {
             frac_qty: None,
             client_order_id: "leg-b".into(),
         };
-        let r = bk.submit_pair(&a, &b);
+        let r = bk.submit_pair(&a, &b, true);
         assert!(r.both_filled() && r.a.unwrap().simulated);
     }
 
@@ -885,7 +900,7 @@ mod tests {
         assert!(!sbody.contains("time_in_force"), "a SELL flatten stays GTC (no FOK): {sbody}");
         assert!(bk.kalshi_base().contains("demo")); // sandbox default
         // no signing keys loaded in the sandbox (KALSHI_RW_KEY_PATH empty) -> both legs refuse to send.
-        let r = bk.submit_pair(&intent, &intent);
+        let r = bk.submit_pair(&intent, &intent, true);
         assert_eq!(r.a, Err(ExecError::KeysUnavailable)); // never sends without keys
         assert!(!r.both_filled());
     }
@@ -1230,6 +1245,19 @@ mod tests {
         // an INTEGER order (frac None) is UNCHANGED — it defers to the venue verdict.
         assert!(is_full_fill(1.0, None, true), "an integer order defers to the venue full-fill verdict (true)");
         assert!(!is_full_fill(0.0, None, false), "an integer order defers to the venue verdict (false)");
+    }
+
+    /// DYNAMIC ORDER serial-fire arithmetic: `fire_a_first` orders the THINNER leg's SLOT first across all 4
+    /// (fire_pmus_first x a_is_pmus) cases — incl. the brand-new Kalshi-first branch (the cardinal-sin path
+    /// the review flagged as previously untested).
+    #[test]
+    fn fire_a_first_orders_the_thinner_leg_slot_first() {
+        // fire_pmus_first=true (pmus is thinner) -> fire the pmus SLOT first (the 0020 default).
+        assert!(fire_a_first(true, true), "pmus-first + slot-a is pmus -> fire a (pmus) first");
+        assert!(!fire_a_first(true, false), "pmus-first + slot-a is Kalshi -> fire b (the pmus slot) first");
+        // fire_pmus_first=false (Kalshi is thinner) -> fire the KALSHI SLOT first (the thin-Kalshi 409 fix).
+        assert!(!fire_a_first(false, true), "kalshi-first + slot-a is pmus -> fire b (the Kalshi slot) first");
+        assert!(fire_a_first(false, false), "kalshi-first + slot-a is Kalshi -> fire a (Kalshi) first");
     }
 
     /// A recovery SELL's `frac_qty` (the EXACT partial, e.g. 0.01) is serialized as the venue `quantity`/`count`
