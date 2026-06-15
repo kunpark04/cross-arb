@@ -1,7 +1,7 @@
 # 0022 — lower the LIVE bot edge floor to 1.5¢ (owner risk-appetite; research prereg τ=2¢ untouched) + Kalshi FOK API-doc-verified
 
 - **Date:** 2026-06-15
-- **Status:** Accepted (owner-directed; **a-priori** risk-appetite, NOT data-tuned)
+- **Status:** Accepted (owner-directed; **a-priori** risk-appetite) — floor value **superseded by [0023](0023-revert-live-edge-floor-to-2c.md)** (reverted to 2.0¢ same day; the EV/governance analysis + the Kalshi FOK API-doc verification below STAND)
 - **Deciders:** owner (requested 1.5¢); Claude (EV + governance + scope workflow with an adversarial reviewer; Kalshi FOK API-doc verification)
 
 ## Context

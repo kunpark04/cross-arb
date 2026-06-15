@@ -24,7 +24,7 @@ pub struct Config {
     pub pmus_env_path: String,
 
     // --- risk caps (defaults are the STAGED-ROLLOUT floor: 1 contract, tiny notional) ---
-    pub edge_floor_cents: f64,        // LIVE floor 1.5c (0022, owner a-priori risk-appetite); 0014 prereg 2.0c stays the RESEARCH-path value
+    pub edge_floor_cents: f64,        // 0014 pre-registered floor = 2.0c (0022 tried 1.5c, reverted by 0023 — verify FOK live first; no demo)
     pub min_edge_rate_cpd: f64,       // 0014-H2 edge-RATE reservation floor (¢/$-day); default 1.0 (enabled, conservative — only cuts slow arbs); 0 disables
     pub max_contracts_per_pair: u32,  // DEFAULT 1
     pub max_notional_per_pair: f64,   // $
@@ -77,7 +77,7 @@ impl Config {
             kalshi_key_path: env::var("KALSHI_RW_KEY_PATH").unwrap_or_default(),
             pmus_env_path: env::var("PMUS_ENV_PATH").unwrap_or_default(),
 
-            edge_floor_cents: env_f64("EDGE_FLOOR_CENTS", 1.5),
+            edge_floor_cents: env_f64("EDGE_FLOOR_CENTS", 2.0),
             min_edge_rate_cpd: env_f64("MIN_EDGE_RATE_CPD", 1.0), // ENABLED live 2026-06-13 (owner): conservative floor, inert on fast arbs
             max_contracts_per_pair: env_u32("MAX_CONTRACTS_PER_PAIR", 1),
             max_notional_per_pair: env_f64("MAX_NOTIONAL_PER_PAIR", 1.0),

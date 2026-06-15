@@ -6,6 +6,22 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 11) — revert to the 2¢ gate + run 1-contract LIVE (no demo ⇒ live IS the FOK verification) [0023]
+
+Owner: "return to the 2c gate, then run live with 1 contract — I don't have demo anymore."
+
+- **Reverted [0022]'s floor 1.5 → 2.0¢** (`config.rs:80`, `.env.example`, README). [0023] supersedes 0022's floor
+  **value** only — its EV/governance analysis + the Kalshi FOK API-doc verification (`exec.rs` comment) stand; the
+  research-path τ=2¢ was never touched. Release rebuilt clean, 163 tests green.
+- **No-demo is load-bearing:** the FOK kill-confirm that 0021/0022 deferred to "demo-sandbox" can now ONLY be done
+  **LIVE** (1-contract prod) — so the first live fire at 2¢ *is* the FOK verification. Running it at the conservative
+  floor is exactly the adversary's "don't loosen *and* rely on unproven FOK together." Saved to memory
+  (`no-demo-verify-live-only`).
+- **Relaunched** 1-contract prod, all events, 2¢, `CROSSARB_MAX_ENTRIES=1` — capped at the first entry so the first
+  real FOK order is verified (killed-not-rested, no naked leg, account reconciles, [L26]) before any continuous run.
+
+---
+
 ## 2026-06-15 (cont. 10) — temp-arb gating diagnosed (EDGE, not staleness) + LIVE edge floor 2.0→1.5¢ [0022]; Kalshi FOK API-doc-verified
 
 Owner: "many arb opportunities in temp — what gates them, what's the condition?" The live gate counter showed
