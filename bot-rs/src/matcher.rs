@@ -10,7 +10,10 @@
 //!     inclusive `[floor, cap]`. Canonicalize BOTH to `[lo, hi]` before comparing.
 //!   - ECON: pmus `>= T` (inclusive) ↔ Kalshi `Above (T - grid_step)` (strict). The twin floor is
 //!     `T - step`, NOT `T` (pairing `floor == T` is off by one bucket = the phantom P(print==T) edge).
-//!   - SPORTS: bind on `(league, date, team-abbrev)`; `void_clean=false` for ALL leagues (only a
+//!   - SPORTS: bind on `(league, date, team-abbrev)` for team/esports leagues; bind on
+//!     `(league, date, player-SURNAME)` for the individual sports (tennis ATP/WTA/ITF + UFC), where
+//!     `smatch`'s ≤1-char prefix guard REJECTS distinct players sharing a prefix (the L1 phantom-arb
+//!     trap — `martin`~`martinez`, `mann`~`mannarino`). `void_clean=false` for ALL leagues (only a
 //!     game that completes on schedule settles identically).
 //!
 //! Settlement-identity status (`settle_clean`) reflects the project's EMPIRICAL findings: weather is
@@ -222,6 +225,70 @@ pub fn match_sports_abbrev(
     }
 }
 
+/// A player's surname key for the individual-sport (surname-join) leagues. FAITHFUL port of
+/// `colisted_map.py::surname`: NFKD-fold accents -> ASCII (drop any char with no ASCII fold, like Python's
+/// `encode("ascii","ignore")`), lowercase, replace every char NOT in `[a-z space hyphen]` with a SPACE,
+/// then split on whitespace and take the LAST token (`""` if none). Hyphen is KEPT (so `Auger-Aliassime`
+/// is one token) and is NOT a split char; digits/apostrophes/periods become spaces (so `O'Brien`->`brien`).
+/// Reuses `discovery::fold_accent` (the same Latin-1 accent table the WC name-fold uses) — no second table.
+pub(crate) fn surname(name: &str) -> String {
+    let folded: String = name
+        .chars()
+        .map(crate::discovery::fold_accent) // é->e, ü->u, ñ->n, ... (Latin-1); other chars pass through
+        .filter(|c| c.is_ascii()) // mirror Python's encode("ascii","ignore"): a non-foldable non-ASCII char is DROPPED
+        .flat_map(|c| c.to_lowercase())
+        // every char not in [a-z space hyphen] becomes a SPACE (a separator), matching re.sub(r"[^a-z \-]", " ", n).
+        .map(|c| if c.is_ascii_lowercase() || c == ' ' || c == '-' { c } else { ' ' })
+        .collect();
+    folded.split_whitespace().last().unwrap_or("").to_string()
+}
+
+/// Surname join predicate — FAITHFUL port of `colisted_map.py::smatch`: a match iff the two surnames are
+/// EXACT-equal, OR one is a prefix of the other differing by ≤1 char (accent/truncation noise). The
+/// `len < 4` floor + the `|len(a) - len(b)| <= 1` guard REJECT distinct players that merely share a prefix
+/// (`martin`~`martinez`, `williams`~`williamson`, `mann`~`mannarino`, `koval`~`kovalenko`) — the
+/// no-false-positive invariant (L1). A loose smatch here manufactures phantom arbs; this guard is load-bearing.
+/// `len` is character count (`.chars().count()`) to mirror Python's `len()`; surname outputs are ASCII so it
+/// equals the byte length, but the char count is unambiguously faithful.
+pub(crate) fn smatch(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    if la < 4 || lb < 4 {
+        return false;
+    }
+    (a.starts_with(b) || b.starts_with(a)) && la.abs_diff(lb) <= 1
+}
+
+/// Bind a pmus game (two player SURNAMES) to ONE Kalshi event's `{surname: ticker}` set. Returns the two
+/// DISTINCT tickers `(player_a, player_b)` only when each surname `smatch`es a DIFFERENT Kalshi player (the
+/// no-false-positive invariant). Surname analogue of [`match_sports_abbrev`] — port of `_match_game`'s
+/// surname arm (`mA = first key where smatch(key, kA)`, likewise `mB`, requiring `mA != mB`). The Kalshi
+/// side is keyed on `surname(yes_sub_title)` by the caller, and the pmus side on `surname(team.name)`.
+pub fn match_sports_surname(
+    surname_a: &str,
+    surname_b: &str,
+    league: &str,
+    date: &str,
+    k_event: &[(String, String)], // (surname, ticker) within ONE Kalshi event
+    days_to_event: Option<f64>,
+) -> Option<ColistedMatch> {
+    let ta = k_event.iter().find(|(s, _)| smatch(s, surname_a)).map(|(_, t)| t.clone());
+    let tb = k_event.iter().find(|(s, _)| smatch(s, surname_b)).map(|(_, t)| t.clone());
+    match (ta, tb) {
+        (Some(ta), Some(tb)) if ta != tb => Some(ColistedMatch {
+            cat: Cat::Sports,
+            kalshi: ta,
+            kalshi_b: Some(tb),
+            cluster: format!("{league}-{date}"),
+            settle_clean: false, // only a match that COMPLETES on schedule settles identically (void tail)
+            days_to_event,
+        }),
+        _ => None,
+    }
+}
+
 // ---- small slug helpers (no regex dep; the patterns here are simple fixed-token scans) ----------------
 
 fn round6(x: f64) -> f64 {
@@ -399,5 +466,72 @@ mod tests {
         let m = match_sports_abbrev("lad", "pit", "mlb", "2026-06-16", &ev, Some(0.5)).unwrap();
         assert_eq!(m.kalshi, "KXMLBGAME-26JUN16-LAD");
         assert_eq!(m.kalshi_b.as_deref(), Some("KXMLBGAME-26JUN16-PIT"));
+    }
+
+    // ---- SURNAME join (individual sports: tennis/UFC) — the L1 ≤1-char-prefix guard is the whole point ----
+
+    /// `surname`: NFKD accent-fold (reuses discovery::fold_accent) + lowercase + last whitespace token,
+    /// KEEPING the hyphen (so `Auger-Aliassime` is one token) and turning digits/apostrophes into spaces.
+    /// FAITHFUL to colisted_map.py::surname (its self-test vectors are reproduced here).
+    #[test]
+    fn surname_folds_and_takes_last_token() {
+        assert_eq!(surname("José Ramírez"), "ramirez"); // NFKD accent strip, last token
+        assert_eq!(surname("Felix Auger-Aliassime"), "auger-aliassime"); // hyphen kept, not a split char
+        assert_eq!(surname("Müller"), "muller"); // ü -> u (the accent/truncation-noise case smatch tolerates)
+        assert_eq!(surname("Novak Djokovic"), "djokovic");
+        assert_eq!(surname("O'Brien"), "brien"); // apostrophe -> space -> last token (matches re.sub)
+        assert_eq!(surname(""), ""); // empty -> empty (unbindable)
+        assert_eq!(surname("   "), ""); // whitespace-only -> empty
+    }
+
+    /// `smatch` ACCEPTS exact + ≤1-char prefix/truncation (accent noise) and REJECTS distinct players that
+    /// merely share a prefix — the L1 no-false-positive invariant. The reject cases are the whole point: a
+    /// loose smatch manufactures phantom arbs. These mirror colisted_map.py::smatch's self-test exactly.
+    #[test]
+    fn smatch_accepts_close_rejects_distinct_prefix_l1() {
+        // ACCEPT: exact.
+        assert!(smatch("djokovic", "djokovic"));
+        assert!(smatch("aliassime", "aliassime"));
+        // ACCEPT: a ≤1-char truncation (one side dropped a trailing char — accent/encoding noise).
+        assert!(smatch("ramirez", "ramire"), "1-char truncation is accent/truncation noise -> accept");
+        assert!(smatch("muller", "mulle"), "1-char prefix differing by one -> accept");
+        // ACCEPT: folded accent makes the two surnames EXACT-equal (müller folds to muller upstream).
+        assert!(smatch(&surname("Müller"), &surname("Muller")), "folded accent -> exact-equal -> accept");
+        // REJECT (L1 — the phantom-arb guard): distinct players sharing a prefix but differing by >1 char.
+        for (a, b) in [("martin", "martinez"), ("williams", "williamson"), ("mann", "mannarino"), ("koval", "kovalenko")] {
+            assert!(!smatch(a, b), "smatch MUST reject distinct players {a}~{b} (L1 no-false-positive)");
+            assert!(!smatch(b, a), "smatch reject is symmetric for {b}~{a}");
+        }
+        // REJECT: a short (<4 char) surname never fuzzy-matches (only exact), so `li`!=`liu` even as a prefix.
+        assert!(!smatch("li", "liu"), "sub-4-char surnames match only EXACTLY, never by prefix");
+        assert!(!smatch("mann", "many"), "non-prefix 4-char surnames don't match (mann vs many)");
+    }
+
+    /// A real tennis bind: a pmus ATP game (two surnames) binds to a Kalshi KXATPMATCH event -> two DISTINCT
+    /// tickers; a non-matching opponent yields NO false pair. This is the surname analogue of
+    /// `sports_binds_two_distinct_tickers`, pinning that the surname path resolves to two different players.
+    #[test]
+    fn sports_surname_binds_two_distinct_tickers() {
+        // a Kalshi ATP event keyed on surname(yes_sub_title): Djokovic vs Alcaraz.
+        let ev = vec![
+            ("djokovic".to_string(), "KXATPMATCH-26JUN16-DJO".to_string()),
+            ("alcaraz".to_string(), "KXATPMATCH-26JUN16-ALC".to_string()),
+        ];
+        let m = match_sports_surname("djokovic", "alcaraz", "atp", "2026-06-16", &ev, Some(2.0)).unwrap();
+        assert_eq!(m.kalshi, "KXATPMATCH-26JUN16-DJO");
+        assert_eq!(m.kalshi_b.as_deref(), Some("KXATPMATCH-26JUN16-ALC"));
+        assert_eq!(m.cat, Cat::Sports);
+        assert!(!m.settle_clean); // void/postpone tail -> never marked clean
+        assert_eq!(m.cluster, "atp-2026-06-16");
+        assert_eq!(m.days_to_event, Some(2.0));
+        // an opponent NOT in the event -> no false pair (sinner isn't listed here).
+        assert!(match_sports_surname("djokovic", "sinner", "atp", "2026-06-16", &ev, None).is_none());
+        // L1 in the bind path: a pmus `martin` must NOT bind a Kalshi `martinez` (the ≤1-char guard), so a
+        // game of martin vs alcaraz finds only one leg -> no pair (never the wrong `martinez` ticker).
+        let ev2 = vec![
+            ("martinez".to_string(), "KXATPMATCH-26JUN16-MAR".to_string()),
+            ("alcaraz".to_string(), "KXATPMATCH-26JUN16-ALC".to_string()),
+        ];
+        assert!(match_sports_surname("martin", "alcaraz", "atp", "2026-06-16", &ev2, None).is_none(), "martin must NOT bind martinez (L1)");
     }
 }
