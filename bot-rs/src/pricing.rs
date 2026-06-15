@@ -180,6 +180,17 @@ pub(crate) fn affordable(cfg: &Config, edge: &Edge, exposure: &Exposure) -> u32 
 /// that leg's PAID price (the same per-leg `venue_fee(leg_price)` those functions sum), so this is the
 /// honest "size and price are consistent" check the gate splits across two functions.
 pub(crate) fn realized_edge_clears_floor(cfg: &Config, legs: &[OrderIntent; 2]) -> bool {
+    let cost = (legs[0].price_cents as f64 + legs[1].price_cents as f64) / 100.0;
+    if cost >= 1.0 {
+        return false; // a >= $1 pair pays more than the $1 payout — never book it
+    }
+    realized_net_dollars(legs) * 100.0 >= cfg.edge_floor_cents
+}
+
+/// REALIZED net edge (dollars) from the two ROUNDED leg prices, after each leg's at-scale MARGINAL taker fee
+/// at its paid price — the shared core of `realized_edge_clears_floor` (≥ floor?) and the second-leg surplus.
+/// The fee model mirrors `signal`/`game_signal` exactly (the same per-leg `venue_fee(leg_price)` they sum).
+fn realized_net_dollars(legs: &[OrderIntent; 2]) -> f64 {
     use crate::ledger::{marginal_taker_fee, KALSHI_TAKER_COEF, PMUS_TAKER_COEF};
     let leg_fee = |leg: &OrderIntent| {
         let p = leg.price_cents as f64 / 100.0;
@@ -193,11 +204,49 @@ pub(crate) fn realized_edge_clears_floor(cfg: &Config, legs: &[OrderIntent; 2]) 
         marginal_taker_fee(coef, p)
     };
     let cost = (legs[0].price_cents as f64 + legs[1].price_cents as f64) / 100.0;
-    if cost >= 1.0 {
-        return false; // a >= $1 pair pays more than the $1 payout — never book it
+    round4((1.0 - cost) - leg_fee(&legs[0]) - leg_fee(&legs[1]))
+}
+
+/// Sanity ceiling (cents) on the capped-aggressive second-leg pay-up, on TOP of the per-arb edge surplus —
+/// so even a fat-edge (possibly phantom) arb can't post a wildly aggressive limit.
+const SECOND_LEG_MARKUP_CAP_CENTS: u8 = 5;
+
+/// Whole-cent surplus of the realized net edge ABOVE the floor, clamped to [0, cap] — the budget the
+/// second-leg pay-up may spend. 0 for a thin arb (net ≈ floor) → no pay-up (it falls back to the cheap
+/// recovery); positive for a fat arb.
+fn realized_surplus_cents(cfg: &Config, legs: &[OrderIntent; 2]) -> u8 {
+    let s = realized_net_dollars(legs) * 100.0 - cfg.edge_floor_cents;
+    s.floor().clamp(0.0, SECOND_LEG_MARKUP_CAP_CENTS as f64) as u8
+}
+
+/// CAPPED-AGGRESSIVE SECOND LEG (decision 0020 follow-up; live-validated need 2026-06-15). Under pmus-first
+/// the Kalshi leg fires SECOND — after the pmus block — and a passive marketable limit then MISSES when the
+/// price ticked during the wait (most edges are sub-second; the re-test's Kalshi leg missed exactly this
+/// way). Raise the Kalshi BUY limit by the realized edge SURPLUS above the floor so it still fills through a
+/// small adverse move, WITHOUT ever eating below the floor: a thin arb (net ≈ floor) gets ~0 markup and
+/// falls back to the cheap recovery; a fat arb spends its surplus to GUARANTEE the lock. The order still
+/// FILLS at the live price (≤ the raised limit), so we pay only the ACTUAL move, bounded by the surplus.
+/// Re-checks the floor after the bump (fees shift at the new price) and REVERTS if it would not clear.
+pub(crate) fn apply_second_leg_markup(cfg: &Config, legs: &mut [OrderIntent; 2]) {
+    // the SECOND-fired leg is the Kalshi one (pmus-first fires pmus, then Kalshi). Mark up that BUY only.
+    let Some(i) = legs.iter().position(|l| l.venue == Venue::Kalshi) else {
+        return; // no Kalshi leg (never for a cross-venue arb) -> nothing to do
+    };
+    let markup = realized_surplus_cents(cfg, legs);
+    if markup == 0 {
+        return; // thin arb: no surplus -> stay passive, rely on the cheap recovery
     }
-    let realized_net = round4((1.0 - cost) - leg_fee(&legs[0]) - leg_fee(&legs[1]));
-    realized_net * 100.0 >= cfg.edge_floor_cents
+    let bumped = legs[i].price_cents.saturating_add(markup);
+    if bumped >= 100 {
+        return; // never post a >= 100c leg
+    }
+    let prev = legs[i].price_cents;
+    legs[i].price_cents = bumped;
+    if !realized_edge_clears_floor(cfg, legs) {
+        // DEFENSIVE: the surplus is derived to keep the floor, but a fee shift at the bumped price could
+        // nudge the realized net under it -> revert. The pay-up never drops realized edge below the floor.
+        legs[i].price_cents = prev;
+    }
 }
 
 /// 4dp round, matching `signal::round4` / ledger.py — keeps the realized-edge re-check bit-consistent with
@@ -506,6 +555,28 @@ mod tests {
         assert!(realized_edge_clears_floor(&cfg, &[leg(Venue::Pmus, 5), leg(Venue::Kalshi, 90)]));
         // a >= $1 pair (51 + 50 = 101c) can never be booked -> SKIP.
         assert!(!realized_edge_clears_floor(&cfg, &[leg(Venue::Pmus, 51), leg(Venue::Kalshi, 50)]));
+    }
+
+    /// 0020 follow-up — CAPPED-AGGRESSIVE second leg: a FAT arb pays up on the KALSHI (second-fired) leg,
+    /// capped at the 5c sanity cap, never the pmus leg, and the bumped pair STILL clears the floor; with no
+    /// surplus above the floor there is NO pay-up (the arb falls back to the cheap recovery).
+    #[test]
+    fn second_leg_markup_pays_up_on_kalshi_capped_and_floor_safe() {
+        let leg = |v: Venue, c: u8| OrderIntent { venue: v, market: "m".into(), action: Action::Buy, side: Side::Yes, price_cents: c, qty: 1, client_order_id: "x".into() };
+        let mut cfg = crate::config::Config::test_default(); // edge_floor_cents = 2.0
+
+        // FAT arb (30 + 30 = 60c, ~40c gross) -> surplus far exceeds the 5c cap -> Kalshi pays up by 5c.
+        let mut fat = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
+        apply_second_leg_markup(&cfg, &mut fat);
+        assert_eq!(fat[0].price_cents, 30, "the pmus (first) leg is NEVER marked up");
+        assert_eq!(fat[1].price_cents, 35, "the Kalshi (second) leg pays up by the 5c cap");
+        assert!(realized_edge_clears_floor(&cfg, &fat), "the bumped pair still clears the floor");
+
+        // NO surplus above the floor (raise it so the same arb has no room) -> NO pay-up.
+        cfg.edge_floor_cents = 50.0;
+        let mut none = [leg(Venue::Pmus, 30), leg(Venue::Kalshi, 30)];
+        apply_second_leg_markup(&cfg, &mut none);
+        assert_eq!(none[1].price_cents, 30, "no surplus above the floor -> no pay-up (cheap recovery instead)");
     }
 
     /// W4: `affordable` subtracts already-open `exposure.total` from the total-notional cap (the bankroll

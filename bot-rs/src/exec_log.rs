@@ -100,3 +100,20 @@ pub fn order_cancel(venue: &str, market: &str, venue_order_id: &str, http: Optio
         "raw": raw.chars().take(1000).collect::<String>(),
     }));
 }
+
+/// ENTRY / RECOVERY book snapshot (0020 follow-up) — the bid/ask we fired against + the take-side depth, so a
+/// later naked-leg recovery decomposes into SPREAD (entry bid↔ask) vs MOVE (entry mid → the recovery fill
+/// price already captured in the submit records). `phase` = "entry" | "recovery". No-op under `cargo test`.
+#[allow(clippy::too_many_arguments)]
+pub fn book_snapshot(phase: &str, market: &str, pm_bid: Option<f64>, pm_ask: Option<f64>, k_bid: Option<f64>, k_ask: Option<f64>, depth_c2: u32) {
+    record(serde_json::json!({
+        "event": "book",
+        "phase": phase,
+        "market": market,
+        "pm_bid": pm_bid,
+        "pm_ask": pm_ask,
+        "k_bid": k_bid,
+        "k_ask": k_ask,
+        "depth_c2": depth_c2,
+    }));
+}

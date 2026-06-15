@@ -29,6 +29,31 @@ pub enum Reject {
     ConcurrencyCap,
 }
 
+/// A short STABLE label for a `Reject` variant — for the live loop's per-gate rejection counter (heartbeat),
+/// so the owner can read which gate is BINDING (e.g. is the 0020 recovery-cost gate too strict?). Exhaustive
+/// on purpose: a new `Reject` variant forces an update here.
+pub fn reject_label(r: &Reject) -> &'static str {
+    match r {
+        Reject::KillSwitch => "kill_switch",
+        Reject::StreamPaused => "stream_paused",
+        Reject::SettlementUnverified => "settle_unverified",
+        Reject::TooEarly => "too_early",
+        Reject::CrossedBook(_) => "crossed_book",
+        Reject::StaleBook(_) => "stale_book",
+        Reject::MidDivergence(_) => "mid_divergence",
+        Reject::NonPositiveEdge => "non_positive_edge",
+        Reject::BelowEdgeFloor => "below_edge_floor",
+        Reject::BelowEdgeRateFloor(_) => "below_edge_rate",
+        Reject::RecoveryCostExceedsEdge(_) => "recovery_cost",
+        Reject::ToxicDirection => "toxic_direction",
+        Reject::NoFillableSize => "no_fillable_size",
+        Reject::PairCap => "pair_cap",
+        Reject::ClusterCap => "cluster_cap",
+        Reject::TotalCap => "total_cap",
+        Reject::ConcurrencyCap => "concurrency_cap",
+    }
+}
+
 /// Live exposure the gates read (updated by the bot as positions open/settle).
 #[derive(Default)]
 pub struct Exposure {
@@ -315,6 +340,7 @@ mod tests {
             assume_econ_settled: false,
             max_days_to_event: 2.0,
             max_recovery_spread_ratio: 0.0,
+            aggressive_second_leg: false,
             kalshi_void_window_days: 2.0,
             postpone_poll_s: 60,
             auto_unwind: true,

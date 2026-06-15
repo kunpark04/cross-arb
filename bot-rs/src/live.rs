@@ -2,11 +2,11 @@ use crate::bookkeeping::{apply_outcome, qualifying_add, reserve_exposure, spawn_
 use crate::config::Config;
 use crate::exec::ExecutionBackend;
 use crate::pair::{lock, FlatKind, LivePair, PairState, SubmitKind, SubmitOutcome};
-use crate::pricing::{affordable, build_legs, position_from_intents, realized_edge_clears_floor};
+use crate::pricing::{affordable, apply_second_leg_markup, build_legs, position_from_intents, realized_edge_clears_floor};
 use crate::refresh::{refresh_loop, report_coverage};
-use crate::risk::{evaluate, Exposure};
+use crate::risk::{evaluate, reject_label, Exposure};
 use crate::types::*;
-use crate::{book, discovery, postpone, signal, venue};
+use crate::{book, discovery, exec_log, postpone, signal, venue};
 
 /// STAGE-2 live loop: discover the co-listed universe, connect both venue WS streams, maintain a book
 /// per venue for each tracked pair, and on each COMPLETE dual-venue update (L5) build a `Quote`, run
@@ -166,6 +166,10 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
     // reports p50/p99/max of the per-frame compute (µ-seconds) over each 20s window, then clears.
     let mut proc_t0: Option<std::time::Instant> = None;
     let mut frame_lat_us: Vec<f64> = Vec::with_capacity(32768);
+    // INSTRUMENTATION (0020 follow-up): per-20s-window count of which risk gate is BINDING (each `evaluate`
+    // outcome → its label, plus "approved"), so the owner can read whether the recovery-cost / edge / velocity
+    // floors are too strict. Logged + cleared each heartbeat.
+    let mut gate_outcomes: HashMap<&'static str, u64> = HashMap::new();
 
     loop {
         // LATENCY: record the PREVIOUS venue-frame's full in-loop compute time (stamped at frame-receipt
@@ -213,6 +217,14 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 let (p50, p99, mx, n) = pct_summary(&mut frame_lat_us);
                 println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
                          k_fresh.len(), exposure.stream_paused);
+                // GATE OUTCOMES this window — which gate is binding (is the 0020 recovery-cost gate too strict?).
+                if !gate_outcomes.is_empty() {
+                    let mut go: Vec<(&&'static str, &u64)> = gate_outcomes.iter().collect();
+                    go.sort_by(|a, b| b.1.cmp(a.1));
+                    let s = go.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
+                    println!("[live] gate outcomes (20s): {s}");
+                    gate_outcomes.clear();
+                }
                 continue;
             }
             // C1 SUPERVISOR: any collector/refresh/poll task ending (clean return OR panic) is FATAL — a
@@ -367,47 +379,64 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             }
         };
 
-        if let Ok(a) = evaluate(cfg, &quote, &edge, &exposure, affordable(cfg, &edge, &exposure)) {
-            // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
-            // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
-            // one-sided book) yields no legs -> skip rather than fire a naked leg.
-            let Some(legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
-            // W6: re-validate the edge from the ROUNDED leg prices (each leg rounds to a whole cent
-            // independently, eroding up to +1c of cost). Skip the fire if the realized net fell under the
-            // floor or the pair would cost >= 100c — the gated edge and the booked edge must agree.
-            if !realized_edge_clears_floor(cfg, &legs) {
-                continue;
+        match evaluate(cfg, &quote, &edge, &exposure, affordable(cfg, &edge, &exposure)) {
+            // INSTRUMENTATION (0020 follow-up): tally the BINDING gate so the owner can read whether the
+            // recovery-cost / edge / velocity floors are too strict (logged + cleared each heartbeat).
+            Err(reject) => {
+                *gate_outcomes.entry(reject_label(&reject)).or_insert(0) += 1;
             }
-            // Record the velocity metric on the live order path (the owner calibrates MIN_EDGE_RATE_CPD
-            // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day). An
-            // ADD additionally logs its scale-in|re-entry tag + the base vs add net so an armed add is
-            // auditable (design §2). `add_tag` is None for a fresh entry (the common case).
-            // LATENCY (per-fire): frame-receipt -> this fire = the in-loop compute that produced the order. The
-            // order RTT that follows is logged per leg in exec_log; decision + RTT = the full fire chain measured.
-            let decision_us = proc_t0.map(|t| t.elapsed().as_secs_f64() * 1e6).unwrap_or(0.0);
-            if let Some(tag) = add_tag {
-                let base_net = held_legs.iter().map(|l| l.entry_net).fold(0.0_f64, f64::max);
-                println!(
-                    "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
-                    base_net * 100.0, edge.net * 100.0, a.size, a.edge_rate, edge.dir
-                );
-            } else {
-                println!(
-                    "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
-                    a.size, edge.net * 100.0, a.edge_rate, edge.dir
-                );
-            }
-            // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
-            // outcome arm keeps the reservation on a both-filled fill (appends the leg) or releases it.
-            let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
-            reserve_exposure(&mut exposure, &pos, a.cost_per);
-            pending_entries.insert(slug.clone());
-            // deref-clone the shared `Arc<LivePair>` into the owned `LivePair` the outcome carries (only on
-            // the rare approved-fire path, never per frame); the poll reads its league/date/abbrevs later.
-            spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir);
-            entries_fired += 1;
-            if max_entries == Some(entries_fired) {
-                println!("[live] CROSSARB_MAX_ENTRIES={entries_fired} reached — holding this position to settlement; NO new entries will open (recovery/unwind stay active).");
+            Ok(a) => {
+                *gate_outcomes.entry("approved").or_insert(0) += 1;
+                // Build BOTH legs with venue-native market ids + per-leg LIMIT prices from the BOOKS (never
+                // derived from the pair edge — that was a self-review CRITICAL). A missing book price (a
+                // one-sided book) yields no legs -> skip rather than fire a naked leg.
+                let Some(mut legs) = build_legs(&pair, &quote, edge.dir, a.size) else { continue };
+                // W6: re-validate the edge from the ROUNDED leg prices (each leg rounds to a whole cent
+                // independently, eroding up to +1c of cost). Skip the fire if the realized net fell under the
+                // floor or the pair would cost >= 100c — the gated edge and the booked edge must agree.
+                if !realized_edge_clears_floor(cfg, &legs) {
+                    continue;
+                }
+                // 0020 follow-up: under pmus-first the Kalshi leg fires SECOND (after the pmus block) and a
+                // passive limit MISSES when the price ticked during the wait (most edges are sub-second). Pay
+                // up to the edge SURPLUS (capped, never below the floor) so it still locks; it re-checks the floor.
+                if cfg.aggressive_second_leg {
+                    apply_second_leg_markup(cfg, &mut legs);
+                }
+                // Record the velocity metric on the live order path (the owner calibrates MIN_EDGE_RATE_CPD
+                // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day). An
+                // ADD additionally logs its scale-in|re-entry tag + the base vs add net so an armed add is
+                // auditable (design §2). `add_tag` is None for a fresh entry (the common case).
+                // LATENCY (per-fire): frame-receipt -> this fire = the in-loop compute that produced the order. The
+                // order RTT that follows is logged per leg in exec_log; decision + RTT = the full fire chain measured.
+                let decision_us = proc_t0.map(|t| t.elapsed().as_secs_f64() * 1e6).unwrap_or(0.0);
+                if let Some(tag) = add_tag {
+                    let base_net = held_legs.iter().map(|l| l.entry_net).fold(0.0_f64, f64::max);
+                    println!(
+                        "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
+                        base_net * 100.0, edge.net * 100.0, a.size, a.edge_rate, edge.dir
+                    );
+                } else {
+                    println!(
+                        "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
+                        a.size, edge.net * 100.0, a.edge_rate, edge.dir
+                    );
+                }
+                // ENTRY book snapshot (0020 follow-up): record the books we fired against so a later naked-leg
+                // recovery can be decomposed into spread-vs-move (the FILL prices are already in exec_log).
+                exec_log::book_snapshot("entry", &slug, quote.pm.yes_bid, quote.pm.yes_ask, quote.k.yes_bid, quote.k.yes_ask, quote.depth.c2);
+                // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
+                // outcome arm keeps the reservation on a both-filled fill (appends the leg) or releases it.
+                let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
+                reserve_exposure(&mut exposure, &pos, a.cost_per);
+                pending_entries.insert(slug.clone());
+                // deref-clone the shared `Arc<LivePair>` into the owned `LivePair` the outcome carries (only on
+                // the rare approved-fire path, never per frame); the poll reads its league/date/abbrevs later.
+                spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir);
+                entries_fired += 1;
+                if max_entries == Some(entries_fired) {
+                    println!("[live] CROSSARB_MAX_ENTRIES={entries_fired} reached — holding this position to settlement; NO new entries will open (recovery/unwind stay active).");
+                }
             }
         }
     }

@@ -43,6 +43,7 @@ pub struct Config {
     pub assume_econ_settled: bool,        // owner override: treat ECON as settlement-reconciled (else gated)
     pub max_days_to_event: f64,           // event-proximity gate: skip arbs >this many days before settlement (<=0 = off)
     pub max_recovery_spread_ratio: f64,   // 0020 recovery-cost gate: skip if pmus bid-ask spread (residual naked-unwind cost under pmus-first) > ratio×edge (<=0 = off)
+    pub aggressive_second_leg: bool,      // 0020 follow-up: pay up to the edge SURPLUS on the SECOND (Kalshi) leg so it fills through the serial-delay move (capped, never below the floor)
     pub kalshi_void_window_days: f64,     // postponement-unwind: Kalshi voids if reschedule is past this (~2d)
     pub postpone_poll_s: u64,             // MLB statsapi postponement-poll cadence (owner droplet)
     pub auto_unwind: bool,                // arm the live postponement-unwind trigger (CROSSARB_NO_AUTO_UNWIND=1 disables)
@@ -95,6 +96,9 @@ impl Config {
             // 0020: ON by default at 1.0 (residual naked-unwind spread must be ≤ the edge). Owner tunes via
             // MAX_RECOVERY_SPREAD_RATIO; 0 disables. Mirrors min_edge_rate_cpd (prod ON, test default OFF).
             max_recovery_spread_ratio: env_f64("MAX_RECOVERY_SPREAD_RATIO", 1.0),
+            // 0020 follow-up: ON by default — the re-test showed the serial pmus-first delay makes a passive
+            // second leg miss on sub-second edges. The pay-up is capped at the edge surplus (never below floor).
+            aggressive_second_leg: env_bool("AGGRESSIVE_SECOND_LEG", true),
             kalshi_void_window_days: env_f64("KALSHI_VOID_WINDOW_DAYS", 2.0),
             postpone_poll_s: env_u64("POSTPONE_POLL_S", 60),
             // armed by default (flattening a void REDUCES risk); CROSSARB_NO_AUTO_UNWIND=1 disengages it.
@@ -147,6 +151,7 @@ impl Config {
             assume_econ_settled: false,
             max_days_to_event: 2.0,
             max_recovery_spread_ratio: 0.0,
+            aggressive_second_leg: false,
             kalshi_void_window_days: 2.0,
             postpone_poll_s: 60,
             auto_unwind: true,
