@@ -121,6 +121,10 @@ pub(crate) fn qualifying_add(cfg: &Config, held: &[postpone::HeldLeg], edge: &Ed
 /// flatten the filled leg) before the halt backstop (FIX A). Unwind: both-filled => remove the position +
 /// decrement exposure; else => the flatten itself left a naked leg -> fail-close (W14). Always clears the
 /// slug's in-flight marker.
+///
+/// RETURNS `Some(slug)` for ANY `SubmitKind::Entry` outcome (lock / abort_clean / abort_ambiguous / recover /
+/// naked_halt) so the caller can STAMP a per-slug entry cooldown on EVERY entry resolution — not just the
+/// fire site (2026-06-15 churn fix). `None` for Unwind/Recovery (those don't gate a fresh entry).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_outcome(
     backend: &std::sync::Arc<dyn ExecutionBackend>,
@@ -133,8 +137,10 @@ pub(crate) fn apply_outcome(
     outcome_tx: &tokio::sync::mpsc::UnboundedSender<SubmitOutcome>,
     halt: &std::sync::atomic::AtomicBool,
     out: SubmitOutcome,
-) {
+) -> Option<String> {
     let both = out.ack.both_filled();
+    // exec-log liveness (2026-06-15): a dry-run backend's fire outcomes route to the separate `.dryrun` log.
+    let live = backend.label() != "dry-run";
     match out.kind {
         SubmitKind::Entry => {
             pending_entries.remove(&out.slug);
@@ -151,7 +157,7 @@ pub(crate) fn apply_outcome(
                     // STORED on the HeldLeg so a later per-leg unwind subtracts EXACTLY this leg (R1) and a
                     // later add gates on max(entry_net)+tau / same-direction.
                     track_position(positions, &pair, pos, out.cost_per, out.entry_net, out.entry_dir);
-                    crate::exec_log::fire_outcome(&out.slug, "lock", "both legs filled");
+                    crate::exec_log::fire_outcome(&out.slug, "lock", "both legs filled", live);
                 }
             } else {
                 // subtract the EXACT reservation made at spawn (the entry did not fully fill) — the unified
@@ -170,7 +176,7 @@ pub(crate) fn apply_outcome(
                     // abort cooldown is a clean production follow-up — not needed for the gated 1-contract test.)
                     EntryMiss::CleanAbort(rest_idx) => {
                         cancel_resting_hedge(backend, &out.slug, &out.ack, out.position.as_ref(), rest_idx);
-                        crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge did not fill; cancelled, no position");
+                        crate::exec_log::fire_outcome(&out.slug, "abort_clean", "pmus hedge did not fill; cancelled, no position", live);
                     }
                     // hedge ERR'd: its order's fate is UNKNOWN (a transport error may have landed it). Fail
                     // CLOSED — HALT so the owner reconciles before any unhedged pmus order can fill silently.
@@ -181,7 +187,7 @@ pub(crate) fn apply_outcome(
                              order fate UNKNOWN (may have landed) -> KILL-SWITCH engaged; reconcile positions before resuming.",
                             out.slug, out.ack.a, out.ack.b
                         );
-                        crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", "pmus hedge err -> halt");
+                        crate::exec_log::fire_outcome(&out.slug, "abort_ambiguous", "pmus hedge err -> halt", live);
                     }
                     // FIX A: a real one-leg-filled outcome is a NAKED directional leg. AUTO-RECOVER (cancel the
                     // resting leg + flatten the filled leg at a marketable book price); the fail-close halt is
@@ -193,13 +199,16 @@ pub(crate) fn apply_outcome(
                             .unwrap_or_default();
                         if !recover_naked_leg(backend, kalshi_books, pmus_books, flattening, outcome_tx, &out.slug, &out.ack, out.position.as_ref()) {
                             naked_leg_failclose(&out.slug, SubmitKind::Entry, &out.ack, halt);
-                            crate::exec_log::fire_outcome(&out.slug, "naked_halt", &naked);
+                            crate::exec_log::fire_outcome(&out.slug, "naked_halt", &naked, live);
                         } else {
-                            crate::exec_log::fire_outcome(&out.slug, "recover", &naked);
+                            crate::exec_log::fire_outcome(&out.slug, "recover", &naked, live);
                         }
                     }
                 }
             }
+            // EVERY Entry resolution stamps the per-slug cooldown (the caller inserts on this `Some`) — the
+            // fire site already stamped it; re-stamping on resolution extends the window past a churn burst.
+            Some(out.slug)
         }
         SubmitKind::Unwind => {
             flattening.remove(&out.slug); // a non-flat outcome lets the poll re-emit to retry
@@ -229,6 +238,7 @@ pub(crate) fn apply_outcome(
                 println!("[UNWIND] WARN {} did not fully flatten (one leg unfilled); poll re-emits", out.slug);
                 naked_leg_failclose(&out.slug, SubmitKind::Unwind, &out.ack, halt);
             }
+            None // an unwind does not gate a fresh entry's cooldown
         }
         SubmitKind::Recovery => {
             // a naked-leg RECOVERY flatten (single SELL of the already-filled leg, fired by FIX A). The
@@ -248,6 +258,7 @@ pub(crate) fn apply_outcome(
                     out.slug, out.ack.a
                 );
             }
+            None // a recovery does not gate a fresh entry's cooldown
         }
     }
 }
@@ -352,6 +363,19 @@ pub(crate) fn recover_naked_leg(
     let resting_idx = 1 - filled_idx;
     let filled_leg = &pos.legs[filled_idx];
     let resting_ack = if resting_idx == 0 { &ack.a } else { &ack.b };
+
+    // AMBIGUOUS UNFILLED LEG (2026-06-15): under FOK a clean MISS returns Ok(not-filled); an Err means a
+    // 4xx-reject or a transport error whose order fate is UNKNOWN — it may have LANDED + FILLED. If we
+    // flattened the KNOWN-filled leg now and the "unfilled" leg actually filled too, we'd UN-HEDGE a real
+    // LOCK (sell off one side of a both-filled pair). FAIL CLOSED: return false so the caller halts for a
+    // manual reconcile, rather than guess. (A clean Ok-but-resting unfilled leg proceeds to recovery below.)
+    if resting_ack.is_err() {
+        eprintln!(
+            "[live] CRITICAL NAKED LEG on {slug}: the unfilled leg ERR'd ({resting_ack:?}) — its order fate is \
+             UNKNOWN (may have FILLED) -> NOT flattening (could be a real LOCK); HALTING for manual reconcile."
+        );
+        return false;
+    }
 
     // W-1: the slug's flatten slot is occupied — by WHAT decides whether this naked leg is covered.
     //   * Recovery: a prior recovery for THIS slug's naked leg is already in flight -> genuinely covered ->
@@ -1355,7 +1379,10 @@ mod tests {
         let mut pb = book::PmusBook::new();
         pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
         pmus_books.insert(slug.clone(), pb);
-        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("add-a"), b: Err(exec::ExecError::RateLimited) }, position: Some(add_pos), pair: Some(pair.clone()), cost_per: 0.95, entry_net: 0.06, entry_dir: Dir::PK };
+        // the unfilled leg is a CLEAN FOK-miss (Ok, not filled) — so it reaches the W-1 unwind-slot check
+        // rather than the 2026-06-15 ambiguous-Err early fail-close (which is exercised separately below).
+        let resting = || Ok(exec::Ack { client_order_id: "add-b".into(), venue_order_id: "PM-2".into(), filled: false, simulated: false });
+        let out = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: live_ack("add-a"), b: resting() }, position: Some(add_pos), pair: Some(pair.clone()), cost_per: 0.95, entry_net: 0.06, entry_dir: Dir::PK };
         let mut rx = run_apply(&dry_backend(), &positions, &empty_kbooks(), &pmus_books, &mut exp, &mut pending, &mut flat, &halt, out);
         // THE FIX: the add's naked leg is NOT silently abandoned — the bot FAIL-CLOSES (halt). (Pre-fix this
         // was halt==false, the abandon.) The add's reservation is still released; the base position + its
@@ -1373,7 +1400,7 @@ mod tests {
         flat_rec.insert(slug.clone(), FlatKind::Recovery);
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
         let covered = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat_rec, &tx2,
-            &slug, &exec::PairAck { a: live_ack("x"), b: Err(exec::ExecError::RateLimited) }, Some(&position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs)));
+            &slug, &exec::PairAck { a: live_ack("x"), b: resting() }, Some(&position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs)));
         assert!(covered, "a recovery-held slot is genuinely covered -> recover_naked_leg returns true (no double-fire, no halt)");
 
         // SAFE BRANCH 2 (mirror of the bug, isolated): an UNWIND-held slot returns FALSE so the caller halts.
@@ -1381,7 +1408,46 @@ mod tests {
         flat_unw.insert(slug.clone(), FlatKind::Unwind);
         let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
         let covered_unw = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat_unw, &tx3,
-            &slug, &exec::PairAck { a: live_ack("x"), b: Err(exec::ExecError::RateLimited) }, Some(&position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs)));
+            &slug, &exec::PairAck { a: live_ack("x"), b: resting() }, Some(&position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &add_legs)));
         assert!(!covered_unw, "an unwind-held slot does NOT cover a fresh naked leg -> false -> caller fail-closes");
+    }
+
+    /// AMBIGUOUS-LEG FAIL-CLOSE (2026-06-15): when the UNFILLED leg ERR'd (a 4xx/transport error, fate
+    /// UNKNOWN — it may have FILLED), `recover_naked_leg` must FAIL CLOSED (return false -> caller halts)
+    /// EVEN when the filled leg's book IS priceable. Flattening the known-filled leg while the "unfilled" one
+    /// might also have filled would un-hedge a real LOCK. A clean Ok-but-resting miss (FOK kill) still
+    /// recovers — contrast asserted here so the gate is by ERR, not by "not filled".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn errd_unfilled_leg_fails_closed_even_with_priceable_book() {
+        let pair = wx_pair();
+        let legs = [
+            OrderIntent { venue: Venue::Pmus, market: pair.slug.clone(), action: Action::Buy, side: Side::Yes, price_cents: 7, qty: 3, client_order_id: "a".into() },
+            OrderIntent { venue: Venue::Kalshi, market: pair.kalshi.clone(), action: Action::Buy, side: Side::No, price_cents: 90, qty: 3, client_order_id: "b".into() },
+        ];
+        let pos = position_from_intents(&pair.slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
+        let slug = pos.market.clone();
+        // a PRICEABLE pmus book for the filled leg — so an Ok-resting miss WOULD recover; an Err must NOT.
+        let mut pmus_books: std::collections::HashMap<String, book::PmusBook> = std::collections::HashMap::new();
+        let mut pb = book::PmusBook::new();
+        pb.apply_snapshot(&[(0.06, 500.0)], &[(0.08, 500.0)]);
+        pmus_books.insert(slug.clone(), pb);
+
+        // leg A (pmus) filled LIVE; leg B (Kalshi) ERR'd -> fate unknown -> FAIL CLOSED (false), no flatten spawned.
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let errd = exec::PairAck { a: live_ack("a"), b: Err(exec::ExecError::Rejected("400 bad".into())) };
+        let launched = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat, &tx, &slug, &errd, Some(&pos));
+        assert!(!launched, "an ERR'd unfilled leg (fate unknown) must fail closed -> false -> caller halts");
+        assert!(!flat.contains_key(&slug), "no recovery flatten was marked (could un-hedge a possible lock)");
+        assert!(rx.try_recv().is_err(), "no recovery SELL was spawned for an ambiguous-Err naked outcome");
+
+        // CONTRAST: the same priceable book + an Ok-but-resting (clean FOK miss) DOES recover -> true.
+        let mut flat2: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        let resting = Ok(exec::Ack { client_order_id: "b".into(), venue_order_id: "K-2".into(), filled: false, simulated: false });
+        let ok_miss = exec::PairAck { a: live_ack("a"), b: resting };
+        let launched2 = recover_naked_leg(&dry_backend(), &empty_kbooks(), &pmus_books, &mut flat2, &tx2, &slug, &ok_miss, Some(&pos));
+        assert!(launched2, "a clean Ok-but-resting miss (not an Err) still recovers when the book is priceable");
+        assert_eq!(flat2.get(&slug), Some(&FlatKind::Recovery), "the clean-miss case marks the slug for recovery");
     }
 }

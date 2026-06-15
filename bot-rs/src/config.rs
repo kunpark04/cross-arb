@@ -48,6 +48,7 @@ pub struct Config {
     pub postpone_poll_s: u64,             // MLB statsapi postponement-poll cadence (owner droplet)
     pub auto_unwind: bool,                // arm the live postponement-unwind trigger (CROSSARB_NO_AUTO_UNWIND=1 disables)
     pub leg_fill_timeout_ms: u64,         // unwind leg A if leg B isn't filled in time
+    pub entry_cooldown_s: u64,            // 2026-06-15 incident: per-slug cooldown after firing/resolving an entry, so one slug can't churn-fire repeatedly (0 disables)
     pub require_settle_clean: bool,       // only trade settlement-verified pairs (econ/sports)
     pub discovery_refresh_s: u64,         // periodic re-discovery interval (monitor.py heartbeat = 300s)
 
@@ -104,6 +105,7 @@ impl Config {
             // armed by default (flattening a void REDUCES risk); CROSSARB_NO_AUTO_UNWIND=1 disengages it.
             auto_unwind: !env_bool("CROSSARB_NO_AUTO_UNWIND", false),
             leg_fill_timeout_ms: env_u64("LEG_FILL_TIMEOUT_MS", 500),
+            entry_cooldown_s: env_u64("ENTRY_COOLDOWN_S", 30),
             require_settle_clean: env_bool("REQUIRE_SETTLE_CLEAN", true),
             discovery_refresh_s: env_u64("DISCOVERY_REFRESH_S", 300),
 
@@ -156,6 +158,7 @@ impl Config {
             postpone_poll_s: 60,
             auto_unwind: true,
             leg_fill_timeout_ms: 500,
+            entry_cooldown_s: 0, // off in tests (like the other gates) — no behavior change
             require_settle_clean: true,
             discovery_refresh_s: 300,
             enable_scale_in: false,

@@ -345,6 +345,7 @@ mod tests {
             postpone_poll_s: 60,
             auto_unwind: true,
             leg_fill_timeout_ms: 500,
+            entry_cooldown_s: 0,
             require_settle_clean: true,
             discovery_refresh_s: 300,
             enable_scale_in: false,

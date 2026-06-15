@@ -25,6 +25,12 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
 
     let http = reqwest::Client::builder().use_rustls_tls().build().unwrap_or_else(|_| reqwest::Client::new());
 
+    // Execution liveness, computed once from the backend label (DryRunBackend -> "dry-run"). Routes the exec
+    // log to the LIVE file vs a separate `.dryrun` file so a dry-run never pollutes the real-money audit
+    // trail (2026-06-15). Used for `book_snapshot` here; `apply_outcome`/`fire_outcome` derive it from the
+    // same `backend.label()`.
+    let live = backend.label() != "dry-run";
+
     // INITIAL DISCOVERY (PUBLIC, no-auth catalog pull). A degraded/empty first pass is not fatal — seed
     // with whatever discovery returns (possibly nothing) and let the refresh task fill in; the loop never
     // invents a universe to trade.
@@ -80,6 +86,13 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
     // slot (which doesn't cover a freshly-naked add leg) apart from a recovery-held one.
     let mut pending_entries: HashSet<String> = HashSet::new();
     let mut flattening: HashMap<String, FlatKind> = HashMap::new();
+
+    // PER-SLUG ENTRY COOLDOWN (2026-06-15 incident): a slug stamps `Instant::now()` the moment an entry FIRES
+    // and again on EVERY entry OUTCOME; a fresh entry on a slug is refused while `elapsed < entry_cooldown_s`.
+    // This stops the churn where one slug fired the same arb repeatedly within seconds (FOK now makes a miss
+    // terminal, but the cooldown is the belt to that suspenders). OFF (entry_cooldown_s=0) in tests + dry-run-
+    // by-default behavior is unchanged. Pruned each heartbeat so the map can't grow unbounded.
+    let mut cooldown: HashMap<String, std::time::Instant> = HashMap::new();
 
     // `CROSSARB_MAX_ENTRIES=N`: stop opening NEW entries after N have fired this run (recovery/unwind still run;
     // the held position settles normally). For a SAFE first live run set it to 1 -> the bot fires EXACTLY ONE
@@ -206,7 +219,11 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             }
             o = outcome_rx.recv() => {
                 if let Some(out) = o {
-                    apply_outcome(&backend, &positions, &kalshi_books, &pmus_books, &mut exposure, &mut pending_entries, &mut flattening, &outcome_tx, &halt, out);
+                    // re-stamp the per-slug cooldown on EVERY entry resolution (Some(slug) iff Entry) so a
+                    // settled/aborted/recovered entry extends the window past a churn burst (2026-06-15).
+                    if let Some(s) = apply_outcome(&backend, &positions, &kalshi_books, &pmus_books, &mut exposure, &mut pending_entries, &mut flattening, &outcome_tx, &halt, out) {
+                        cooldown.insert(s, std::time::Instant::now());
+                    }
                 }
                 continue;
             }
@@ -217,6 +234,9 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 let (p50, p99, mx, n) = pct_summary(&mut frame_lat_us);
                 println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={}, deployed=${:.2}, open={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
                          k_fresh.len(), exposure.stream_paused, exposure.total, exposure.open_positions);
+                // PRUNE expired per-slug cooldowns so the map can't grow unbounded (keep entries only while
+                // they could still gate: 2× the cooldown, min 60s, well past `entry_cooldown_s`).
+                cooldown.retain(|_, t| t.elapsed().as_secs() < cfg.entry_cooldown_s.saturating_mul(2).max(60));
                 // GATE OUTCOMES this window — which gate is binding (is the 0020 recovery-cost gate too strict?).
                 if !gate_outcomes.is_empty() {
                     let mut go: Vec<(&&'static str, &u64)> = gate_outcomes.iter().collect();
@@ -360,6 +380,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
         if halt.load(Ordering::Relaxed)
             || pending_entries.contains(&slug)
             || flattening.contains_key(&slug)
+            || (cfg.entry_cooldown_s > 0 && cooldown.get(&slug).is_some_and(|t| t.elapsed().as_secs() < cfg.entry_cooldown_s))
         {
             continue;
         }
@@ -430,7 +451,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 }
                 // ENTRY book snapshot (0020 follow-up): record the books we fired against so a later naked-leg
                 // recovery can be decomposed into spread-vs-move (the FILL prices are already in exec_log).
-                exec_log::book_snapshot("entry", &slug, quote.pm.yes_bid, quote.pm.yes_ask, quote.k.yes_bid, quote.k.yes_ask, quote.depth.c2);
+                exec_log::book_snapshot("entry", &slug, quote.pm.yes_bid, quote.pm.yes_ask, quote.k.yes_bid, quote.k.yes_ask, quote.depth.c2, live);
                 // RESERVE exposure NOW (on spawn), so concurrent in-flight entries can't over-allocate; the
                 // outcome arm keeps the reservation on a both-filled fill (appends the leg) or releases it.
                 let pos = position_from_intents(&slug, pair.cat, &pair.cluster, pair.pm_min_tick, &legs);
@@ -439,6 +460,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 // deref-clone the shared `Arc<LivePair>` into the owned `LivePair` the outcome carries (only on
                 // the rare approved-fire path, never per frame); the poll reads its league/date/abbrevs later.
                 spawn_submit(&backend, &outcome_tx, SubmitKind::Entry, slug.clone(), legs, Some(pos), Some((*pair).clone()), a.cost_per, edge.net, edge.dir);
+                cooldown.insert(slug.clone(), std::time::Instant::now()); // 2026-06-15: start the per-slug entry cooldown at the fire
                 entries_fired += 1;
                 if max_entries == Some(entries_fired) {
                     println!("[live] CROSSARB_MAX_ENTRIES={entries_fired} reached — holding this position to settlement; NO new entries will open (recovery/unwind stay active).");

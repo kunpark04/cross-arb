@@ -375,6 +375,14 @@ impl LiveBackend {
             "client_order_id": intent.client_order_id,
         });
         body[price_key] = serde_json::json!(intent.price_cents);
+        // FILL-OR-KILL on entry BUYs (2026-06-15 incident fix). A resting GTC limit that the bot reads as
+        // "not filled" at one instant can FILL SECONDS LATER -> an untracked naked position (the incident's
+        // root cause). FOK forces the venue to fill the whole clip IMMEDIATELY or KILL it, so "not filled"
+        // becomes TERMINAL: no late fill, no cancel race. Recovery/unwind SELLs deliberately stay GTC — they
+        // flatten a KNOWN leg, and a rested SELL at worst triggers a needless halt, never a naked position.
+        if matches!(intent.action, Action::Buy) {
+            body["time_in_force"] = serde_json::json!("fill_or_kill");
+        }
         body.to_string()
     }
 
@@ -413,13 +421,22 @@ impl LiveBackend {
             Side::No => 100u8.saturating_sub(intent.price_cents),
         };
         let value = format!("{:.2}", (yes_cents as f64) / 100.0);
+        // FILL-OR-KILL on entry BUYs (2026-06-15 incident fix — same rationale as the Kalshi leg). A GTC pmus
+        // order RESTS after the synchronousExecution block expires and can fill LATER, after the bot read it
+        // "not filled" -> an untracked naked position. FOK kills an unfilled clip at the venue (still inside the
+        // block, which still returns a real fill verdict), so "not filled" is TERMINAL. Recovery/unwind SELLs
+        // (flattening a KNOWN leg) stay GTC.
+        let tif = match intent.action {
+            Action::Buy => "TIME_IN_FORCE_FILL_OR_KILL",
+            Action::Sell => "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+        };
         serde_json::json!({
             "marketSlug": intent.market,
             "intent": order_intent,
             "type": "ORDER_TYPE_LIMIT",
             "price": {"value": value, "currency": "USD"},
             "quantity": intent.qty,
-            "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+            "tif": tif,
             // block until the order resolves so the response carries a real fill state (no clientOrderId:
             // pmus has no idempotency token — see the doc above). maxBlockTime is a STRING per the schema.
             "synchronousExecution": true,
@@ -763,6 +780,7 @@ mod tests {
             postpone_poll_s: 60,
             auto_unwind: true,
             leg_fill_timeout_ms: 500,
+            entry_cooldown_s: 0,
             require_settle_clean: true,
             discovery_refresh_s: 300,
             enable_scale_in: false,
@@ -785,6 +803,13 @@ mod tests {
         assert!(body.contains("\"action\":\"buy\"") && body.contains("\"side\":\"no\"") && body.contains("\"count\":1"));
         // a NO leg prices via `no_price` (its own side), NOT `yes_price` — the pmus-class side-pricing fix.
         assert!(body.contains("\"no_price\":14") && !body.contains("yes_price"), "NO leg must use no_price: {body}");
+        // FOK on entry BUYs (2026-06-15 incident fix): a kill-on-no-fill makes "not filled" TERMINAL — no
+        // late fill of a resting GTC limit -> no untracked naked position.
+        assert!(body.contains("\"time_in_force\":\"fill_or_kill\""), "entry BUY must be FOK: {body}");
+        // a SELL (recovery/unwind flatten of a KNOWN leg) deliberately stays GTC — no FOK field.
+        let sell = OrderIntent { action: Action::Sell, ..intent.clone() };
+        let sbody = bk.build_kalshi_payload(&sell);
+        assert!(!sbody.contains("time_in_force"), "a SELL flatten stays GTC (no FOK): {sbody}");
         assert!(bk.kalshi_base().contains("demo")); // sandbox default
         // no signing keys loaded in the sandbox (KALSHI_RW_KEY_PATH empty) -> both legs refuse to send.
         let r = bk.submit_pair(&intent, &intent);
@@ -821,6 +846,7 @@ mod tests {
             postpone_poll_s: 60,
             auto_unwind: true,
             leg_fill_timeout_ms: 500,
+            entry_cooldown_s: 0,
             require_settle_clean: true,
             discovery_refresh_s: 300,
             enable_scale_in: false,
@@ -851,6 +877,9 @@ mod tests {
         assert_eq!(v["maxBlockTime"], "1", "sub-1s timeout floors up to the 1s minimum block");
         // FIX 2: pmus has NO idempotency key — the payload must NOT carry a clientOrderId (silently dropped).
         assert!(v.get("clientOrderId").is_none(), "pmus payload must not send a clientOrderId: {v}");
+        // FOK on entry BUYs (2026-06-15 incident fix): an unfilled clip is killed at the venue inside the
+        // synchronousExecution block -> "not filled" is TERMINAL, no resting GTC order fills later unhedged.
+        assert_eq!(v["tif"], "TIME_IN_FORCE_FILL_OR_KILL", "pmus entry BUY must be FOK");
         assert_eq!(v["price"]["value"], "0.07"); // YES leg: price is the YES price as-is
         assert_eq!(v["price"]["currency"], "USD");
         // Buy+No -> BUY_SHORT, and CRITICALLY the price is the YES-EQUIVALENT (1 - NO price): a NO leg with
@@ -860,12 +889,17 @@ mod tests {
         let nv: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&no)).unwrap();
         assert_eq!(nv["intent"], "ORDER_INTENT_BUY_SHORT");
         assert_eq!(nv["price"]["value"], "0.93"); // 1 - 0.07 (YES-denominated) — the fix
+        assert_eq!(nv["tif"], "TIME_IN_FORCE_FILL_OR_KILL", "a NO entry BUY is also FOK");
         let sell = OrderIntent { action: Action::Sell, side: Side::Yes, ..intent.clone() };
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&bk.build_pmus_payload(&sell)).unwrap()["intent"], "ORDER_INTENT_SELL_LONG");
+        let sv: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&sell)).unwrap();
+        assert_eq!(sv["intent"], "ORDER_INTENT_SELL_LONG");
+        // a SELL (recovery/unwind flatten of a KNOWN leg) deliberately stays GTC, not FOK.
+        assert_eq!(sv["tif"], "TIME_IN_FORCE_GOOD_TILL_CANCEL", "a SELL flatten stays GTC");
         // Sell+No (SELL_SHORT) is also YES-denominated: a NO sell at price_cents=7 -> YES 0.93.
         let sn = OrderIntent { action: Action::Sell, side: Side::No, ..intent.clone() };
         let snv: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&sn)).unwrap();
         assert_eq!((snv["intent"].as_str(), snv["price"]["value"].as_str()), (Some("ORDER_INTENT_SELL_SHORT"), Some("0.93")));
+        assert_eq!(snv["tif"], "TIME_IN_FORCE_GOOD_TILL_CANCEL", "a NO SELL flatten stays GTC");
     }
 
     /// CRITICAL C2 regression: a venue-supplied `market`/`coid` containing a `"` (or `\`) must NOT malform
@@ -900,6 +934,7 @@ mod tests {
             postpone_poll_s: 60,
             auto_unwind: true,
             leg_fill_timeout_ms: 500,
+            entry_cooldown_s: 0,
             require_settle_clean: true,
             discovery_refresh_s: 300,
             enable_scale_in: false,
