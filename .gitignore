@@ -19,3 +19,8 @@ bot-rs/*.key
 # bot-rs execution log (runtime audit trail; CROSSARB_EXEC_LOG, default executions.jsonl) — never committed
 executions.jsonl
 **/executions.jsonl
+# bot stdout logs + dry-run exec log (runtime artifacts) — never committed
+bot-live.out
+**/bot-live.out
+executions.dryrun.jsonl
+**/executions.dryrun.jsonl
