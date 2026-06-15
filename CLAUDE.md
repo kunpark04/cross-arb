@@ -180,8 +180,12 @@ See [deploy/README.md](deploy/README.md).
   config** — rest on **Kalshi** (weather, $0 maker fee) + taker-hedge on pmus, bounded **+0.14–0.44¢/attempt**;
   rest-on-pmus is structurally toxic (15–16¢ hedge slippage) and full maker-maker carries 32% one-leg-naked —
   weather **trade-print + ladder logging is built** (spec'd from a measured 2-orders-of-magnitude sampling gap:
-  ~23.8k Kalshi weather prints/day vs 220 visible crossings) and rides the next redeploy to convert bounds into
-  measurements; **(b)** the adverse-selection **skip filter is null** overall, but a weather-only
+  ~23.8k Kalshi weather prints/day vs 220 visible crossings). **MEASURED 2026-06-15 → NOT_VIABLE ([0026](decisions/0026-maker-mode-not-viable-prereg-threshold.md), cont.15):**
+  `scripts/p_hedge_measure.py` on those WAVE-2 logs gives clock-corrected `p_hedge` 36–46% < ~53% breakeven, EV
+  negative — the +0.14–0.44¢ bound priced only the hedge SLIPPAGE, never the hedge-MISS, and the maker
+  structurally INVERTS [0025]'s fire-the-thinner-leg-first safety; shelved (re-measurable free, forward
+  threshold pre-registered; a stats-review caught a clock-skew look-ahead that had flipped the sign, [L44]);
+  **(b)** the adverse-selection **skip filter is null** overall, but a weather-only
   **leg-sequencing** signature (cheap-side-made opens 18% toxic vs dear-side-made 79%, z=4.6, small cells) is
   hypothesis-grade — pre-register before believing; **(c) early-exit = hold-all** (exit-all ≈ −1.5¢/pair;
   boundary-day maker-exit breakeven needs P(flip)>2%, measured 0/14 station-days — and the diverging leg is

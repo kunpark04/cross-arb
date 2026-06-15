@@ -6,6 +6,51 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 15) — maker mode measured NOT_VIABLE [0026]; coid-collision class CLOSED; breadth re-armed (sports/econ) + 1.5¢ floor; naked-recovery VERIFIED LIVE
+
+A very long session: resolved the biggest queued lever (maker) by MEASUREMENT, closed the coid-collision
+false-halt class, hardened the money path, and — after the owner caught I'd reverted to weather-only — re-armed
+breadth + lowered the floor. Three relaunch incidents, all reconciled **FLAT (0 naked positions, 0 loss)**.
+Everything committed + pushed (`b7f2ff2`).
+
+- **Maker mode NOT_VIABLE [0026] — measured, not assumed.** Owner asked to build the rest-on-Kalshi-weather maker
+  (the largest queued PnL lever). Adversarial scoping → a-priori NOT_VIABLE: it **INVERTS [0025]'s safety** —
+  resting on Kalshi fills the Kalshi leg FIRST, then reaches for the pmus hedge, which is thin ~77% → naked →
+  recovery loss; the +0.14–0.44¢ priced only the hedge SLIPPAGE, never the hedge-MISS. Built
+  `scripts/p_hedge_measure.py` to MEASURE `p_hedge` from the trades-/ladders- logs. First cut showed +EV — but
+  `stats-ml-logic-reviewer` caught a sign-flipping **clock-skew LOOK-AHEAD** (hedge matched to venue `vt` vs the
+  ladders' monitor-recv `t`, a structured ~150 s skew) [L44]. Clock-fixed: **p_hedge 36%/46% < ~53% breakeven,
+  EV negative, (city,date)-bootstrap P(EV>0) 0%/11%** → confirmed empirically. Design scoped + SHELVED
+  (re-measurable free); forward go-threshold pre-registered. `35ca63d`.
+- **Coid-collision class CLOSED — 3 false-halt incidents → root cause.** The deterministic entry coid
+  `xarb-{slug}-{idx}` collided on reuse. `fc6a51d`: advance the index on ANY landed order (not just locks) — a
+  fill-then-recover burns the coid (tiplem). `0fa2aba` [L43]: a FOK-REJECTED leg ALSO burns it (mdwhigh,
+  within-run) + a per-process `run_salt` so a RESTART can't reuse a prior run's burnt coids (in-memory index
+  resets, venue dedup is permanent). `4ff7fec`: unwind/flatten coids salted too (all four families closed) + an
+  internal-gate rejection ("pmus gated") is now a clean SKIP, not a halt.
+- **4 small live-money/measurement fixes (`38ad5bd`, backlog #1/#3/#7/#8, all adversarial-reviewed SOUND):** pmus
+  WS-reconnect freshness gate (`pm_fresh`, mirrors Kalshi's `k_fresh`); recovery-cost gate fail-CLOSED on a
+  one-sided book; `edge_rate` logged per fire (calibration); recovery book-snapshot. + venue-accurate abort
+  label (`df8a5b2`).
+- **3 relaunch incidents, all reconciled FLAT:** (a) omitted `PMUS_POST_SIGNING_VERIFIED=yes` → bot booted
+  healthy but halted on the first fire (pmus internally gated), ~40 min captured nothing [L41]; (b) a `cd`-leak
+  broke the relative exe path → exit-127, bot never started [L42]; (c) the coid collision [L43]. → built
+  **`bot-rs/run-live.sh`** (canonical launch: full env one place, cd-safe, secrets read inline).
+- **Edge-floor measured (`scripts/edge_floor_measure.py`, `049a288`) → lowered 2.0→1.5¢.** The [1.5,2.0)¢ band is
+  large by DISPLAYED depth (201/202 fillable, +52% by count) BUT displayed depth EVAPORATES (we lock ~23% of it)
+  → real gain modest (~+15% in cents, thinner-margin). The floor isn't the binding constraint — **liquidity is**.
+  1.5¢ defensible now (FOK verified live → 0023's "verify-at-2¢-first" reason is spent).
+- **Reverted to weather-only, then re-armed breadth (owner-caught).** The relaunch set `ASSUME_SPORTS_SETTLED=false`
+  (the conservative recipe), silently gating the sports the owner had been trading. Owner flagged it → re-armed
+  **sports + econ + WC at 1.5¢, cap 1** (1-contract mechanics test). `settle_unverified` gone; 411 pairs.
+- **Naked-recovery VERIFIED LIVE (backlog #2).** Arming sports → deeper books → the first real first-leg-fill
+  (ITF `beltho-celsan`): Kalshi leg filled, pmus missed → naked Kalshi → **auto-flattened cleanly, no halt**. The
+  recovery path had been built-but-unverified since the start.
+- **Improvement backlog** (`31af072` → `tasks/improvement-backlog-2026-06-15.md`): multi-agent survey, 17 ranked /
+  25 dropped. **Lessons L41–L44 added; decision 0026 filed.**
+
+---
+
 ## 2026-06-15 (cont. 14) — DYNAMIC fire-order (fire the thinner leg first) [0025] + recovery hardened on BOTH venues; pmus is the binding leg (live-corroborated)
 
 A long order-path session: shipped the dynamic fire-order, hardened recovery end-to-end, and live-corroborated
