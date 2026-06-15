@@ -6,6 +6,31 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 9) — LIVE INCIDENT: untracked naked positions from a fill-detection race → fill-or-kill fix [0021]
+
+The first multi-fire live run (5-position measurement, [0020] pmus-first) churned ONE UFC fight 4× in ~45s and
+left UNTRACKED naked positions — the owner caught it reconciling his Kalshi + pmus accounts vs the bot's exec log.
+
+- **Root cause (diagnosed + adversarially verified):** both legs rested as GTC limit orders → `filled:false` was
+  a SNAPSHOT, not terminal — a resting order fills LATE, after the read; the bot cancelled/aborted/recovered
+  assuming flat, then the order filled → untracked naked. Every symptom (Kalshi -GAE @51 cancel-404, pmus Topuria
+  @0.40 "missed", the 4× churn + 409s) was that one flaw. Settled to a few cents (1-contract caps held). [L34]
+- **Reconciliation corrected the diagnosis:** the owner's pmus history (Bought Gaethje @0.82 + the Topuria
+  buys/sells) was the ground truth that overturned an initial suspected pmus over-read (pmus filled correctly;
+  the race was Kalshi-rest-then-late-fill). [L26]
+- **Fix [0021] (`fadd544` + `e8a250e`):** (1) FILL-OR-KILL on entry BUYs (terminal fill verdict, no rest, no
+  race — both venues; SELLs stay GTC); (2) per-slug entry cooldown (`ENTRY_COOLDOWN_S=30`, fresh-entries-only);
+  (3) ambiguous-leg fail-close (an Err'd unfilled leg → halt, don't un-hedge a possible lock); (4) dry-run exec
+  log split to `executions.dryrun.jsonl`. 163 tests, clippy clean.
+- **Adversarial pipeline (ultracode):** diagnose-and-design workflow (FOK confirmed venue-supported; the DIM-2
+  cancel-verify was CORRECTED — under FOK a 404 cancel is benign) → coding-agent implement + self-review → an
+  independent review workflow (22 agents / 5 dimensions, every finding verified): **0 CRITICAL, 3 WARNs all
+  fixed** (cooldown scoped to fresh entries; the cooldown contract pinned by a test; pmus FOK enum flagged).
+- **GATED:** NOT re-armed live until the pmus `TIME_IN_FORCE_FILL_OR_KILL` enum is DEMO-verified (safe-fail if
+  wrong — pmus-first aborts, no naked leg). Bus: `tasks/_agent_bus/20260615-fill-race/`.
+
+---
+
 ## 2026-06-14 (cont. 8) — FIRST LIVE ARB (owner-override, all-events) → naked leg on trade #1; recovery worked; → pmus-first + recovery-cost gate
 
 Owner: "measure the latency of EVERYTHING" + "look at all events, not just weather." Added the one unmeasured

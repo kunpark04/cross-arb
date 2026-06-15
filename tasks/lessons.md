@@ -503,3 +503,27 @@ halt (no leg filled = clean abort, not a naked leg). Then **gate on recovery cos
 spread exceeds the edge, however deep the take side looks. The Kalshi spread is NOT gated — under pmus-first it
 locks and is held to settlement, never unwound. Decision [0020]. Corollary: log bid/ask/depth at BOTH entry and
 recovery so a naked leg's cost decomposes into spread-vs-move instead of being inferred after the fact.
+
+## L34 — "filled:false" from a RESTING order is a SNAPSHOT, not terminal — a resting limit fills LATE; make entry legs FILL-OR-KILL
+
+**Pattern:** The first multi-fire live run churned ONE UFC fight 4× in ~45s and left UNTRACKED naked positions
+(the owner caught it on his accounts). Both legs were GTC LIMIT orders. The bot reads each leg's fill ONCE from
+the create response; a non-marketable leg comes back `status:resting` / `filled:false`. But a resting GTC order
+FILLS SECONDS LATER when the market ticks to it — AFTER the bot already acted on "not filled" (cancelled the
+resting leg / aborted / recovered, all assuming flat). The cancel then races the late fill and LOSES (Kalshi
+-GAE @51 cancel 404'd because it had already filled; the pmus Topuria @0.40 "abort" had actually filled). Result:
+a naked DIRECTIONAL position the bot never tracked. The serial pmus-first delay + the aggressive-second-leg markup
+(a higher resting limit) made the rest-then-late-fill MORE likely, and the same-slug churn (no cooldown +
+deterministic `client_order_id`) compounded it into 4 fires + 409 dedup errors. Settled to a few cents — the
+1-contract caps held. An EARLIER mis-diagnosis (suspected pmus over-read) was corrected only by the owner's pmus
+HISTORY (Bought Gaethje @0.82 + the Topuria buys/sells) — the account was the ground truth ([L26]).
+
+**Rule:** An ARB ENTRY leg's fill verdict must be TERMINAL at read time — use **FILL-OR-KILL** (the venue kills an
+unfilled order; it never rests), so `filled:false` means the order is DEAD, not pending. NEVER fire a RESTING
+(GTC) limit for an entry and then rely on a client-side cancel to undo it — the cancel races the late fill and
+loses. (Recovery/unwind SELLs that flatten a KNOWN leg may stay GTC — a rested SELL at worst halts, never nakeds.)
+Corollaries: (a) under FOK, a cancel-404 is BENIGN (the order was killed) but an unfilled-leg ERR is AMBIGUOUS →
+fail-CLOSED (it may have landed+filled — don't un-hedge a possible lock); (b) a deterministic `client_order_id` +
+no per-slug cooldown lets one slug churn-fire + collide on the coid — add a cooldown; (c) reconcile the bot's
+belief against the actual ACCOUNT, always ([L26]) — the bot's "I cancelled it / it didn't fill" is a hypothesis,
+not a fact. Decision [0021].
