@@ -626,3 +626,31 @@ so don't book a slippage loss to force a fill. The only safe "more aggressive" k
 limit markup (capped by the edge, can't lose); market orders are the unbounded version where the losses live.
 The constraint is pmus LIQUIDITY — scale by breadth + the maker study + transient depth windows ([L37]), not by
 changing the order type.
+
+## L41 — Build a LIVE launch from the CANONICAL documented invocation, not a synthesized env recipe — a single missing arming flag silently breaks the run
+
+**Pattern:** The cap-5 relaunch was assembled from a pre-flight agent's env-var recipe, which listed `PMUS_*`
+secrets but OMITTED `PMUS_POST_SIGNING_VERIFIED=yes`. The bot booted clean (banner, both venues connected, no
+403) and ran ~40 min looking healthy — but pmus live submission is gated behind that flag (`exec.rs:549`,
+safe-by-default per [0015]). The FIRST entry that fired got the pmus leg rejected with "pmus live leg gated",
+the unrecognized-rejection classifier fail-closed to a KILL-SWITCH, and the cap-5 run captured ZERO trades. The
+canonical full invocation was in `bot-rs/src/flatten.rs:20` + `probe.rs:18` module docs the whole time.
+
+**Rule:** For a live-money launch, the SOURCE OF TRUTH is the canonical invocation documented in the code
+(`flatten.rs`/`probe.rs` module headers), not a freshly-synthesized recipe — diff your command against it and
+account for EVERY arming gate before firing. A clean boot + connected venues does NOT prove the bot can trade:
+the arming gates only bite at the first ORDER, so verify the first live fire actually SUBMITS before trusting a
+"healthy" heartbeat.
+
+## L42 — The Bash cwd PERSISTS across calls; a bare `cd X && cmd` leaks it and breaks the NEXT relative-path command
+
+**Pattern:** A portfolio-read command `cd .../scripts && python …` left the persistent Bash cwd in `scripts/`.
+The next command — the live relaunch using the relative `./target/release/cross-arb-bot.exe` — then resolved
+against `scripts/`, the exe wasn't there, and the launch died `exit 127` (the bot silently did NOT start). A
+RECURRENCE of the same class noted earlier this session (a `cd` to repo-root for a commit moving the cwd).
+
+**Rule:** Never let a `cd` leak. Wrap directory-scoped commands in a SUBSHELL `(cd X && cmd)` so the cwd is
+restored, or use absolute paths / tool-native dir flags (`git -C`, `cargo --manifest-path`). For a LIVE relaunch
+specifically, ALWAYS `cd` to the bot dir IN the launch command (the bot also needs cwd=bot-rs for its relative
+`.env`/`executions.jsonl`) and verify it actually started (a 127 produces no process + no banner) before walking
+away.
