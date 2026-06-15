@@ -76,3 +76,12 @@ Two changes, one lesson:
   depth at entry AND recovery so a naked leg's cost decomposes into spread-vs-move, not inferred ([L33]).
 - Arming stays an owner action under [0006](0006-deploy-on-digitalocean-consult-first.md) /
   [0015](0015-owner-override-live-trading-phase.md); this was built from a real 1-contract live trade.
+- **Live-validated 2026-06-15 (1 contract, prod defaults).** A moneyline-UFC arb fired pmus-first: pmus filled
+  (654ms), the Kalshi leg fired second and MISSED (its price moved during the serial wait), the fast leg was
+  NEVER naked, and the residual naked-pmus recovered for **~2.4¢ (≈0¢ spread + fees) vs the −11¢ that motivated
+  this** — the recovery-cost gate kept the pmus leg tight. CONFIRMED two things: (1) the residual case is real
+  and cheap, and (2) the **serial delay itself can cause the second-leg miss**, so pmus-first trades a possibly-
+  higher naked RATE for a ~5× lower naked COST (n=1, not yet a rate estimate). Open follow-ups: an **aggressive-
+  but-capped second-leg fill** (cross deeper to lock once pmus is committed, but cap the pay-up at the edge floor
+  so it never eats the edge), and **logging gate-rejection counts** to test whether the 1.0 ratio is too strict.
+  Detail: docs/sessions.md 2026-06-14 (cont. 8).

@@ -30,8 +30,18 @@ latency stage, then ran the first live armed all-events arb — it hit a naked l
 - **Decision [0020](../decisions/0020-pmus-first-serial-plus-recovery-cost-gate.md) + [L33]: pmus-first serial
   execution** (fire the slow/uncertain pmus leg first; open Kalshi only on its confirmed fill ⇒ structurally no
   naked fast leg; cancel the resting GTC pmus order on abort, no halt) **+ a recovery-cost gate** (skip arbs whose
-  pmus bid↔ask spread — the residual naked-unwind cost — exceeds the edge). Built + re-tested live this session.
-  Follow-up: snapshot the book at entry+recovery to measure spread-vs-move.
+  pmus bid↔ask spread — the residual naked-unwind cost — exceeds the edge). Built `09a1438` (159 tests, clippy clean; dry-run byte-unchanged).
+- **Re-test VALIDATED pmus-first (`09a1438`, live, 1 contract, prod defaults):** fired a moneyline-UFC arb
+  (`aec-ufc-cirgan-alexper`, edge 2.1¢). The order log proved serial execution: **Pmus Buy YES @41¢ filled FIRST**
+  (654ms — a FILLED pmus order returns fast, vs the first trade's 1,533ms no-fill block), **then Kalshi Buy YES
+  @54¢ fired (only because pmus filled) and MISSED** (its price moved in the ~654ms serial window) → naked PMUS
+  leg → recovery SOLD pmus @41¢. **The fast Kalshi leg was NEVER naked** (it didn't fill → cancelled). Net **−2.4¢
+  (≈0¢ spread + pmus fees) vs the first trade's −11¢** — the recovery-cost gate kept the pmus leg tight
+  (spread ≤ edge) so flattening was ~free. Recovered to flat → NO unreconciled-UFC settlement risk taken. **Nuance
+  (n=1):** pmus-first didn't ELIMINATE the naked leg — it MOVED it to the cheap gated pmus leg, and the serial
+  delay itself caused the Kalshi miss. **Follow-ups:** (a) fire the SECOND leg more aggressively but cap the
+  pay-up at the edge floor (cut the residual miss rate without eating the edge); (b) log recovery-cost-gate
+  rejection counts to calibrate the 1.0 ratio (too-strict? unknown at n=1); (c) snapshot books at entry+recovery.
 
 ---
 
