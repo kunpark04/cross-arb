@@ -6,6 +6,26 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 12) — FIRST live FOK arb FIRED + account-reconciled → FOK enums LIVE-VERIFIED ACCEPTED
+
+The all-events 1-contract run (cont.11) fired its first FOK entry and it locked cleanly — the live verification
+that replaced the now-unavailable demo kill-confirm.
+
+- **The fire:** `aec-itfw-alepui-irifet-2026-06-15` (ITF women's tennis), dir KP, edge 2.6¢, decision 809µs. Exec
+  log: pmus BUY NO @70¢ (fired FIRST, pmus-first 0020) `filled:true`, THEN Kalshi BUY YES `…PUIFET-PUI` @25¢
+  `filled:true`. No naked leg, no recovery. `deployed=$0.97, open=1`.
+- **Account-reconciled (owner, [L26]):** Kalshi YES **Puiac** @26¢ (25¢ + 1¢ fee) + pmus YES **Fetecau** @70¢ — the
+  same lock (YES on the two OPPOSITE players → one pays $1 regardless of who wins). Bot record == account.
+- **FOK enums LIVE-VERIFIED ACCEPTED:** both Kalshi `fill_or_kill` AND pmus `TIME_IN_FORCE_FILL_OR_KILL` were
+  accepted + filled (not rested, not 400-rejected) — the demo-gate (0021) is satisfied by the live fire
+  (`no-demo-verify-live-only` memory). NOT yet directly observed: the kill-on-NO-fill path (both legs filled this
+  time) — documented FOK semantics; the first leg-MISS confirms it. `exec.rs` comments updated.
+- **Caveat:** ITF has no auto-unwind (`statsapi` is MLB-only), so this position relies on the match completing +
+  both venues settling identically (the sports settlement risk taken on with all-events). Run holds it to the 2h
+  exit; continuous is a separate owner go — the gate counter shows recurring approved-but-capped ≥2¢ flow.
+
+---
+
 ## 2026-06-15 (cont. 11) — revert to the 2¢ gate + run 1-contract LIVE (no demo ⇒ live IS the FOK verification) [0023]
 
 Owner: "return to the 2c gate, then run live with 1 contract — I don't have demo anymore."

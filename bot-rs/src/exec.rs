@@ -383,7 +383,9 @@ impl LiveBackend {
         // API-DOC-VERIFIED (docs.kalshi.com, 2026-06-15): /trade-api/v2/portfolio/orders takes time_in_force as
         // an OPTIONAL enum {fill_or_kill, good_till_canceled, immediate_or_cancel} — "fill_or_kill" is valid, and
         // an UNKNOWN value 400s (it is NOT silently rested as GTC), so this can't degrade into the late-fill race.
-        // Optional ⇒ the SELL path (no field) defaults to GTC, as intended. (Live demo-sandbox kill-confirm: TODO.)
+        // Optional ⇒ the SELL path (no field) defaults to GTC, as intended. LIVE-VERIFIED ACCEPTED 2026-06-15
+        // (ITF arb: a fill_or_kill BUY YES @25¢ filled + owner-reconciled); kill-on-miss = documented FOK
+        // semantics, not yet directly observed (both legs filled — the first leg-MISS confirms it).
         if matches!(intent.action, Action::Buy) {
             body["time_in_force"] = serde_json::json!("fill_or_kill");
         }
@@ -430,11 +432,13 @@ impl LiveBackend {
         // "not filled" -> an untracked naked position. FOK kills an unfilled clip at the venue (still inside the
         // block, which still returns a real fill verdict), so "not filled" is TERMINAL. Recovery/unwind SELLs
         // (flattening a KNOWN leg) stay GTC.
-        // ⚠️ DEMO-VERIFY BEFORE LIVE: the `TIME_IN_FORCE_FILL_OR_KILL` enum is NOT yet primary-source-confirmed
-        // (the GTC value is confirmed-by-use since 2026-06-11; FOK is new). SAFE-FAIL if wrong: under pmus-first
-        // the pmus leg fires FIRST, so a 400 enum-reject -> Err -> the entry ABORTS (no Kalshi leg, no naked
-        // position) — an availability stop, never a safety risk. Confirm in demo that a FOK BUY that can't fill
-        // returns 2xx-no-fill (-> Ok(filled:false), the "clean miss" the recovery assumes), then pin it [L32].
+        // LIVE-VERIFIED ACCEPTED (2026-06-15, ITF arb aec-itfw-alepui-irifet): a FOK BUY NO @70¢ with this enum
+        // FILLED (filled:true) + owner-reconciled — so `TIME_IN_FORCE_FILL_OR_KILL` is venue-accepted (NOT a
+        // 400-reject) and a fillable FOK fills. NOT yet directly observed: the kill-on-NO-fill path (an unfillable
+        // FOK BUY -> 2xx-no-fill -> Ok(filled:false), the "clean miss" recovery assumes) — both legs filled this
+        // fire, so the first leg-MISS confirms it (no demo to force it, see [[no-demo-verify-live-only]]). SAFE-FAIL
+        // meanwhile: pmus-first fires this leg FIRST, so any enum/transport failure -> Err -> the entry ABORTS
+        // (no Kalshi leg, no naked position) — an availability stop, never a safety risk. [L32]
         let tif = match intent.action {
             Action::Buy => "TIME_IN_FORCE_FILL_OR_KILL",
             Action::Sell => "TIME_IN_FORCE_GOOD_TILL_CANCEL",
