@@ -158,7 +158,22 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
     heartbeat.tick().await; // consume the immediate first tick
     let mut events: u64 = 0;
 
+    // LATENCY of EVERYTHING (owner ask 2026-06-14): time the in-loop COMPUTE per venue frame — book apply +
+    // freshness gate + Quote build + signal/depth + risk evaluate + (rare) build_legs/spawn. This was the one
+    // pipeline stage we had only ASSUMED was ~0; now it's MEASURED. `proc_t0` is stamped when a venue frame
+    // falls through the select and READ at the next loop-top, so every `continue` exit path is captured. The
+    // order RTT (the dominant, network-bound stage) is already logged per leg in exec_log; the heartbeat
+    // reports p50/p99/max of the per-frame compute (µ-seconds) over each 20s window, then clears.
+    let mut proc_t0: Option<std::time::Instant> = None;
+    let mut frame_lat_us: Vec<f64> = Vec::with_capacity(32768);
+
     loop {
+        // LATENCY: record the PREVIOUS venue-frame's full in-loop compute time (stamped at frame-receipt
+        // below, read HERE so every `continue` exit path is timed). `None` after a heartbeat/unwind/outcome
+        // tick (those arms `continue` without stamping), so only real frame processing enters the distribution.
+        if let Some(t) = proc_t0.take() {
+            frame_lat_us.push(t.elapsed().as_secs_f64() * 1e6);
+        }
         // C1 (robustness): a supervised task can finish WHILE the loop is in its body — and the guarded
         // `select!` arms below (`if !is_finished()`) are then DISABLED, so that death would never wake the
         // select. Re-check at the TOP of every iteration: any finished collector/refresh/poll = FATAL halt
@@ -194,7 +209,9 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             _ = heartbeat.tick() => {
                 let (kb, pmb) = (lock(&kalshi_books).len(), pmus_books.len());
                 let pn = lock(&pairs).by_slug.len();
-                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={}",
+                // LATENCY: p50/p99/max (µs) of the per-frame in-loop compute over this 20s window, then clear.
+                let (p50, p99, mx, n) = pct_summary(&mut frame_lat_us);
+                println!("[live] heartbeat: {pn} pairs, {kb} kalshi books, {pmb} pmus books, {events} frames, k_fresh={}, paused={} | frame-compute us p50={p50:.1} p99={p99:.1} max={mx:.1} (n={n})",
                          k_fresh.len(), exposure.stream_paused);
                 continue;
             }
@@ -206,6 +223,7 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             r = poll_opt(&mut poll_handle), if poll_handle.is_some() => { supervise_fatal("poll_mlb_postponements", r, &halt); break; }
         };
         events = events.wrapping_add(1); // a venue book frame fell through the select (heartbeat activity)
+        proc_t0 = Some(std::time::Instant::now()); // LATENCY: start timing THIS frame's in-loop compute
         // which pmus slug does this event touch? (book updates first, then evaluate on the complete state)
         let slug = match &ev {
             venue::VenueEvent::Kalshi { ticker } => {
@@ -364,15 +382,18 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
             // against this accruing distribution): every fired ENTRY logs its edge + edge_rate (¢/$-day). An
             // ADD additionally logs its scale-in|re-entry tag + the base vs add net so an armed add is
             // auditable (design §2). `add_tag` is None for a fresh entry (the common case).
+            // LATENCY (per-fire): frame-receipt -> this fire = the in-loop compute that produced the order. The
+            // order RTT that follows is logged per leg in exec_log; decision + RTT = the full fire chain measured.
+            let decision_us = proc_t0.map(|t| t.elapsed().as_secs_f64() * 1e6).unwrap_or(0.0);
             if let Some(tag) = add_tag {
                 let base_net = held_legs.iter().map(|l| l.entry_net).fold(0.0_f64, f64::max);
                 println!(
-                    "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}",
+                    "[live] ADD({tag}) {slug}  base_net={:.1}c  add_net={:.1}c  size={}  @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
                     base_net * 100.0, edge.net * 100.0, a.size, a.edge_rate, edge.dir
                 );
             } else {
                 println!(
-                    "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}",
+                    "[live] ENTRY {slug}  size={}  edge={:.1}c @ {:.2}c/$-day  dir={:?}  decision={decision_us:.0}us",
                     a.size, edge.net * 100.0, a.edge_rate, edge.dir
                 );
             }
@@ -418,6 +439,22 @@ fn supervise_fatal(name: &str, res: Result<(), tokio::task::JoinError>, halt: &s
     }
 }
 
+/// p50/p99/max (µs) of the accumulated per-frame compute latencies, then CLEAR the buffer (so each call
+/// reports one 20s heartbeat window). Returns (p50, p99, max, n); empty -> all-zeros. Sorts in place — cheap
+/// at the ~10^4 samples/window the loop produces, and it's off the per-frame hot path (heartbeat-only).
+fn pct_summary(samples: &mut Vec<f64>) -> (f64, f64, f64, usize) {
+    let n = samples.len();
+    if n == 0 {
+        return (0.0, 0.0, 0.0, 0);
+    }
+    samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = samples[n / 2];
+    let p99 = samples[(n * 99 / 100).min(n - 1)];
+    let max = samples[n - 1];
+    samples.clear();
+    (p50, p99, max, n)
+}
+
 /// Determine which venue led the current edge by comparing each venue's mid to the prior snapshot: the
 /// venue whose mid moved MORE since last time is the mover. `None` on the first sighting (no prior).
 fn led_by_from_prior(
@@ -446,4 +483,33 @@ fn led_by_from_prior(
     };
     prior.insert(slug.to_string(), (pm_mid, k_mid));
     led
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pct_summary_basic_and_clears() {
+        // 1..=100 -> p50 at index 50 (value 51), p99 at index 99 (value 100), max 100.
+        let mut s: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let (p50, p99, max, n) = pct_summary(&mut s);
+        assert_eq!(n, 100);
+        assert_eq!(p50, 51.0);
+        assert_eq!(p99, 100.0);
+        assert_eq!(max, 100.0);
+        assert!(s.is_empty(), "buffer must be cleared so each call is one heartbeat window");
+    }
+
+    #[test]
+    fn pct_summary_empty_is_zeros() {
+        let mut s: Vec<f64> = vec![];
+        assert_eq!(pct_summary(&mut s), (0.0, 0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn pct_summary_single_sample() {
+        let mut s = vec![7.5];
+        assert_eq!(pct_summary(&mut s), (7.5, 7.5, 7.5, 1));
+    }
 }
