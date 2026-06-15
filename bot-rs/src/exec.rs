@@ -426,6 +426,11 @@ impl LiveBackend {
         // "not filled" -> an untracked naked position. FOK kills an unfilled clip at the venue (still inside the
         // block, which still returns a real fill verdict), so "not filled" is TERMINAL. Recovery/unwind SELLs
         // (flattening a KNOWN leg) stay GTC.
+        // ⚠️ DEMO-VERIFY BEFORE LIVE: the `TIME_IN_FORCE_FILL_OR_KILL` enum is NOT yet primary-source-confirmed
+        // (the GTC value is confirmed-by-use since 2026-06-11; FOK is new). SAFE-FAIL if wrong: under pmus-first
+        // the pmus leg fires FIRST, so a 400 enum-reject -> Err -> the entry ABORTS (no Kalshi leg, no naked
+        // position) — an availability stop, never a safety risk. Confirm in demo that a FOK BUY that can't fill
+        // returns 2xx-no-fill (-> Ok(filled:false), the "clean miss" the recovery assumes), then pin it [L32].
         let tif = match intent.action {
             Action::Buy => "TIME_IN_FORCE_FILL_OR_KILL",
             Action::Sell => "TIME_IN_FORCE_GOOD_TILL_CANCEL",

@@ -380,7 +380,11 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
         if halt.load(Ordering::Relaxed)
             || pending_entries.contains(&slug)
             || flattening.contains_key(&slug)
-            || (cfg.entry_cooldown_s > 0 && cooldown.get(&slug).is_some_and(|t| t.elapsed().as_secs() < cfg.entry_cooldown_s))
+            // ENTRY COOLDOWN — FRESH ENTRIES ONLY (`held_legs.is_empty()`): the churn this stops was the same
+            // FRESH arb re-firing. A held slug is an ADD, gated below by `qualifying_add` (+ the per-slug count
+            // cap), so it must NOT be cooldown-blocked — a scale-in targets a ~1s line-lag dislocation that a
+            // 30s cooldown would always miss. (At the safe default both add flags are off, so this is moot.)
+            || (held_legs.is_empty() && cfg.entry_cooldown_s > 0 && cooldown.get(&slug).is_some_and(|t| t.elapsed().as_secs() < cfg.entry_cooldown_s))
         {
             continue;
         }

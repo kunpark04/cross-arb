@@ -745,6 +745,50 @@ mod tests {
         rx
     }
 
+    /// Like `run_apply` but RETURNS `apply_outcome`'s `Option<String>` — the per-slug cooldown contract the
+    /// whole churn-cooldown depends on (Some(slug) for an Entry outcome, None for Unwind/Recovery).
+    #[allow(clippy::too_many_arguments)]
+    fn run_apply_ret(
+        backend: &std::sync::Arc<dyn ExecutionBackend>,
+        positions: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, postpone::SlugPositions>>>,
+        kalshi_books: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, book::KalshiBook>>>,
+        pmus_books: &std::collections::HashMap<String, book::PmusBook>,
+        exp: &mut Exposure,
+        pending: &mut std::collections::HashSet<String>,
+        flat: &mut std::collections::HashMap<String, FlatKind>,
+        halt: &AtomicBool,
+        out: SubmitOutcome,
+    ) -> Option<String> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<SubmitOutcome>();
+        apply_outcome(backend, positions, kalshi_books, pmus_books, exp, pending, flat, &tx, halt, out)
+    }
+
+    /// COOLDOWN CONTRACT (2026-06-15): `apply_outcome` returns `Some(slug)` for EVERY Entry outcome (so the
+    /// loop stamps the per-slug cooldown that stops churn) and `None` for Unwind/Recovery (those must not cool
+    /// an entry slug). The whole churn-cooldown rests on this return value; pin it.
+    #[test]
+    fn apply_outcome_returns_cooldown_slug_for_entry_only() {
+        use std::sync::{Arc, Mutex};
+        let positions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut exp = Exposure::new();
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flat: std::collections::HashMap<String, FlatKind> = std::collections::HashMap::new();
+        let halt = AtomicBool::new(false);
+        let (pair, pos, cp) = wx_entry_pair();
+        let slug = pos.market.clone();
+        reserve_exposure(&mut exp, &pos, cp);
+        pending.insert(slug.clone());
+        // ENTRY (both-filled lock) -> Some(slug)
+        let entry = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Entry, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: Some(pos), pair: Some(pair), cost_per: cp, entry_net: 0.03, entry_dir: Dir::PK };
+        assert_eq!(run_apply_ret(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, entry).as_deref(), Some(slug.as_str()), "an Entry outcome cools its slug");
+        // UNWIND -> None (the cooldown gates ENTRIES, never unwinds)
+        let unwind = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Unwind, ack: exec::PairAck { a: sim_ack("a"), b: sim_ack("b") }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
+        assert_eq!(run_apply_ret(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, unwind), None, "Unwind does not cool the entry slug");
+        // RECOVERY (its SELL filled) -> None
+        let recovery = SubmitOutcome { slug: slug.clone(), kind: SubmitKind::Recovery, ack: exec::PairAck { a: sim_ack("a"), b: Err(exec::ExecError::Rejected("unused".into())) }, position: None, pair: None, cost_per: 0.0, entry_net: 0.0, entry_dir: Dir::PK };
+        assert_eq!(run_apply_ret(&dry_backend(), &positions, &empty_kbooks(), &std::collections::HashMap::new(), &mut exp, &mut pending, &mut flat, &halt, recovery), None, "Recovery does not cool the entry slug");
+    }
+
     fn dry_backend() -> std::sync::Arc<dyn ExecutionBackend> {
         std::sync::Arc::new(exec::DryRunBackend)
     }
