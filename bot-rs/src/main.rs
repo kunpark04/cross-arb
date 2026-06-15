@@ -95,7 +95,18 @@ async fn main() {
     let force_smoke = std::env::args().any(|a| a == "--smoke");
     match (force_smoke, venue::VenueCreds::from_env()) {
         (false, Ok(creds)) => {
-            run_live(&cfg, backend, std::sync::Arc::new(creds)).await;
+            let creds = std::sync::Arc::new(creds);
+            // `--duration N`: a BOUNDED verification run — connect WS + populate books + detect arbs for N
+            // seconds, then exit GRACEFULLY (flushes output, drops the streams). Without it, the loop runs
+            // until the venue streams end / the kill-switch (the normal 24/7 mode).
+            match run_duration_secs() {
+                Some(secs) => {
+                    println!("[startup] BOUNDED run: live loop for {secs}s then exit (verification).\n");
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(secs), run_live(&cfg, backend, creds)).await;
+                    println!("\n[live] {secs}s elapsed — verification run complete, exiting.");
+                }
+                None => run_live(&cfg, backend, creds).await,
+            }
         }
         (_, Err(why)) if !force_smoke => {
             println!("[startup] venue creds unavailable ({why}) -> running offline smoke instead.\n");
@@ -163,4 +174,13 @@ fn probe_order_iters() -> Option<usize> {
     let args: Vec<String> = std::env::args().collect();
     let i = args.iter().position(|a| a == "--probe-order")?;
     Some(args.get(i + 1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(8))
+}
+
+/// Parse `--duration <secs>` from argv — run the live loop for a BOUNDED time then exit gracefully (a
+/// verification run: connect WS, populate books, detect arbs for N seconds). `None` -> run until the streams
+/// end / kill-switch (the normal 24/7 mode).
+fn run_duration_secs() -> Option<u64> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--duration")?;
+    args.get(i + 1).and_then(|s| s.parse::<u64>().ok())
 }
