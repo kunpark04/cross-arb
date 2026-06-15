@@ -414,13 +414,12 @@ impl LiveBackend {
             Side::Yes => "yes_price",
             Side::No => "no_price",
         };
-        // `frac_qty` (a partial-fill recovery SELL) overrides the integer `count` with the EXACT fractional
-        // qty — Kalshi is whole-share so a fractional Kalshi recovery isn't expected, but honoring it keeps
-        // the size source single. A normal entry leaves `frac_qty=None` -> the integer `count` is BYTE-IDENTICAL.
-        let count = match intent.frac_qty {
-            Some(q) => serde_json::json!(q),
-            None => serde_json::json!(intent.qty),
-        };
+        // Kalshi is WHOLE-SHARE: `count` MUST be an INTEGER. A recovery SELL's `frac_qty` of a naked Kalshi leg
+        // is whole-valued (Kalshi can't fill fractional), so ROUND it to the int count — serializing the float
+        // `1.0` 400s ("cannot unmarshal number 1.0 into ... count of type int", LIVE 2026-06-15 on the dynamic
+        // order's FIRST naked-Kalshi recovery — the residual WARN 0024 flagged, dormant under pmus-first). A
+        // normal entry (`frac_qty=None`) uses the integer `qty`, BYTE-IDENTICAL.
+        let count = serde_json::json!(intent.frac_qty.map(|q| q.round() as u32).unwrap_or(intent.qty));
         let mut body = serde_json::json!({
             "action": action,
             "side": side,
@@ -1273,10 +1272,13 @@ mod tests {
         };
         let pv: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&base)).unwrap();
         assert_eq!(pv["quantity"], 0.01, "the pmus SELL sends the EXACT fractional 0.01, not the integer qty");
-        // Kalshi honors the override too (whole-share venue, but the size source stays single).
-        let k = OrderIntent { venue: Venue::Kalshi, market: "K".into(), ..base.clone() };
+        // Kalshi is WHOLE-SHARE: `count` MUST serialize as an INTEGER — a recovery SELL's frac_qty is
+        // whole-valued (round it). A float `1.0` 400s ("cannot unmarshal number 1.0 into ... int" — the live
+        // 2026-06-15 dynamic-order naked-Kalshi recovery, the residual WARN 0024 flagged).
+        let k = OrderIntent { venue: Venue::Kalshi, market: "K".into(), frac_qty: Some(1.0), ..base.clone() };
         let kv: serde_json::Value = serde_json::from_str(&bk.build_kalshi_payload(&k)).unwrap();
-        assert_eq!(kv["count"], 0.01, "the Kalshi count honors frac_qty");
+        assert_eq!(kv["count"].as_u64(), Some(1), "the Kalshi count is the rounded INTEGER (whole-share)");
+        assert!(kv["count"].is_u64() || kv["count"].is_i64(), "Kalshi count serializes as an int, never a float (1.0 -> 400)");
         // frac_qty None -> the integer qty, byte-identical to the pre-fix entry path.
         let entry = OrderIntent { frac_qty: None, qty: 2, action: Action::Buy, ..base };
         let ev: serde_json::Value = serde_json::from_str(&bk.build_pmus_payload(&entry)).unwrap();
