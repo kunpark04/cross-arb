@@ -80,7 +80,9 @@ pub fn order_submit(
         "venue_order_id": venue_order_id,
         "filled": filled,
         "latency_ms": round1(latency_ms),
-        "raw": raw.chars().take(2000).collect::<String>(),
+        // pmus FILL bodies (executions[].order.marketMetadata) run several KB; capture enough to keep the
+        // fill evidence (cumQuantity / executions[].lastShares) intact for forensics.
+        "raw": raw.chars().take(6000).collect::<String>(),
     }));
 }
 

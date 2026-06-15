@@ -1009,6 +1009,27 @@ mod tests {
         assert!(pmus_order_filled(&rem, 2));
     }
 
+    /// W2 (audit gap, [L32] class): pmus fill detection pinned to the EXACT shape captured from a REAL 1¢
+    /// BUY_LONG fill (live 2026-06-14). The synchronous CreateOrderResponse carries TWO executions — a NEW
+    /// acceptance record (`lastShares:"0.0000"`, nested `order.state ORDER_STATE_NEW`, cumQuantity 0) AND the
+    /// actual FILL (`lastShares:"1.0000"`, `order.state ORDER_STATE_FILLED`, cumQuantity 1). `pmus_order_filled`
+    /// SUMS the executions' `lastShares` (0.0000 + 1.0000 = 1 >= qty) -> filled. A resting order returns ONLY the
+    /// NEW execution (sum 0) -> not filled (fail-safe, no false positive). Shares are 4-decimal STRINGS.
+    #[test]
+    fn pmus_order_filled_real_captured_fill() {
+        let real_fill: serde_json::Value = serde_json::from_str(
+            r#"{"id":"AN42KH5W23FV","executions":[
+                {"id":"e1","lastShares":"0.0000","lastPx":{"value":"0.0000","currency":"USD"},"order":{"cumQuantity":0,"leavesQuantity":1,"state":"ORDER_STATE_NEW"}},
+                {"id":"e2","lastShares":"1.0000","lastPx":{"value":"0.0100","currency":"USD"},"order":{"cumQuantity":1,"leavesQuantity":0,"state":"ORDER_STATE_FILLED"}}
+            ]}"#).unwrap();
+        assert!(pmus_order_filled(&real_fill, 1), "captured 2-execution NEW+FILLED body (lastShares 0+1=1) IS a fill");
+        assert!(!pmus_order_filled(&real_fill, 2), "...but not for qty 2 (only 1 share filled) — fail-safe partial");
+        // a RESTING order returns ONLY the NEW execution (lastShares 0) -> sum 0 -> NOT filled (no false positive).
+        let resting_only: serde_json::Value = serde_json::from_str(
+            r#"{"id":"o","executions":[{"id":"e1","lastShares":"0.0000","order":{"cumQuantity":0,"leavesQuantity":1,"state":"ORDER_STATE_NEW"}}]}"#).unwrap();
+        assert!(!pmus_order_filled(&resting_only, 1), "a NEW-only (lastShares 0) body is acceptance, not a fill");
+    }
+
     /// FIX 1: `both_filled()` requires BOTH legs Ok AND filled. One Ok-but-resting (accepted, not filled)
     /// leg means NOT both-filled — the old `is_ok()`-only check wrongly called this a complete hedge.
     #[test]
