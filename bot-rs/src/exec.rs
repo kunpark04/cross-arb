@@ -380,6 +380,10 @@ impl LiveBackend {
         // root cause). FOK forces the venue to fill the whole clip IMMEDIATELY or KILL it, so "not filled"
         // becomes TERMINAL: no late fill, no cancel race. Recovery/unwind SELLs deliberately stay GTC — they
         // flatten a KNOWN leg, and a rested SELL at worst triggers a needless halt, never a naked position.
+        // API-DOC-VERIFIED (docs.kalshi.com, 2026-06-15): /trade-api/v2/portfolio/orders takes time_in_force as
+        // an OPTIONAL enum {fill_or_kill, good_till_canceled, immediate_or_cancel} — "fill_or_kill" is valid, and
+        // an UNKNOWN value 400s (it is NOT silently rested as GTC), so this can't degrade into the late-fill race.
+        // Optional ⇒ the SELL path (no field) defaults to GTC, as intended. (Live demo-sandbox kill-confirm: TODO.)
         if matches!(intent.action, Action::Buy) {
             body["time_in_force"] = serde_json::json!("fill_or_kill");
         }

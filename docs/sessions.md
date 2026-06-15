@@ -6,6 +6,39 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-15 (cont. 10) — temp-arb gating diagnosed (EDGE, not staleness) + LIVE edge floor 2.0→1.5¢ [0022]; Kalshi FOK API-doc-verified
+
+Owner: "many arb opportunities in temp — what gates them, what's the condition?" The live gate counter showed
+weather rejecting on the EDGE, not latency. Investigating NYC-high-temp June-15 surfaced a diagnostic bug first:
+
+- **Parsing bug + correction ([L35]):** a REST probe read the Kalshi book under `orderbook.yes/no` (keys that don't
+  exist) → wrongly concluded "empty book → no arb." The owner refuted it on sight ("live trades right now"). Real
+  shape is `orderbook_fp.{yes,no}_dollars` (a deep NO side). The **bot's WS path was always correct**
+  (`yes_dollars_fp`/`no_dollars_fp`, `venue.rs:87`) — the bug was confined to the throwaway diagnostic. Also retracted
+  an earlier "staleness" mis-attribution. Rule: a diagnostic that contradicts the owner's live screen is the
+  diagnostic's bug ([L26]).
+- **Real finding:** the temp arbs gate on **NET edge**. Live NYC buckets net **+1.0…+1.1¢** after fees (best two,
+  below the 2¢ floor; the rest negative). The eye-catching ~12¢ YES "gaps" are mostly the **pmus bid-ask spread**
+  (80–81° bucket: pmus NO costs 91¢ vs Kalshi's 1¢ internal spread) + fees peaking near 50¢. The bot is correctly
+  skipping sub-floor arbs, not stuck.
+- **Floor change [0022]:** owner asked to revisit the 2¢ floor (→1.5¢). An adversarial workflow (EV / governance /
+  scope + a skeptical money-path reviewer, ultracode) returned **PROCEED_WITH_CAVEAT** — EV sound (~+1.0–1.3¢/fired
+  arb, break-even miss-rate ~97% vs measured 15–30%; residual unwind ~0.3¢, recovery-gate-bounded ≤edge), governance
+  clean (an **a-priori** owner operational parameter under [0015], NOT research-prereg tuning), scope a one-liner
+  (`config.rs:80`; **0 of 163 tests break**). Lowered the LIVE default `2.0→1.5¢`; the **0014 pre-registered τ=2¢
+  stays the research-path value, untouched** (descriptive mirror `backtest_current_strategy.py:52` left at 2.0).
+- **Adversary's CRITICAL → resolved:** the floor's safety rests on FOK, and the Kalshi `fill_or_kill` value was
+  asserted-but-uncited in 0021 (if Kalshi silently rested an unknown `time_in_force` as GTC, the late-fill incident
+  returns — and the Kalshi leg fires *second*, after pmus fills). **API-doc-verified** (`docs.kalshi.com`):
+  `/trade-api/v2/portfolio/orders` takes `time_in_force` as an OPTIONAL enum `{fill_or_kill, good_till_canceled,
+  immediate_or_cancel}`; `fill_or_kill` is valid and an unknown value **400s** (NOT silently rested). Pinned in the
+  `exec.rs` comment. A live demo-sandbox kill-confirm is still the gold standard ([L17]/[L32]).
+- **CONDITIONAL + status:** the 1.5¢ floor's bounded-unwind safety requires `MAX_RECOVERY_SPREAD_RATIO=1.0` stays ON.
+  The 1-contract prod FOK run finished its 30-min window with **0 fires** (consistent — nothing cleared even 2¢), so
+  FOK is still unexercised live. 163 tests green. [L35], [0022].
+
+---
+
 ## 2026-06-15 (cont. 9) — LIVE INCIDENT: untracked naked positions from a fill-detection race → fill-or-kill fix [0021]
 
 The first multi-fire live run (5-position measurement, [0020] pmus-first) churned ONE UFC fight 4× in ~45s and
