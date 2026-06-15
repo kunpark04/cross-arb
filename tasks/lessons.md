@@ -527,3 +527,28 @@ fail-CLOSED (it may have landed+filled — don't un-hedge a possible lock); (b) 
 no per-slug cooldown lets one slug churn-fire + collide on the coid — add a cooldown; (c) reconcile the bot's
 belief against the actual ACCOUNT, always ([L26]) — the bot's "I cancelled it / it didn't fill" is a hypothesis,
 not a fact. Decision [0021].
+
+## L35 — A read-only DIAGNOSTIC that contradicts the owner's LIVE observation is the diagnostic's bug — re-verify, don't restate (Kalshi REST book = `orderbook_fp.{yes,no}_dollars`)
+
+**Pattern:** Investigating why the bot wasn't trading the NYC-high-temp Jun-15 weather buckets, a one-off REST probe
+of the Kalshi orderbook (`/markets/{ticker}/orderbook`) parsed `json["orderbook"]["yes"]/["no"]` — keys that DON'T
+EXIST in the response — read empty, and I concluded "the Kalshi book is completely empty → no executable arb." The
+owner refuted it instantly ("there are live trades right now, no way it's empty"). The RAW response showed the real
+shape: `{"orderbook_fp": {"yes_dollars": [[price,size],…], "no_dollars": […]}}` — a deep NO side (200/121/75/105/58
+contracts at 95–99¢). "Empty book" was a pure key-name parse error. The BOT's own WS path was fine (it reads
+`yes_dollars_fp`/`no_dollars_fp` from the snapshot frame, `venue.rs:87-88`), so the bug was confined to the throwaway
+diagnostic, not the trading core. I had ALSO mis-attributed the gate to "staleness" first; the corrected per-bucket
+computation showed the real gate is the EDGE — net **+1.0…+1.1¢** after fees (below the 2¢ floor), and the apparent
+12¢ YES-gap was mostly the **pmus 10¢ bid-ask spread**, not capturable edge.
+
+**Rule:** When a read-only diagnostic's conclusion CONTRADICTS the owner's direct, live observation of the venue or
+account, the default assumption is the DIAGNOSTIC is wrong — re-verify it (dump the RAW body, confirm the actual JSON
+shape), do NOT restate the conclusion more confidently. The owner's live screen/account is ground truth ([L26]).
+Corollaries: (a) before asserting "empty / no data" from an API, print the raw response and confirm field names — an
+all-`None` parse (incl. `volume`/`open_interest` None on an *actively trading* market) is a TELL you're reading the
+wrong keys, not that the market is empty; (b) Kalshi **REST** orderbook lives under `orderbook_fp.yes_dollars` /
+`no_dollars` (dollar-scaled `[price,size]` ladders), NOT `orderbook.yes`/`no` — and the **WS** snapshot uses
+`yes_dollars_fp`/`no_dollars_fp` (different shapes for REST vs WS); to BUY YES you cross the NO bids (`yes_ask =
+1 − best_no_bid`); (c) a cross-venue "YES-price gap" is NOT the edge — the executable edge nets the price you pay to
+HEDGE (cross the OTHER venue's bid-ask) plus both legs' `coef·P(1−P)` taker fees (max near 50¢); a wide pmus spread
+can collapse a 12¢ apparent gap to ~+1¢ net.
