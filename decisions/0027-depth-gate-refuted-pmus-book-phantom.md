@@ -81,9 +81,14 @@ venue pair** — a finding, not a business.
   ~7/2) unlocking cleaner categories, (b) the rare **transient deep-AND-real-book** windows (MLB line-lag, n=1 —
   instrument, don't bet), and (c) accepting this may top out as a research rig. [0025]'s "breadth not clips" is
   narrowed: even breadth doesn't help while fills are phantom.
-- **Creates an instrumentation TODO** in the live bot: extend `exec_log::book_snapshot` (and the `live.rs:477`
-  call) to log the pmus bid/ask SIZE ladder at fire. Logging-only, owner-gated deploy ([0006]). Until it runs,
-  the "fundamentally uncapturable" verdict is held at "World 2 on paired depth, pmus-specific signal untested."
+- **Instrumentation BUILT this session** (logging-only, no order-path change, build + 187 tests + clippy green):
+  `book::pmus_hedge_depth(pm, dir) -> HedgeDepth{touch, within_2c}` computes the pmus HEDGE-side single-leg
+  resting qty (dir-specific: PK→pmus YES-ask, KP→pmus NO-ask), and `exec_log::book_snapshot` now logs it as
+  `pm_depth0` (touch) + `pm_depth2` (within 2¢) at every entry fire (`live.rs:477`, recomputed from the
+  unchanged-this-iteration pmus book). `scripts/depth_at_fire.py` reads the new fields and runs a pmus-only
+  per-category AUC (graceful "not yet instrumented" on pre-2026-06-16 logs). **Captures on the next live run**
+  (owner-gated, [0006]); until then the verdict is held at "World 2 on paired depth, pmus-specific signal awaiting
+  data." If the pmus-only depth ALSO fails to separate next run, the "uncapturable at scale" verdict is final.
 - **Does not change safety or current operation:** the bot remains 1-contract, dynamic-fire-order, 0-loss; the
   21 open/closed locks are clean hedged positions. No live behavior changed by this decision.
 - Artifacts: `scripts/depth_at_fire.py` (+ `--selftest`), the council transcript, and the stats audit are the

@@ -131,8 +131,11 @@ pub fn order_cancel(venue: &str, market: &str, venue_order_id: &str, http: Optio
 /// later naked-leg recovery decomposes into SPREAD (entry bid↔ask) vs MOVE (entry mid → the recovery fill
 /// price already captured in the submit records). `phase` = "entry" | "recovery". `live` routes a dry-run
 /// snapshot to the `.dryrun` log (2026-06-15). No-op under `cargo test`.
+/// `depth_c2` = the PAIRED cross-venue fillable-pairs depth (min of both legs). `pm_depth0`/`pm_depth2` =
+/// the pmus HEDGE-SIDE single-leg resting qty AT the touch / within 2¢ ([`book::pmus_hedge_depth`]) — the
+/// pmus-ONLY fill signal [0027] flagged as untested (paired `depth_c2` masks it). Recovery snapshots pass 0.
 #[allow(clippy::too_many_arguments)]
-pub fn book_snapshot(phase: &str, market: &str, pm_bid: Option<f64>, pm_ask: Option<f64>, k_bid: Option<f64>, k_ask: Option<f64>, depth_c2: u32, live: bool) {
+pub fn book_snapshot(phase: &str, market: &str, pm_bid: Option<f64>, pm_ask: Option<f64>, k_bid: Option<f64>, k_ask: Option<f64>, depth_c2: u32, pm_depth0: u32, pm_depth2: u32, live: bool) {
     record(serde_json::json!({
         "event": "book",
         "phase": phase,
@@ -142,6 +145,8 @@ pub fn book_snapshot(phase: &str, market: &str, pm_bid: Option<f64>, pm_ask: Opt
         "k_bid": k_bid,
         "k_ask": k_ask,
         "depth_c2": depth_c2,
+        "pm_depth0": pm_depth0,
+        "pm_depth2": pm_depth2,
     }), live);
 }
 

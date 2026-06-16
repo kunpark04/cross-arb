@@ -311,6 +311,38 @@ pub fn fire_pmus_first_game(pm: &PmusBook, ka: &KalshiBook, kb: &KalshiBook, dir
     ladder_qty(&pmus) <= ladder_qty(&kalshi)
 }
 
+/// pmus HEDGE-SIDE single-leg liquidity at fire — the instrumentation gap [0027] flagged. `depth_at_edge`
+/// returns the PAIRED min-depth (`depth_curve`, capped by the thinner leg), which MASKS a pmus-ONLY fill
+/// signal: the 2026-06-16 depth-at-fire replay showed paired `depth_c2` does not predict the fill, but a
+/// pmus-only depth was never logged so it couldn't be tested separately. The pmus leg a fire consumes is
+/// dir-specific (`PK`: buy pmus YES → YES-ask ladder; `KP`: buy pmus NO = `1 − pmus YES-bid`), IDENTICAL
+/// for game and non-game pairs (only the Kalshi leg differs). Returns resting qty AT the best hedge price
+/// (`touch`) and cumulative within 2¢ of it (`within_2c`) — bands are PRICE proximity on ONE leg, NOT the
+/// paired ≥X¢ EDGE thresholds of `Depth`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HedgeDepth {
+    pub touch: u32,
+    pub within_2c: u32,
+}
+
+pub fn pmus_hedge_depth(pm: &PmusBook, dir: Dir) -> HedgeDepth {
+    let ladder = match dir {
+        Dir::PK => pm.yes_ask_ladder(),                 // buy pmus YES at the ask
+        Dir::KP => no_ask_ladder(&pm.yes_bid_ladder()), // buy pmus NO = 1 - pmus YES bid
+    };
+    let Some(&(best, _)) = ladder.first() else { return HedgeDepth::default() };
+    let (mut touch, mut within_2c) = (0.0_f64, 0.0_f64);
+    for &(p, q) in &ladder {
+        if (p - best).abs() < 1e-9 {
+            touch += q;
+        }
+        if p <= best + 0.0200001 {
+            within_2c += q;
+        }
+    }
+    HedgeDepth { touch: touch.round() as u32, within_2c: within_2c.round() as u32 }
+}
+
 /// The cheap venue's YES-ask ladder for a direction, exposed for sizing/leg-sequencing in stage-2.
 pub fn cheap_yes_ask_ladder(k: &KalshiBook, pm: &PmusBook, dir: Dir) -> Vec<(f64, f64)> {
     match dir.cheap_venue() {
@@ -350,6 +382,20 @@ mod tests {
         assert_eq!(p.best(), (Some(0.59), Some(0.60)));
         assert_eq!(p.yes_bid_ladder()[0].0, 0.59); // highest bid first
         assert_eq!(p.yes_ask_ladder()[0].0, 0.60); // lowest ask first
+    }
+
+    /// pmus_hedge_depth ([0027] gap): PRICE-band liquidity on the dir-specific pmus hedge leg.
+    #[test]
+    fn pmus_hedge_depth_bands_by_direction() {
+        let mut pm = PmusBook::new();
+        // YES bids .50@15, .48@30 ; YES asks .60@10, .61@20, .63@40
+        pm.apply_snapshot(&[(0.50, 15.0), (0.48, 30.0)], &[(0.60, 10.0), (0.61, 20.0), (0.63, 40.0)]);
+        // PK buys pmus YES at asks: best .60; touch=10; within 2¢ (≤.62) = .60+.61 = 30 (.63 excluded).
+        assert_eq!(pmus_hedge_depth(&pm, Dir::PK), HedgeDepth { touch: 10, within_2c: 30 });
+        // KP buys pmus NO = 1−YES bid: asks .50@15, .52@30; best .50; touch=15; within 2¢ (≤.52) = 45.
+        assert_eq!(pmus_hedge_depth(&pm, Dir::KP), HedgeDepth { touch: 15, within_2c: 45 });
+        // empty book → default (0,0), no panic.
+        assert_eq!(pmus_hedge_depth(&PmusBook::new(), Dir::PK), HedgeDepth::default());
     }
 
     /// Port of `bot/monitor.py` depth_curve vector: a=[(.40,10),(.42,20)], b=[(.50,5),(.55,30)] with

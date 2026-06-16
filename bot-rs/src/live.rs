@@ -474,7 +474,11 @@ pub(crate) async fn run_live(cfg: &Config, backend: std::sync::Arc<dyn Execution
                 }
                 // ENTRY book snapshot (0020 follow-up): record the books we fired against so a later naked-leg
                 // recovery can be decomposed into spread-vs-move (the FILL prices are already in exec_log).
-                exec_log::book_snapshot("entry", &slug, quote.pm.yes_bid, quote.pm.yes_ask, quote.k.yes_bid, quote.k.yes_ask, quote.depth.c2, live);
+                // pmus HEDGE-SIDE single-leg depth ([0027] gap): re-read the (unchanged this iteration) pmus
+                // book and log its hedge-side resting qty AT the touch + within 2¢ — the pmus-only fill signal
+                // the PAIRED depth_c2 masked. Computed only on the rare fire; default 0,0 if the book vanished.
+                let pm_hedge = pmus_books.get(&slug).map(|b| book::pmus_hedge_depth(b, edge.dir)).unwrap_or_default();
+                exec_log::book_snapshot("entry", &slug, quote.pm.yes_bid, quote.pm.yes_ask, quote.k.yes_bid, quote.k.yes_ask, quote.depth.c2, pm_hedge.touch, pm_hedge.within_2c, live);
                 // edge_rate into the JSONL (0017 follow-up / backlog #7): the MIN_EDGE_RATE_CPD gate is ENABLED
                 // live but was uncalibrated because the velocity metric never landed in the record. One
                 // `approved` line per fire gives the opportunity distribution to set the threshold from data.

@@ -624,7 +624,7 @@ pub(crate) fn recover_naked_leg(
                 Venue::Pmus => (b.yes_bid, b.yes_ask, None, None),
                 Venue::Kalshi => (None, None, b.yes_bid, b.yes_ask),
             };
-            crate::exec_log::book_snapshot("recovery", slug, pm_b, pm_a, k_b, k_a, 0, live);
+            crate::exec_log::book_snapshot("recovery", slug, pm_b, pm_a, k_b, k_a, 0, 0, 0, live);
         }
         let Some(exit) = book.and_then(|b| flatten_exit_cents(filled_leg, &b)) else {
             eprintln!("[live] CRITICAL NAKED LEG on {slug}: filled {:?} leg can't be priced for a flatten (one-sided book) -> halting (no SELL fired)", filled_leg.venue);

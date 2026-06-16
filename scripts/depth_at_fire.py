@@ -107,6 +107,7 @@ def group_fires(records: list[dict]) -> list[dict]:
         if ev == "book" and r.get("phase") == "entry":
             pending[mkt] = {
                 "depth_c2": r.get("depth_c2"),
+                "pm_depth0": r.get("pm_depth0"), "pm_depth2": r.get("pm_depth2"),  # pmus-only ([0027], 2026-06-16+)
                 "pm_bid": r.get("pm_bid"), "pm_ask": r.get("pm_ask"),
                 "k_bid": r.get("k_bid"), "k_ask": r.get("k_ask"),
                 "ts_ms": r.get("ts_ms"), "approved": None,
@@ -130,6 +131,7 @@ def group_fires(records: list[dict]) -> list[dict]:
                 "market": mkt, "result": r.get("result"), "detail": r.get("detail") or "",
                 "category": cat, "league": league,
                 "depth_c2": (ctx or {}).get("depth_c2"),
+                "pm_depth0": (ctx or {}).get("pm_depth0"), "pm_depth2": (ctx or {}).get("pm_depth2"),
                 "edge_net_c": appr.get("edge_net_c"), "dir": appr.get("dir"),
                 "pm_bid": pm_bid, "pm_ask": pm_ask, "pm_spread": pm_spread,
                 "ts_ms": r.get("ts_ms"),
@@ -298,6 +300,27 @@ def report(fires: list[dict]) -> None:
             print(f"    pmus touch-spread AUC(lock>miss) = {sa:.3f}  "
                   f"(lock spread med={statistics.median(sL):.3f}, miss med={statistics.median(sM):.3f})")
 
+    # ---- the [0027] gap: pmus-SIDE-ONLY depth (not the paired depth_c2) — instrumented 2026-06-16 ----
+    print("\n--- [pmus-only depth, [0027] gap] HEDGE-leg resting qty within 2¢, locks vs misses per category ---")
+    pm_inst = [f for f in with_depth if f.get("pm_depth2") is not None]
+    if not pm_inst:
+        print("  pmus-side ladder NOT in this log (pre-2026-06-16 run). book_snapshot now logs pm_depth0 (touch)")
+        print("  + pm_depth2 (within 2¢) on the dir-specific HEDGE leg — re-run this after the next live session")
+        print("  to test the pmus-ONLY fill signal the paired depth_c2 masked.")
+    else:
+        print(f"  {len(pm_inst)}/{len(with_depth)} fires carry the pmus-side ladder")
+        for cat in sorted({f["category"] for f in pm_inst}):
+            cf = [f for f in pm_inst if f["category"] == cat]
+            cL = [f["pm_depth2"] for f in cf if f["result"] == LOCK]
+            cM = [f["pm_depth2"] for f in cf if f["result"] != LOCK]
+            ca = auc(cL, cM)
+            if ca is not None:
+                verdict = "pmus depth SEPARATES (World 1 at the pmus level!)" if ca > 0.60 else \
+                          "no pmus-only separation -> World 2 confirmed at the pmus level"
+                print(f"  [{cat}] {len(cf)} fires, {len(cL)} locks — pmus within-2¢ AUC(lock>miss) = {ca:.3f}  ({verdict})")
+            else:
+                print(f"  [{cat}] {len(cf)} fires, {len(cL)} locks — AUC n/a")
+
     # ---- robustness: literal 'did pmus fill?' coding (recover/naked_halt detail = the FILLED leg) ----
     print("\n--- [robustness] re-code outcome as the LITERAL 'did the pmus leg fill?' (not 'did it lock?') ---")
     fL = [f["depth_c2"] for f in with_depth if pmus_filled(f)]
@@ -373,7 +396,7 @@ def selftest() -> int:
     # synthetic log: 2 markets, each fires twice. Grouping must split repeated fires; AUC must compute.
     recs = [
         {"event": "book", "phase": "entry", "market": "tc-temp-x", "depth_c2": 5,
-         "pm_bid": 0.10, "pm_ask": 0.12, "ts_ms": 1},
+         "pm_depth0": 3, "pm_depth2": 7, "pm_bid": 0.10, "pm_ask": 0.12, "ts_ms": 1},
         {"event": "approved", "market": "tc-temp-x", "edge_net_c": 2.0, "dir": "KP", "ts_ms": 2},
         {"event": "submit", "market": "tc-temp-x", "venue": "Pmus", "filled": True, "ts_ms": 3},
         {"event": "fire_outcome", "market": "tc-temp-x", "result": "lock", "ts_ms": 4},
@@ -394,6 +417,8 @@ def selftest() -> int:
     lock = next(f for f in fires if f["result"] == "lock")
     miss = next(f for f in fires if f["result"] == "abort_clean")
     assert lock["depth_c2"] == 5 and miss["depth_c2"] == 2, "depth association wrong"
+    assert lock["pm_depth2"] == 7 and lock["pm_depth0"] == 3, "pmus-side depth association wrong"
+    assert miss["pm_depth2"] is None, "absent pmus-side depth must stay None (graceful pre-instrumentation)"
     assert lock["category"] == "weather" and lock["league"] == "weather"
     censored = next(f for f in fires if f["market"].startswith("aec-mlb"))
     assert censored["depth_c2"] is None and censored["category"] == "sports", "censored fire mishandled"
