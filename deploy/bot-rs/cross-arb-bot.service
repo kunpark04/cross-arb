@@ -1,0 +1,48 @@
+[Unit]
+Description=cross-arb LIVE trading bot (Rust) — REAL MONEY (decisions 0015 / 0028)
+Documentation=https://github.com/kunpark04/cross-arb
+After=network-online.target
+Wants=network-online.target
+# a real-money bot that dies >20x in 5min is a real fault (bad creds / dead endpoint), not a blip — stop hammering.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+# dedicated unprivileged user, SEPARATE from the read-only monitor's 'cross-arb' user; owns ONLY
+# /opt/cross-arb-bot (0700). This is the ONLY identity that holds the trade-capable key (decision 0028).
+User=cross-arb-bot
+Group=cross-arb-bot
+WorkingDirectory=/opt/cross-arb-bot
+# the full arming + risk env lives in the wrapper (one auditable place; mirrors bot-rs/run-live.sh).
+ExecStart=/opt/cross-arb-bot/run-live-droplet.sh
+Restart=always
+RestartSec=5
+
+# --- hardening: FS-confined like the monitor, but (unlike it) network-capable + may write its own logs. ---
+# (systemd has NO inline comments — a directive with a trailing '# ...' silently breaks the value.)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/cross-arb-bot
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=true
+RestrictRealtime=true
+ProtectKernelModules=true
+ProtectClock=true
+
+# logging parity with the laptop run (./run-live.sh > bot-live.out 2>&1): stdout+stderr -> bot-live.out,
+# executions.jsonl written by the bot itself in WorkingDirectory.
+StandardOutput=append:/opt/cross-arb-bot/bot-live.out
+StandardError=append:/opt/cross-arb-bot/bot-live.out
+SyslogIdentifier=cross-arb-bot
+
+[Install]
+WantedBy=multi-user.target

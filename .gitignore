@@ -12,6 +12,8 @@ __pycache__/
 
 # rust (bot-rs) — build artifacts only; src + Cargo.toml + Cargo.lock ARE tracked
 bot-rs/target/
+# droplet Linux build artifact (deploy/bot-rs/build-linux.sh output) — never committed
+deploy/bot-rs/dist/
 # bot-rs runtime secrets (keys + env) — NEVER committed; the read-write key lives external
 bot-rs/.env
 bot-rs/*.pem

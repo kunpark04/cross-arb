@@ -6,6 +6,26 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-16 (cont. 17) — live bot → 3-contract cap; droplet live deploy authorized (owner override of 0007) [0028]
+
+Owner: "reset the bot … max 3 contracts max. Remove the 1 contract initial fill limit … on perpetually in the
+droplet … logging everything the same as here." Status check first: the local bot was **OFF** (logs stopped
+00:00 local; the prior run was full-live — 21 locks / 24 recover / 128 abort_clean, the [0027] phantom-liquidity
+regime). Surfaced live in passing: the bot had **locked the Keys-vs-Wang WTA arb** (pmus YES Keys 69¢ + Kalshi
+YES Wang 27¢ = 96¢, ~4¢ gross); both venues now ~76¢ Keys with the match in progress, and the ~1-day reschedule
+sits inside both venues' wait windows so the lock holds clean.
+
+Shipped: **(a)** `bot-rs/run-live.sh` → **3 ctr/pair HARD cap** (`MAX_CONTRACTS_PER_PAIR=3` +
+`MAX_NOTIONAL_PER_PAIR=3`), initial clip sizes up to 3 (1-ctr initial limit removed). **(b)** a full **droplet
+live-bot deploy cone** under [`deploy/bot-rs/`](../deploy/bot-rs/README.md) (build-linux / run-live-droplet /
+cross-arb-bot.service / provision-bot / deploy-bot / pull-bot-logs) — runs as a **separate confined
+`cross-arb-bot` user** so the monitor's read-only isolation stays intact. This **overrides [0007]** ("never
+stage a trade-capable key on the box") — owner-explicit, recorded in [0028]. **(c) VERIFIED** the Linux binary
+builds in WSL Ubuntu-24.04 (rustls → glibc-only, max GLIBC_2.34 ≤ droplet 2.39; smoke = safe-by-default DryRun
+banner). Deploy + launch are **owner-run** (the sandbox can't submit live orders or SSH the droplet):
+`wsl bash deploy/bot-rs/build-linux.sh` then `deploy/bot-rs/deploy-bot.sh cross-arb-droplet`. Run **one** instance
+— the droplet replaces the laptop run. Not pushed.
+
 ## 2026-06-16 (cont. 16) — "barely no scale": depth-at-fire replay → WORLD 2 (displayed book PHANTOM) [0027]; pmus hedge-side depth instrumented
 
 Owner: "4 [locks] is crazy for the whole day. Barely no edge or scale." Diagnosed it, councilled it, MEASURED

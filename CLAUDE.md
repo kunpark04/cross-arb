@@ -229,6 +229,7 @@ doc without linking it here leaves the index incomplete.
 | [bot-rs/README.md](bot-rs/README.md) | **LIVE trading bot (Rust, [0015](decisions/0015-owner-override-live-trading-phase.md))** — safe-by-default model, build/run, staged rollout, stage-1 spine vs stage-2 venue I/O |
 | [docs/architecture.md](docs/architecture.md) | Data-flow diagram (venues → discovery → monitor → transitions → analysis/bot); marks where the clip / position-size lever sits |
 | [deploy/README.md](deploy/README.md) | Droplet deploy artifacts (systemd unit, provision/deploy/pull-logs scripts) + droplet sizing — GATED ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)) |
+| [deploy/bot-rs/README.md](deploy/bot-rs/README.md) | **LIVE-bot droplet deploy** (WSL Linux build + systemd unit + out-of-band secrets + log pull) — owner override of 0007 ([0028](decisions/0028-live-bot-on-droplet-override-0007.md)) |
 | [tasks/scale-in-reentry-design.md](tasks/scale-in-reentry-design.md) | Design-of-record for the scale-in/re-entry money-path capability (multi-position-per-slug; exact per-position exposure release) — [0019](decisions/0019-scale-in-reentry-multi-position.md) |
 
 ## Repo layout
