@@ -96,6 +96,17 @@ See [deploy/README.md](deploy/README.md).
   cross-venue size. The bot now fires the **THINNER leg first** ([0025], superseding 0020's fixed pmus-first), and the
   scaling lever reframes from "which category" to **breadth + the maker study + transient depth windows, not depth
   per pair** (the MLB line-lag window stays n=1 — instrument it, don't bet it). [tasks/lessons.md](tasks/lessons.md) L37–L40.
+  **MEASURED 2026-06-16 → the displayed book is PHANTOM ([0027](decisions/0027-depth-gate-refuted-pmus-book-phantom.md), cont.16):**
+  a 178-fire depth-at-fire replay (`scripts/depth_at_fire.py`, after a 25.3 h run: 21 locks / 11.8% conversion, ~85%
+  died on the pmus hedge non-fill) shows DISPLAYED `depth_c2`-at-fire does **NOT** predict the fill — per-category
+  AUC ≤0.57 (sports 0.42, weather 0.57), stratified-perm p=0.64, best depth-gate lift ≤3.3 pts, and conversion is
+  **monotone-DECREASING** in displayed depth (11.9% → 0% @≥5000; MLB, the deepest book, converts WORST). A Monte-Carlo
+  power check (89-100% vs a business-relevant gate) makes "p=0.64" **evidence of absence, not under-power**, so the
+  **depth-gate / breadth / bigger-clip scale levers are REFUTED** — the cross-venue taker arb is capacity-capped by
+  phantom pmus liquidity, NOT by the cap or the floor. The locks that DO complete are profitable (net edge +2.49¢
+  mean) → a *capacity* problem, not a losing strategy. Bot stays a 1-contract rig; one gap pre-registered before the
+  FINAL "uncapturable" verdict — log the **pmus-side depth ladder** at fire (`depth_c2` is paired-min; a pmus-only
+  signal is untested). `stats-ml-logic-reviewer` reproduced the result SOUND/0-CRITICAL.
 - **Hardened post-review (three passes):** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
   `bot/monitor.py`) plus per-transition depth + staleness instrumentation. `age` is a coarse staleness hint
   (a resting-but-tradeable quote and a wedged stream both accrue large `age`); **depth** does the real
