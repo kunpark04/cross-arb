@@ -6,6 +6,35 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-16 (cont. 16) — "barely no scale": depth-at-fire replay → WORLD 2 (displayed book PHANTOM) [0027]; pmus hedge-side depth instrumented
+
+Owner: "4 [locks] is crazy for the whole day. Barely no edge or scale." Diagnosed it, councilled it, MEASURED
+it, and closed the loop in code. The answer: it's not the cap or the floor — **the displayed cross-venue book
+is phantom at retail size**; you can't see the fills coming. Commits `272361f` (analysis + [0027]), `9dfb3e5`
+(instrumentation). Not pushed.
+
+- **Diagnosis first (no issue).** The live run was healthy and ran to the **midnight watcher stop** (not a crash;
+  the `bxk4085k7` "exit 127" was a stale empty-output launch artifact). Whole 19:05→midnight run **clean: 21
+  locks, 0 halts, 0 unrecovered naked legs**; the ~2.5 h "no trades" stretch the owner noticed was a real
+  zero-edge lull, then a late-evening sports/weather burst. 4 clean hedged locks left riding to settlement.
+- **LLM council on the scale question** (`tasks/council-transcript-2026-06-16-pmus-fill-wall.md`): 4-of-5
+  advisors + all 5 reviewers converged on **instrument-first** (depth-at-fire), rejecting the Expansionist's
+  push-breadth-now as the biggest blind spot (breadth at 12% phantom-gated conversion = adversely-selected tickets).
+- **`scripts/depth_at_fire.py` → WORLD 2.** 178-fire replay, **stratified by category** (depth_c2 is
+  Simpson-confounded): per-category AUC ≤0.57 (sports 0.42, weather 0.57), stratified-perm **p=0.64**, gate lift
+  ≤3.3 pts, conversion **monotone-DECREASING** in displayed depth (11.9%→0% @≥5000; MLB, deepest, converts WORST).
+  `stats-ml-logic-reviewer` reproduced bit-for-bit **SOUND/0-CRITICAL**; Monte-Carlo power **89-100%** ⇒ "p=0.64"
+  is evidence of absence, not under-power. Caught + fixed a `categorize()` ufc/valorant mis-bucket. Depth-gate /
+  breadth / bigger-clip scale levers **REFUTED** — capacity-capped by phantom pmus liquidity. The locks that DO
+  complete are profitable (+2.49¢ mean) → a *capacity* problem, not a losing strategy. **Decision [0027].**
+- **pmus hedge-side depth INSTRUMENTED** (`9dfb3e5`, logging-only, build + 187 tests + clippy green): closes the
+  reviewer's one gap — `depth_c2` is paired-min; a pmus-ONLY signal was untested. `book::pmus_hedge_depth(pm,dir)`
+  → `book_snapshot` logs `pm_depth0`/`pm_depth2` (hedge-side qty at touch / within 2¢) at every fire;
+  `depth_at_fire.py` reads them. **Captures on the next live run** — if the pmus-only depth also fails to
+  separate, the "uncapturable at scale" verdict is final.
+
+---
+
 ## 2026-06-15 (cont. 15) — maker mode measured NOT_VIABLE [0026]; coid-collision class CLOSED; breadth re-armed (sports/econ) + 1.5¢ floor; naked-recovery VERIFIED LIVE
 
 A very long session: resolved the biggest queued lever (maker) by MEASUREMENT, closed the coid-collision
