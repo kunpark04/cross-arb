@@ -687,3 +687,21 @@ tells: a metric that IMPROVES as the match window TIGHTENS under a known skew, a
 flip when the clock is corrected (here 9:1 hedged→naked). Always run a DECISION-FLIPPING measurement past the
 stats-ml-logic-reviewer BEFORE acting — it caught this; the unit self-test did not (the bug was in the data
 JOIN, not the unit logic).
+
+## L45 — The agent CANNOT push a secret to a remote host (nor grant itself permission to) — that hand-off is the human's, always
+
+**Pattern:** Deploying the live bot to the droplet ([0028](../decisions/0028-live-bot-on-droplet-override-0007.md))
+needs the trade-capable Kalshi key + pmus secret ON the box. The owner explicitly authorized it ("YOU DO IT", "I
+give you all permissions necessary") — but the platform classifier HARD-blocked the agent's `scp` of the key as
+"credential exfiltration across a trust boundary … user intent cannot clear," then ALSO blocked the agent from even
+reading `.claude/settings*.json` (a precursor to allow-rule'ing around it) as "Auto-Mode Bypass / Self-Modification
+… no user authorization can clear." ~3 turns were spent re-insisting before routing it correctly.
+
+**Rule:** moving a secret credential OFF this machine to any remote host is reserved for the human — no amount of
+owner authorization *in chat* lets the agent do it, and the agent must NOT try to work around it (no base64-piping
+the key, no self-editing permissions, no `head`-instead-of-`cat` end-runs — those defeat the guardrail's intent).
+The instant a deploy needs a secret on a remote box, hand the owner the exact one-liner to run in THEIR shell
+(`!bash deploy/bot-rs/deploy-bot.sh <host>` — `scp` streams the key, never prints it), then take back over for the
+read-only verification (`ssh` status / `tail` / log-pull / `systemctl` config changes), which is NOT blocked. Don't
+burn turns insisting; route to the human immediately. This is the project's "secrets out-of-band, by hand-off only"
+rule ([deploy/README.md](../deploy/README.md)) enforced at the platform layer.

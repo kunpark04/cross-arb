@@ -4,13 +4,13 @@
 **persistent and large enough to justify a live trading bot**. Phase: **READ-ONLY** (no orders).
 This file is the live plan; the step-by-step history is in [sessions](../docs/sessions.md).
 
-## bot-rs — LIVE droplet deploy @ 3-contract cap (2026-06-16, [0028](../decisions/0028-live-bot-on-droplet-override-0007.md)) — ARTIFACTS READY, owner-run deploy pending
+## bot-rs — LIVE droplet deploy @ 3-contract cap (2026-06-16, [0028](../decisions/0028-live-bot-on-droplet-override-0007.md)) — ✅ LIVE on droplet, ALL configs enabled
 - [x] `run-live.sh` + droplet wrapper → **3 ctr/pair hard cap** (`MAX_CONTRACTS_PER_PAIR=3`, `MAX_NOTIONAL_PER_PAIR=3`); 1-ctr initial-fill limit removed.
 - [x] `deploy/bot-rs/` cone — WSL Linux build + systemd unit (separate confined `cross-arb-bot` user) + out-of-band secrets + log-pull parity. **Overrides 0007** (owner-explicit).
 - [x] Linux binary build VERIFIED in WSL Ubuntu-24.04 (rustls → glibc-only, GLIBC_2.34 ≤ droplet 2.39; smoke = safe DryRun banner).
-- [ ] **OWNER-RUN** (sandbox can't submit live / SSH): `wsl bash deploy/bot-rs/build-linux.sh` → `deploy/bot-rs/deploy-bot.sh cross-arb-droplet`. Run ONE instance (droplet replaces the laptop run).
-- [ ] After launch: `pwsh deploy/bot-rs/pull-bot-logs.ps1`; watch the recover/naked rate at size 3 ([0027](../decisions/0027-depth-gate-refuted-pmus-book-phantom.md) phantom-liquidity risk).
-- [ ] Optional hardening: DO firewall (inbound SSH only); arm `ASSUME_SPORTS_SETTLED`/`ECON` via systemd drop-in once recon closes (~6/23 / ~7/2).
+- [x] **DEPLOYED + LIVE 2026-06-16 10:21 UTC** — owner ran `deploy-bot.sh` (agent hard-blocked from the secret push, [L45](lessons.md)); active, 0 restarts, both venues connected, no auth errors.
+- [x] **ALL configs enabled** — sports+econ armed via `systemd` drop-in (`ASSUME_*_SETTLED=true`, 10:27 UTC); full 417-pair universe, settle gate cleared, already firing. Logs mirror to `Kalshi/data/cross-arb-bot/`.
+- [ ] Watch the recover/naked rate at size 3 ([0027](../decisions/0027-depth-gate-refuted-pmus-book-phantom.md) phantom-liquidity risk); optional: schedule `pull-bot-logs`, DO firewall (inbound SSH only).
 
 ## bot-rs — ENGINE REFACTOR: time-complexity + monolith split (2026-06-14) — IN PROGRESS
 

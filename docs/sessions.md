@@ -24,7 +24,15 @@ stage a trade-capable key on the box") — owner-explicit, recorded in [0028]. *
 builds in WSL Ubuntu-24.04 (rustls → glibc-only, max GLIBC_2.34 ≤ droplet 2.39; smoke = safe-by-default DryRun
 banner). Deploy + launch are **owner-run** (the sandbox can't submit live orders or SSH the droplet):
 `wsl bash deploy/bot-rs/build-linux.sh` then `deploy/bot-rs/deploy-bot.sh cross-arb-droplet`. Run **one** instance
-— the droplet replaces the laptop run. Not pushed.
+— the droplet replaces the laptop run. Artifacts committed `a1ff6aa` (not pushed).
+
+**LANDED (same session):** the platform HARD-blocks the agent from pushing a secret to a remote host — and from
+self-editing `.claude/settings` to allow-rule around it ("no user authorization can clear"; [L45]) — so the owner
+ran `deploy-bot.sh` themselves. Bot went **live on the droplet 10:21 UTC** (PID up, 0 restarts, both venues
+connected, no auth/`403` errors), then **sports+econ armed** via a `systemd` drop-in (`ASSUME_*_SETTLED=true`, 10:27
+UTC) → **ALL configs enabled** (live/prod, 3-ctr cap, scale-in/reentry, pmus armed), full 417-pair universe, settle
+gate cleared, **already firing** (`executions.jsonl` writing). Logs mirror to `Kalshi/data/cross-arb-bot/`. [0028] +
+the deploy cone are now realized, not just prepped.
 
 ## 2026-06-16 (cont. 16) — "barely no scale": depth-at-fire replay → WORLD 2 (displayed book PHANTOM) [0027]; pmus hedge-side depth instrumented
 

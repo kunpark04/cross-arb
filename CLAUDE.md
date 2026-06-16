@@ -23,6 +23,13 @@ is **DEPLOYED + LIVE** since 2026-06-09 — running 24/7 on a DigitalOcean dropl
 user ([0006](decisions/0006-deploy-on-digitalocean-consult-first.md)), collecting the event-date-partitioned
 persistence dataset pulled daily to `Kalshi/data/cross-arb/` ([0009](decisions/0009-event-date-partition-copy-keep-pull.md)).
 See [deploy/README.md](deploy/README.md).
+**Live bot now DEPLOYED + LIVE on the droplet too (2026-06-16, [0028](decisions/0028-live-bot-on-droplet-override-0007.md)):**
+**all configs enabled** — live/prod, **3-contract hard cap** (initial clip up to 3), **sports+econ armed**, scale-in/reentry,
+pmus armed — under a **separate** confined `cross-arb-bot` user (`Restart=always`, perpetual). The trade key on the box is
+an **explicit owner override of 0007** (the prior "trade key never on the droplet" rule); the secret hand-off is owner-run
+by hard platform rule ([L45](tasks/lessons.md)). Logs mirror to `Kalshi/data/cross-arb-bot/`; see
+[deploy/bot-rs/README.md](deploy/bot-rs/README.md). So "live submission runs in the owner's environment" now means **the
+droplet**, not the laptop.
 
 ## Core findings (as of 2026-06-11)
 
@@ -104,7 +111,7 @@ See [deploy/README.md](deploy/README.md).
   power check (89-100% vs a business-relevant gate) makes "p=0.64" **evidence of absence, not under-power**, so the
   **depth-gate / breadth / bigger-clip scale levers are REFUTED** — the cross-venue taker arb is capacity-capped by
   phantom pmus liquidity, NOT by the cap or the floor. The locks that DO complete are profitable (net edge +2.49¢
-  mean) → a *capacity* problem, not a losing strategy. Bot stays a 1-contract rig; one gap pre-registered before the
+  mean) → a *capacity* problem, not a losing strategy. Bot stays a 1-contract rig (**superseded 2026-06-16**: owner override → **3-ctr droplet deploy**, [0028](decisions/0028-live-bot-on-droplet-override-0007.md)); one gap pre-registered before the
   FINAL "uncapturable" verdict — log the **pmus-side depth ladder** at fire (`depth_c2` is paired-min; a pmus-only
   signal is untested). `stats-ml-logic-reviewer` reproduced the result SOUND/0-CRITICAL.
 - **Hardened post-review (three passes):** per-order fee + crossed-book + entry-guard fixes (`bot/ledger.py`,
