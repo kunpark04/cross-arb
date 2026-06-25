@@ -30,6 +30,11 @@ an **explicit owner override of 0007** (the prior "trade key never on the drople
 by hard platform rule ([L45](tasks/lessons.md)). Logs mirror to `Kalshi/data/cross-arb-bot/`; see
 [deploy/bot-rs/README.md](deploy/bot-rs/README.md). So "live submission runs in the owner's environment" now means **the
 droplet**, not the laptop.
+**Whole stack DISABLED 2026-06-25 (owner, cont. 18):** the droplet `cross-arb-bot` + `cross-arb-monitor` units are stopped
+and `systemctl disable`d (won't auto-start; overrides the bot's `Restart=always`) and the local `PullCrossArbData` /
+`CrossArbHealthcheck` Task-Scheduler jobs dropped — cross-arb is intentionally **OFF**. Open positions, if any, hold to
+settlement (not flattened). Revert: `ssh cross-arb-droplet systemctl enable --now cross-arb-bot cross-arb-monitor` +
+`pwsh deploy/register-tasks.ps1` ([docs/sessions.md](docs/sessions.md) cont. 18).
 
 ## Core findings (as of 2026-06-11)
 

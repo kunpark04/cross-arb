@@ -6,6 +6,23 @@ terse — link the artifact (brief / script / decision / todo item) rather than 
 
 ---
 
+## 2026-06-25 (cont. 18) — cross-arb DISABLED (owner): droplet bot + monitor stopped+disabled, local pull/healthcheck jobs dropped
+
+Owner: "Disable the bots and loggers for this project" → "Drop related local jobs." No diagnosis — a clean
+operational shutdown of the whole cross-arb stack (both were `active`/`enabled`, not a fault). No code shipped,
+no decision filed: this reads as an operational pause, **not** a strategic reversal of [0028] (file one if it
+becomes permanent).
+
+- **Droplet** (`cross-arb-droplet` = `root@198.199.67.245`): `systemctl disable --now cross-arb-bot cross-arb-monitor`
+  → both **`inactive` + `disabled`** (boot `wants` symlinks removed; overrides the bot's `Restart=always`). No stray
+  procs survived (`pgrep` clean). The live bot's open positions, if any, are **not flattened** — they hold to
+  settlement by design; the stop only halts new fires.
+- **Laptop**: `Unregister-ScheduledTask` dropped both Task-Scheduler jobs — `PullCrossArbData` (daily pull) +
+  `CrossArbHealthcheck` (30-min liveness) — so no false-down alerts now that the monitor is intentionally off.
+- **Revert:** `ssh cross-arb-droplet systemctl enable --now cross-arb-bot cross-arb-monitor` + `pwsh deploy/register-tasks.ps1`.
+- Left alone: the oversight-dir `kalshi_watch.py` / session-start dashboard (cross-*project* watcher) — it will simply
+  show cross-arb down, now the expected state.
+
 ## 2026-06-16 (cont. 17) — live bot → 3-contract cap; droplet live deploy authorized (owner override of 0007) [0028]
 
 Owner: "reset the bot … max 3 contracts max. Remove the 1 contract initial fill limit … on perpetually in the
